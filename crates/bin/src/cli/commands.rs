@@ -347,6 +347,9 @@ pub async fn secrets_ls(
         output::info(format!("no secrets stored for project '{project_name}'"));
         return Ok(());
     }
+    if let Some(mode) = resp.file_mode {
+        output::info(format!("file mode: {mode:04o}"));
+    }
     if !resp.keys.is_empty() {
         output::heading("env keys:");
         for key in &resp.keys {

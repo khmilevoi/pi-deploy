@@ -82,6 +82,12 @@ impl SendSecrets {
 
         let workdir = self.source.workdir(project);
         self.writer.write(&workdir, &bundle).await?;
+        log.line(&format!(
+            "secrets applied ({} keys, {} files, mode {:04o})",
+            keys,
+            files,
+            bundle.secret_file_mode()
+        ));
         let override_file = self
             .overrides
             .write(
@@ -113,6 +119,7 @@ impl SendSecrets {
 pub struct StoredSecrets {
     pub keys: Vec<String>,
     pub files: Vec<String>,
+    pub file_mode: u32,
 }
 
 pub struct ListSecrets {
@@ -129,6 +136,7 @@ impl ListSecrets {
         Ok(StoredSecrets {
             keys: bundle.keys(),
             files: bundle.file_paths(),
+            file_mode: bundle.secret_file_mode(),
         })
     }
 }
@@ -330,6 +338,10 @@ mod tests {
             !lines.iter().any(|l| l.contains("hunter2-long")),
             "secret leaked"
         );
+        assert!(
+            lines.iter().any(|l| l.contains("mode 0644")),
+            "the applied mode must be visible in the log: {lines:?}"
+        );
     }
 
     #[tokio::test]
@@ -363,5 +375,16 @@ mod tests {
             vec!["DB_PASSWORD".to_string(), "PORT".to_string()]
         );
         assert_eq!(stored.files, vec!["certs/server.pem".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn list_secrets_reports_the_effective_file_mode() {
+        let mut secrets = MockSecretStore::new();
+        secrets.expect_load().returning(|_| Ok(bundle()));
+        let stored = ListSecrets::new(Arc::new(secrets))
+            .execute("rateme")
+            .await
+            .unwrap();
+        assert_eq!(stored.file_mode, 0o644);
     }
 }

@@ -268,9 +268,10 @@ impl DeployProject {
             masker.arm(&bundle);
             self.secrets_writer.write(&fetched.workdir, &bundle).await?;
             log.line(&format!(
-                "secrets injected ({} keys, {} files)",
+                "secrets injected ({} keys, {} files, mode {:04o})",
                 bundle.vars.len(),
-                bundle.files.len()
+                bundle.files.len(),
+                bundle.secret_file_mode()
             ));
         }
 
@@ -1172,7 +1173,7 @@ mod tests {
         assert_eq!(result.status, DeploymentStatus::Success);
         assert!(result
             .log_tail
-            .contains("secrets injected (1 keys, 1 files)"));
+            .contains("secrets injected (1 keys, 1 files, mode 0644)"));
         assert!(
             result.log_tail.contains("***DB_PASSWORD***"),
             "tail: {}",

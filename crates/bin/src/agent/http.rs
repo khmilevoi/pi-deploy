@@ -856,6 +856,7 @@ async fn list_secrets_handler(
     Ok(Json(SecretsListResponse {
         keys: stored.keys,
         files: stored.files,
+        file_mode: Some(stored.file_mode),
     }))
 }
 
