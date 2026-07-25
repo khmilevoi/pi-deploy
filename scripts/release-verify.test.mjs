@@ -7,6 +7,7 @@ import {
   checkJobs,
   checkNpmVersion,
   checkSmokeOutput,
+  assertSafePackageName,
 } from "./release-verify.mjs";
 
 test("expectedAssets names the three archives and the checksum file", () => {
@@ -76,7 +77,9 @@ const REAL_V0_25_1_JOBS = [
 ];
 
 test("checkJobs accepts the real six-job matrix run", () => {
-  assert.equal(checkJobs(REAL_V0_25_1_JOBS).ok, true);
+  const result = checkJobs(REAL_V0_25_1_JOBS);
+  assert.equal(result.ok, true);
+  assert.match(result.reason, /all 6 jobs green/);
 });
 
 test("checkJobs reports a failed matrix instance by its full name", () => {
@@ -116,6 +119,11 @@ test("checkJobs reports an in-progress matrix instance", () => {
   const result = checkJobs(jobs);
   assert.equal(result.ok, false);
   assert.match(result.reason, /build \(ubuntu-latest, x86_64-unknown-linux-musl\): in_progress/);
+});
+
+test("assertSafePackageName rejects shell metacharacters and accepts a normal package name", () => {
+  assert.throws(() => assertSafePackageName('"&calc.exe&"'));
+  assert.doesNotThrow(() => assertSafePackageName("rpi-deploy"));
 });
 
 test("checkNpmVersion compares exactly", () => {

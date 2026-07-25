@@ -31,6 +31,7 @@ export function checkAssets(actualNames, version) {
 
 export function checkJobs(jobs) {
   const problems = [];
+  let matched = 0;
   for (const name of JOBS) {
     const exact = jobs.find((j) => j.name === name);
     // Matrix jobs report as "<name> (<matrix values>)", never the bare name.
@@ -41,13 +42,19 @@ export function checkJobs(jobs) {
       problems.push(`${name}: missing`);
       continue;
     }
+    matched += instances.length;
     for (const job of instances) {
       if (job.status !== "completed") problems.push(`${job.name}: ${job.status}`);
       else if (job.conclusion !== "success") problems.push(`${job.name}: ${job.conclusion}`);
     }
   }
+  // Report the number of job entries actually matched and verified (which
+  // includes every matrix instance), not JOBS.length — a real release
+  // reports six job rows (three of them "build (...)" matrix instances) for
+  // four required names, and a message claiming "4" while GitHub shows six
+  // rows is exactly the kind of mismatch this script exists to prevent.
   return problems.length === 0
-    ? { ok: true, reason: `all ${JOBS.length} jobs green` }
+    ? { ok: true, reason: `all ${matched} jobs green` }
     : { ok: false, reason: problems.join(", ") };
 }
 
@@ -76,14 +83,32 @@ function sh(cmd, args) {
   return execFileSync(cmd, args, { encoding: "utf8", maxBuffer: 32 * 1024 * 1024 }).trim();
 }
 
+// Package names reaching npmView must match this narrow, conservative set
+// before they are allowed anywhere near cmd.exe on Windows (see npmView).
+const SAFE_PACKAGE_NAME = /^[\w.-]+$/;
+
+export function assertSafePackageName(pkg) {
+  if (!SAFE_PACKAGE_NAME.test(pkg)) {
+    throw new Error(`npmView: unsafe package name ${JSON.stringify(pkg)}`);
+  }
+  return pkg;
+}
+
 // On Windows, npm is npm.cmd, and Windows can only run .cmd/.bat files
 // through a shell — Node's execFile family refuses to spawn them directly
 // (confirmed: EINVAL), extension or not. cmd.exe itself is a real .exe, so
 // invoking it as the command (rather than setting the shell:true option)
-// runs npm.cmd without Node's shell-argument-concatenation warning. Every
-// argument here is a hardcoded literal or a value already validated by the
-// version regex in main(), so there is no injectable input reaching it.
+// runs npm.cmd without Node's shell-argument-concatenation deprecation
+// warning. This is NOT the same as execFile's normal argv safety: cmd.exe
+// re-parses its own /c command line, so a value like `"&calc.exe&"` passed
+// straight through as `pkg` gets interpreted by cmd.exe and launches an
+// arbitrary process (verified). The call site below only ever passes the
+// hardcoded literal "rpi-deploy", but that is not what makes this call
+// safe — the assertSafePackageName() guard is, because it rejects anything
+// outside a narrow character set before pkg ever reaches cmd.exe, so any
+// future caller passing a variable inherits the same protection.
 function npmView(pkg) {
+  assertSafePackageName(pkg);
   return process.platform === "win32"
     ? sh("cmd.exe", ["/d", "/s", "/c", "npm", "view", pkg, "version"])
     : sh("npm", ["view", pkg, "version"]);
