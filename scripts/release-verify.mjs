@@ -30,13 +30,21 @@ export function checkAssets(actualNames, version) {
 }
 
 export function checkJobs(jobs) {
-  const byName = new Map(jobs.map((j) => [j.name, j]));
   const problems = [];
   for (const name of JOBS) {
-    const job = byName.get(name);
-    if (!job) problems.push(`${name}: missing`);
-    else if (job.status !== "completed") problems.push(`${name}: ${job.status}`);
-    else if (job.conclusion !== "success") problems.push(`${name}: ${job.conclusion}`);
+    const exact = jobs.find((j) => j.name === name);
+    // Matrix jobs report as "<name> (<matrix values>)", never the bare name.
+    // The " (" separator is required so e.g. a job named "builder" cannot
+    // satisfy a requirement for "build".
+    const instances = exact ? [exact] : jobs.filter((j) => j.name.startsWith(`${name} (`));
+    if (instances.length === 0) {
+      problems.push(`${name}: missing`);
+      continue;
+    }
+    for (const job of instances) {
+      if (job.status !== "completed") problems.push(`${job.name}: ${job.status}`);
+      else if (job.conclusion !== "success") problems.push(`${job.name}: ${job.conclusion}`);
+    }
   }
   return problems.length === 0
     ? { ok: true, reason: `all ${JOBS.length} jobs green` }
@@ -66,6 +74,19 @@ export function checkSmokeOutput(stdout, version, elapsedMs) {
 
 function sh(cmd, args) {
   return execFileSync(cmd, args, { encoding: "utf8", maxBuffer: 32 * 1024 * 1024 }).trim();
+}
+
+// On Windows, npm is npm.cmd, and Windows can only run .cmd/.bat files
+// through a shell — Node's execFile family refuses to spawn them directly
+// (confirmed: EINVAL), extension or not. cmd.exe itself is a real .exe, so
+// invoking it as the command (rather than setting the shell:true option)
+// runs npm.cmd without Node's shell-argument-concatenation warning. Every
+// argument here is a hardcoded literal or a value already validated by the
+// version regex in main(), so there is no injectable input reaching it.
+function npmView(pkg) {
+  return process.platform === "win32"
+    ? sh("cmd.exe", ["/d", "/s", "/c", "npm", "view", pkg, "version"])
+    : sh("npm", ["view", pkg, "version"]);
 }
 
 function main() {
@@ -103,7 +124,7 @@ function main() {
       : `missing: ${assetCheck.missing.join(", ") || "none"}; unexpected: ${assetCheck.extra.join(", ") || "none"}`,
   });
 
-  results.push({ label: "npm", ...checkNpmVersion(sh("npm", ["view", "rpi-deploy", "version"]), version) });
+  results.push({ label: "npm", ...checkNpmVersion(npmView("rpi-deploy"), version) });
 
   const started = Date.now();
   const stdout = sh("docker", ["run", "--rm", "node:20-slim", "npx", "-y", `rpi-deploy@${version}`, "--version"]);

@@ -66,6 +66,58 @@ test("checkJobs reports a missing job", () => {
   assert.match(result.reason, /build|release|npm-publish/);
 });
 
+const REAL_V0_25_1_JOBS = [
+  { name: "check", status: "completed", conclusion: "success" },
+  { name: "build (windows-latest, x86_64-pc-windows-msvc)", status: "completed", conclusion: "success" },
+  { name: "build (ubuntu-latest, x86_64-unknown-linux-musl)", status: "completed", conclusion: "success" },
+  { name: "build (ubuntu-24.04-arm, aarch64-unknown-linux-musl)", status: "completed", conclusion: "success" },
+  { name: "release", status: "completed", conclusion: "success" },
+  { name: "npm-publish", status: "completed", conclusion: "success" },
+];
+
+test("checkJobs accepts the real six-job matrix run", () => {
+  assert.equal(checkJobs(REAL_V0_25_1_JOBS).ok, true);
+});
+
+test("checkJobs reports a failed matrix instance by its full name", () => {
+  const jobs = REAL_V0_25_1_JOBS.map((j) =>
+    j.name === "build (windows-latest, x86_64-pc-windows-msvc)" ? { ...j, conclusion: "failure" } : j,
+  );
+  const result = checkJobs(jobs);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /build \(windows-latest, x86_64-pc-windows-msvc\): failure/);
+});
+
+test("checkJobs reports build missing when no matrix instance exists", () => {
+  const jobs = REAL_V0_25_1_JOBS.filter((j) => !j.name.startsWith("build"));
+  const result = checkJobs(jobs);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /build: missing/);
+});
+
+test("checkJobs requires the ' (' separator, so 'builder' does not satisfy 'build'", () => {
+  const jobs = [
+    { name: "check", status: "completed", conclusion: "success" },
+    { name: "release", status: "completed", conclusion: "success" },
+    { name: "npm-publish", status: "completed", conclusion: "success" },
+    { name: "builder", status: "completed", conclusion: "success" },
+  ];
+  const result = checkJobs(jobs);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /build: missing/);
+});
+
+test("checkJobs reports an in-progress matrix instance", () => {
+  const jobs = REAL_V0_25_1_JOBS.map((j) =>
+    j.name === "build (ubuntu-latest, x86_64-unknown-linux-musl)"
+      ? { ...j, status: "in_progress", conclusion: null }
+      : j,
+  );
+  const result = checkJobs(jobs);
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /build \(ubuntu-latest, x86_64-unknown-linux-musl\): in_progress/);
+});
+
 test("checkNpmVersion compares exactly", () => {
   assert.equal(checkNpmVersion("0.25.2", "0.25.2").ok, true);
   assert.equal(checkNpmVersion("0.25.1", "0.25.2").ok, false);
