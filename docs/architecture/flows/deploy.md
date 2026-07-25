@@ -169,7 +169,15 @@ stateDiagram-v2
     outcome, though: whichever process is still following that deploy's log
     stream sees a status other than success or superseded, so an explicit
     `--cancel` still prints the same failed-style stamp and exits non-zero,
-    just like a genuine failure.
+    just like a genuine failure. A cancel that arrives for a deployment whose
+    final status is already recorded is refused as a conflict ("already
+    finished") rather than reported as canceling — the recorded status, not the
+    queue's own bookkeeping, decides whether a deployment is still cancellable,
+    because the queue only releases a deployment's slot after its run has
+    returned, which is a moment later than the status write inside it. Since
+    `--cancel` cancels the whole active list, one such refusal is reported
+    against that deployment and the rest are still cancelled; the command exits
+    non-zero at the end.
 15. When a running deploy ends — success, failure, or cancellation — the
     agent immediately promotes the one deploy waiting behind it (if any) to
     running. If nothing is queued, the project goes idle until the next
@@ -189,8 +197,10 @@ stateDiagram-v2
   `create_deployment`, are covered in full in `flows/environments.md`.
 - `crates/application/src/scheduler.rs` — the per-project deploy queue:
   starts a deploy immediately if the project is idle, otherwise queues it; a
-  newer queued request supersedes the one waiting; drives cancel and
-  promotes the next queued deploy once the running one finishes.
+  newer queued request supersedes the one waiting; drives cancel — checking the
+  recorded status first, so a deployment that already finished is not treated as
+  cancellable while its slot is still being released — and promotes the next
+  queued deploy once the running one finishes.
 - `crates/infrastructure/src/git.rs` — the fetch stage: clones or updates
   the checkout, generates a per-project SSH deploy key when the repo needs
   one, and checks repo access ahead of a deploy.
