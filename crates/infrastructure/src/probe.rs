@@ -101,8 +101,11 @@ fn data_dir_permissions_check(stat: Result<String, String>) -> DiagnosticCheck {
             let mut parts = out.split_whitespace();
             let owner = parts.next().unwrap_or_default().to_string();
             let mode = parts.next().unwrap_or_default().to_string();
-            let wide = mode.chars().last().is_some_and(|c| c != '0');
-            let passed = owner == "rpi-agent" && !wide;
+            let too_wide = match u32::from_str_radix(&mode, 8) {
+                Ok(bits) => bits & !0o750 != 0,
+                Err(_) => true,
+            };
+            let passed = owner == "rpi-agent" && !too_wide;
             DiagnosticCheck {
                 name: "data dir permissions".into(),
                 passed,
@@ -788,5 +791,22 @@ mod tests {
     #[test]
     fn data_dir_permissions_check_passes_when_tighter() {
         assert!(data_dir_permissions_check(Ok("rpi-agent 700".into())).passed);
+    }
+
+    #[test]
+    fn data_dir_permissions_check_fails_on_a_group_writable_dir() {
+        // Ends in '0' (others), so a naive last-digit check would call this
+        // healthy — but group-write matters: `rpi setup` puts the login user
+        // in the `rpi-agent` group, so this is a real escalation path.
+        let check = data_dir_permissions_check(Ok("rpi-agent 770".into()));
+        assert!(!check.passed);
+        assert!(check.hint.unwrap().contains("rpi agent setup"));
+    }
+
+    #[test]
+    fn data_dir_permissions_check_fails_on_an_unparseable_mode() {
+        let check = data_dir_permissions_check(Ok("rpi-agent garbage".into()));
+        assert!(!check.passed);
+        assert!(check.hint.unwrap().contains("rpi agent setup"));
     }
 }
