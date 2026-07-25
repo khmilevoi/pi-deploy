@@ -83,14 +83,27 @@ fn create_secret_dir(path: &Path) -> std::io::Result<()> {
 /// Widens a directory this writer created before 0.26.0 (owned by us and at
 /// exactly `0700`) so a container can traverse into it. Anything else — a
 /// directory from the repository, one with another owner, one with any other
-/// mode — is left untouched: it is not ours to change. Best-effort; a failure
-/// to stat or chmod is not worth failing a deploy over.
+/// mode, or not a directory at all — is left untouched: it is not ours to
+/// change. Best-effort; a failure to stat or chmod is not worth failing a
+/// deploy over.
+///
+/// `symlink_metadata` rather than `metadata`: the caller already ruled out a
+/// symlink at this exact path via `stat_dir_component` moments ago, but using
+/// the non-following stat here too avoids re-opening a TOCTOU window, and —
+/// combined with the `is_dir()` check — also refuses a *plain file* that
+/// happens to sit at an intermediate path component. `DirStep::Existing`
+/// covers "any non-symlink entry", not "any directory", so without this
+/// check a 0700 file owned by us would get chmod'd to 0755 before the write
+/// itself fails on it not being a directory.
 #[cfg(unix)]
 fn widen_legacy_secret_dir(path: &Path) {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    let Ok(meta) = std::fs::metadata(path) else {
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
         return;
     };
+    if !meta.file_type().is_dir() {
+        return;
+    }
     if meta.permissions().mode() & 0o777 != 0o700 {
         return;
     }
@@ -720,6 +733,40 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o750, "only an exact 0700 is ours to widen");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_plain_file_at_an_intermediate_path_component_is_never_widened() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // `stat_dir_component` reports `DirStep::Existing` for any non-symlink
+        // entry, including a plain file that happens to occupy the spot a
+        // directory component is expected at.
+        std::fs::write(dir.path().join("certs"), b"not a directory").unwrap();
+        std::fs::set_permissions(
+            dir.path().join("certs"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+
+        let result = FsSecretsWriter::new()
+            .write(dir.path(), &bundle_with_file())
+            .await;
+
+        assert!(
+            result.is_err(),
+            "writing 'certs/server.pem' through a plain file 'certs' must fail"
+        );
+        let mode = std::fs::metadata(dir.path().join("certs"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "a non-directory entry at 0700 must never be widened"
+        );
     }
 
     #[cfg(unix)]
