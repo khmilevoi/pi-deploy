@@ -110,7 +110,7 @@ impl SecretStore for EncryptedFileStore {
         let path = self.bundle_path(project)?;
         let legacy = self.legacy_path(project)?;
         tokio::task::spawn_blocking(move || {
-            fsutil::write_private_atomic(&path, &ciphertext).map_err(secrets_err)?;
+            fsutil::write_private_atomic(&path, &ciphertext, 0o600).map_err(secrets_err)?;
             match fs::remove_file(&legacy) {
                 Ok(()) => Ok(()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),

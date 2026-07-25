@@ -131,7 +131,7 @@ fn write_files_blocking(
         }
 
         let target = dir.join(file_component);
-        fsutil::write_private_atomic(&target, &bytes)
+        fsutil::write_private_atomic(&target, &bytes, 0o600)
             .map_err(|e| storage_err(format!("write secret file '{rel}'"), e))?;
     }
     Ok(())
@@ -254,7 +254,7 @@ fn sync_manifest_blocking(
         };
         let contents = serde_json::to_vec(&manifest)
             .map_err(|e| storage_err("serialize secrets manifest".into(), e))?;
-        fsutil::write_private_atomic(manifest_path, &contents)
+        fsutil::write_private_atomic(manifest_path, &contents, 0o600)
             .map_err(|e| storage_err("write secrets manifest".into(), e))?;
     }
     Ok(())
@@ -293,7 +293,7 @@ impl SecretsWriter for FsSecretsWriter {
         } else {
             let contents = dotenv::serialize(bundle);
             tokio::task::spawn_blocking(move || {
-                fsutil::write_private_atomic(&env_path, contents.as_bytes())
+                fsutil::write_private_atomic(&env_path, contents.as_bytes(), 0o600)
             })
             .await
             .map_err(|e| storage_err("write .env".into(), format!("join error: {e}")))?
