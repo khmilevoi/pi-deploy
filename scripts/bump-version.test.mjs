@@ -52,7 +52,52 @@ test("bumpPackageJson preserves formatting byte-for-byte apart from the version"
   assert.equal(out, PKG.replace('"version": "0.25.1"', '"version": "0.25.2"'));
 });
 
+test("bumpPackageJson rewrites the top-level version and leaves a nested engines.version untouched", () => {
+  const pkg = '{\n  "name": "x",\n  "engines": {\n    "version": "9.9.9"\n  },\n  "version": "0.25.1"\n}\n';
+  const out = bumpPackageJson(pkg, "0.25.2");
+  assert.equal(JSON.parse(out).version, "0.25.2");
+  assert.equal(JSON.parse(out).engines.version, "9.9.9");
+  assert.match(out, /"version": "9\.9\.9"/);
+  assert.match(out, /"version": "0\.25\.2"\n\}/);
+});
+
+test("bumpPackageJson throws when there is no top-level version key", () => {
+  const pkg = '{\n  "name": "x",\n  "engines": {\n    "version": "9.9.9"\n  }\n}\n';
+  assert.throws(() => bumpPackageJson(pkg, "0.25.2"), BumpError);
+});
+
 test("assertLockfileDiff accepts a workspace-only diff", () => {
+  const diff = `diff --git a/Cargo.lock b/Cargo.lock
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -10,3 +10,3 @@
+ [[package]]
+ name = "pi"
+-version = "0.25.1"
++version = "0.25.2"
+`;
+  assert.doesNotThrow(() => assertLockfileDiff(diff, "0.25.1", "0.25.2"));
+});
+
+test("assertLockfileDiff accepts a paired change owned by pi and by pi-domain", () => {
+  const diff = `diff --git a/Cargo.lock b/Cargo.lock
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -10,3 +10,3 @@
+ [[package]]
+ name = "pi"
+-version = "0.25.1"
++version = "0.25.2"
+@@ -40,3 +40,3 @@
+ [[package]]
+ name = "pi-domain"
+-version = "0.25.1"
++version = "0.25.2"
+`;
+  assert.doesNotThrow(() => assertLockfileDiff(diff, "0.25.1", "0.25.2"));
+});
+
+test("assertLockfileDiff rejects a changed version line with no visible owning name line", () => {
   const diff = `diff --git a/Cargo.lock b/Cargo.lock
 --- a/Cargo.lock
 +++ b/Cargo.lock
@@ -63,6 +108,54 @@ test("assertLockfileDiff accepts a workspace-only diff", () => {
 -version = "0.25.1"
 +version = "0.25.2"
 `;
+  assert.throws(() => assertLockfileDiff(diff, "0.25.1", "0.25.2"), BumpError);
+});
+
+test("assertLockfileDiff rejects a lone unpaired +version line", () => {
+  const diff = `diff --git a/Cargo.lock b/Cargo.lock
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -10,3 +10,3 @@
+ [[package]]
+ name = "pi"
+-version = "0.25.1"
++version = "0.25.2"
+@@ -40,2 +40,3 @@
+ [[package]]
+ name = "pi-domain"
++version = "0.25.2"
+`;
+  assert.throws(() => assertLockfileDiff(diff, "0.25.1", "0.25.2"), BumpError);
+});
+
+test("assertLockfileDiff rejects a properly paired change owned by pin-project", () => {
+  const diff = `diff --git a/Cargo.lock b/Cargo.lock
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -10,3 +10,3 @@
+ [[package]]
+ name = "pin-project"
+-version = "0.25.1"
++version = "0.25.2"
+`;
+  assert.throws(() => assertLockfileDiff(diff, "0.25.1", "0.25.2"), (err) => {
+    assert.ok(err instanceof BumpError);
+    assert.match(err.message, /pin-project/);
+    return true;
+  });
+});
+
+test("assertLockfileDiff accepts the existing valid fixture with CRLF line endings", () => {
+  const lfDiff = `diff --git a/Cargo.lock b/Cargo.lock
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -10,3 +10,3 @@
+ [[package]]
+ name = "pi"
+-version = "0.25.1"
++version = "0.25.2"
+`;
+  const diff = lfDiff.replace(/\n/g, "\r\n");
   assert.doesNotThrow(() => assertLockfileDiff(diff, "0.25.1", "0.25.2"));
 });
 

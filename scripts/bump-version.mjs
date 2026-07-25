@@ -23,20 +23,89 @@ export function bumpCargoToml(text, version) {
 }
 
 export function bumpPackageJson(text, version) {
-  const re = /^(\s*"version"\s*:\s*")([^"]+)(")/m;
-  if (!re.test(text)) {
-    throw new BumpError("cannot find a top-level version in package.json");
+  const n = text.length;
+
+  function skipString(startIdx) {
+    // startIdx points at the opening quote; returns the index of the
+    // closing quote (or the end of the text if unterminated).
+    let j = startIdx + 1;
+    while (j < n) {
+      const c = text[j];
+      if (c === "\\") {
+        j += 2;
+        continue;
+      }
+      if (c === '"') {
+        return j;
+      }
+      j++;
+    }
+    return j;
   }
-  return text.replace(re, `$1${version}$3`);
+
+  let depth = 0;
+  let i = 0;
+  while (i < n) {
+    const c = text[i];
+    if (c === '"') {
+      const strStart = i;
+      const strEnd = skipString(i);
+      const strValue = text.slice(strStart + 1, strEnd);
+
+      let k = strEnd + 1;
+      while (k < n && /\s/.test(text[k])) k++;
+      const isKey = text[k] === ":";
+
+      if (isKey && strValue === "version" && depth === 1) {
+        let v = k + 1;
+        while (v < n && /\s/.test(text[v])) v++;
+        if (text[v] !== '"') {
+          throw new BumpError("top-level \"version\" value in package.json is not a string");
+        }
+        const valStart = v;
+        const valEnd = skipString(v);
+        return text.slice(0, valStart + 1) + version + text.slice(valEnd);
+      }
+
+      i = strEnd + 1;
+      continue;
+    }
+    if (c === "{" || c === "[") {
+      depth++;
+      i++;
+      continue;
+    }
+    if (c === "}" || c === "]") {
+      depth--;
+      i++;
+      continue;
+    }
+    i++;
+  }
+
+  throw new BumpError("cannot find a top-level version in package.json");
+}
+
+const VERSION_LINE_RE = /^([-+])version = "([^"]+)"\r?$/;
+const NAME_LINE_RE = /^[-+ ]name = "([^"]+)"\r?$/;
+
+function isWorkspaceCrate(name) {
+  return name === "pi" || name.startsWith("pi-");
 }
 
 export function assertLockfileDiff(diffText, from, to) {
-  const lines = diffText.split("\n").filter((l) => /^[-+]/.test(l) && !/^(---|\+\+\+)/.test(l));
-  if (lines.length === 0) {
+  const allLines = diffText.split("\n");
+  const changeLines = allLines.filter((l) => /^[-+]/.test(l) && !/^(---|\+\+\+)/.test(l));
+  if (changeLines.length === 0) {
     throw new BumpError("Cargo.lock shows no changes — did `cargo update --workspace` run?");
   }
-  const offending = lines.filter((l) => {
-    const m = /^([-+])version = "([^"]+)"$/.exec(l);
+
+  // Value check: every changed line must be a version line moving exactly
+  // from -> to. This alone does not prevent an unrelated crate's version
+  // from being smuggled in if it happens to share the same from/to values,
+  // which is why the structural checks below exist.
+  const offending = changeLines.filter((l) => {
+    const m = VERSION_LINE_RE.exec(l);
     if (!m) return true;
     return m[1] === "-" ? m[2] !== from : m[2] !== to;
   });
@@ -44,6 +113,58 @@ export function assertLockfileDiff(diffText, from, to) {
     throw new BumpError(
       `Cargo.lock carries changes beyond the workspace version bump — commit those separately:\n${offending.map((l) => `  ${l}`).join("\n")}`,
     );
+  }
+
+  // Structural checks, per hunk: (1) removed and added version lines must
+  // pair up, and (2) every changed version line must belong to a workspace
+  // crate, found via the nearest preceding `name = "..."` line in the same
+  // hunk (context or changed).
+  const hunks = [];
+  let current = null;
+  for (const line of allLines) {
+    if (/^@@/.test(line)) {
+      current = [];
+      hunks.push(current);
+    } else if (current) {
+      current.push(line);
+    }
+  }
+
+  for (const hunk of hunks) {
+    let removed = 0;
+    let added = 0;
+    for (let i = 0; i < hunk.length; i++) {
+      const m = VERSION_LINE_RE.exec(hunk[i]);
+      if (!m) continue;
+      if (m[1] === "-") {
+        removed++;
+      } else {
+        added++;
+      }
+
+      let owner = null;
+      for (let j = i - 1; j >= 0; j--) {
+        const nm = NAME_LINE_RE.exec(hunk[j]);
+        if (nm) {
+          owner = nm[1];
+          break;
+        }
+      }
+      if (owner === null) {
+        throw new BumpError(`cannot determine the owning crate for changed line: ${hunk[i]}`);
+      }
+      if (!isWorkspaceCrate(owner)) {
+        throw new BumpError(
+          `Cargo.lock version change belongs to "${owner}", not a workspace crate — commit that separately:\n  ${hunk[i]}`,
+        );
+      }
+    }
+    if (removed !== added) {
+      const culprits = hunk.filter((l) => VERSION_LINE_RE.test(l)).map((l) => `  ${l}`);
+      throw new BumpError(
+        `Cargo.lock has an unpaired version change (${removed} removed vs ${added} added in one hunk):\n${culprits.join("\n")}`,
+      );
+    }
   }
 }
 
@@ -77,15 +198,24 @@ function main() {
 
   const cargoPath = path.join(root, "Cargo.toml");
   const pkgPath = path.join(root, "package.json");
-  const from = JSON.parse(fs.readFileSync(pkgPath, "utf8")).version;
+  const cargoText = fs.readFileSync(cargoPath, "utf8");
+  const pkgText = fs.readFileSync(pkgPath, "utf8");
+  const from = JSON.parse(pkgText).version;
 
-  fs.writeFileSync(cargoPath, bumpCargoToml(fs.readFileSync(cargoPath, "utf8"), version));
-  fs.writeFileSync(pkgPath, bumpPackageJson(fs.readFileSync(pkgPath, "utf8"), version));
+  // Compute both new contents before writing either — a failure bumping
+  // the second file must not leave the first one half-bumped on disk.
+  const nextCargoText = bumpCargoToml(cargoText, version);
+  const nextPkgText = bumpPackageJson(pkgText, version);
+
+  fs.writeFileSync(cargoPath, nextCargoText);
+  fs.writeFileSync(pkgPath, nextPkgText);
   console.log(`bump-version: ${from} -> ${version} in Cargo.toml, package.json`);
 
   execFileSync("cargo", ["update", "--workspace"], { cwd: root, stdio: "inherit" });
 
-  assertLockfileDiff(git(root, "diff", "-U0", "--", "Cargo.lock"), from, version);
+  // -U3 (rather than -U0) is required so each hunk carries the `name = "..."`
+  // line that assertLockfileDiff needs to verify crate ownership.
+  assertLockfileDiff(git(root, "diff", "-U3", "--", "Cargo.lock"), from, version);
   console.log("bump-version: Cargo.lock diff is workspace-only");
 
   assertChangedFiles(git(root, "diff", "--name-only").split("\n").filter(Boolean));
