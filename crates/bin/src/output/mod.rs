@@ -147,6 +147,24 @@ pub fn status(msg: impl std::fmt::Display) {
     eprintln!("{}", status_line(&msg.to_string()));
 }
 
+/// One line of a streamed remote payload, printed to stdout verbatim as it
+/// arrives: no frame, no scroll window, no truncation to the terminal width.
+/// Used by `rpi command`, where the remote output *is* the data the operator
+/// came to read, so it must survive redirection and long lines intact.
+///
+/// Only layout-breaking control sequences are dropped (cursor movement, erase,
+/// scroll — see `sanitize_line`); colour is passed through untouched.
+pub fn log_line(line: &str) {
+    let stdout = std::io::stdout();
+    write_log_line(line, &mut stdout.lock());
+}
+
+fn write_log_line(line: &str, out: &mut impl std::io::Write) {
+    // A closed/broken pipe downstream is not this layer's problem to report:
+    // the exit code still carries the remote command's verdict.
+    let _ = writeln!(out, "{}", pi_infrastructure::process::sanitize_line(line));
+}
+
 /// Print the deploy logo banner to stderr, but only on an interactive
 /// terminal — under a pipe, file, or CI it is skipped so logs stay clean.
 pub fn show_deploy_banner(project: &str) {
@@ -276,6 +294,21 @@ mod tests {
         assert_eq!(styled_err("FAIL"), "FAIL");
         // The sparkline accent tint is plain text off a TTY, same contract.
         assert_eq!(styled_accent("▁▂▃"), "▁▂▃");
+    }
+
+    #[test]
+    fn log_line_keeps_long_lines_whole_and_drops_layout_control() {
+        // The `rpi command` contract: whatever the container printed reaches
+        // stdout unabridged. A line far wider than any terminal must not be
+        // truncated, while a cursor-erase sequence (which would corrupt the
+        // scrollback) is stripped and colour survives.
+        let long = "x".repeat(400);
+        let mut out = Vec::new();
+        write_log_line(&format!("\x1b[2K\x1b[32m{long}\x1b[0m"), &mut out);
+        assert_eq!(
+            String::from_utf8(out).unwrap(),
+            format!("\x1b[32m{long}\x1b[0m\n")
+        );
     }
 
     #[test]

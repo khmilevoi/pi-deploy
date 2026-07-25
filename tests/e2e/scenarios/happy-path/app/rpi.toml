@@ -1,0 +1,28 @@
+schema = 1
+
+[project]
+name = "e2e-fixture"
+
+[source]
+repo = "git://git-fixture/fixture.git"
+branch = "main"
+
+[build]
+compose = "compose.yaml"
+
+[ingress]
+service = "web"
+port = 8080
+
+[healthcheck]
+path = "/health"
+expect = "200"
+timeout = "30s"
+
+# `rpi command` coverage. echo-lines prints more lines than any pane window
+# would have shown plus one line far wider than a terminal, so the scenario can
+# prove the CLI streams everything untruncated; fail-lines proves output still
+# arrives when the run fails and that the in-container exit code propagates.
+[commands]
+echo-lines = ["sh", "-c", "i=1; while [ $i -le 30 ]; do echo line-$i; i=$((i+1)); done; long=; i=1; while [ $i -le 200 ]; do long=${long}x; i=$((i+1)); done; echo tail-$long"]
+fail-lines = ["sh", "-c", "echo before-failure; exit 7"]

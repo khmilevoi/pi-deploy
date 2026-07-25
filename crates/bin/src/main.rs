@@ -114,9 +114,6 @@ enum Cmd {
         /// Extra arguments appended to the declared command (write them after --)
         #[arg(last = true)]
         args: Vec<String>,
-        /// Print the full output instead of just the last lines
-        #[arg(long)]
-        full: bool,
         /// Deploy/operate an environment defined by rpi.<env>.toml
         #[arg(long)]
         env: Option<String>,
@@ -459,11 +456,10 @@ async fn run() -> anyhow::Result<()> {
         Cmd::Command {
             name,
             args,
-            full,
             env,
             vars,
             connect,
-        } => cli::commands::command(name, args, full, env, vars, connect).await,
+        } => cli::commands::command(name, args, env, vars, connect).await,
         Cmd::Stats {
             project,
             json,
@@ -872,6 +868,14 @@ mod tests {
             }
             _ => panic!("expected command"),
         }
+    }
+
+    #[test]
+    fn command_rejects_the_removed_full_flag() {
+        assert!(
+            Cli::try_parse_from(["pi", "command", "migrate", "--full"]).is_err(),
+            "--full is removed: command output always streams in full"
+        );
     }
 
     #[test]

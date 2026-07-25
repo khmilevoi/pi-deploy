@@ -30,7 +30,7 @@ sequenceDiagram
             Svc-->>Runner: stdout or stderr line
             Runner-->>Agent: line
             Agent-->>CLI: log event
-            CLI-->>Op: append to live pane
+            CLI-->>Op: print the line to stdout as it arrives
         end
         alt exec fails to start, e.g. service not running
             Svc-->>Runner: exec error
@@ -81,13 +81,20 @@ sequenceDiagram
    run that hangs past that budget is killed and reported as a timeout, the
    same way a stuck deploy stage would be.
 6. **Streaming output.** stdout/stderr lines from the exec are pushed onto
-   the response as an event stream as they're produced, and the CLI renders
-   them into a live pane on the terminal as they arrive.
+   the response as an event stream as they're produced, and the CLI prints
+   each one to its own stdout the moment it arrives — every line, in full,
+   with no framing, no last-N window, and no truncation to the terminal
+   width. The remote output is this command's payload rather than progress
+   noise, so it follows the "stdout is data" split (see
+   `docs/cli-philosophy.md`) and survives redirection to a file or a pipe
+   unchanged. The only thing the CLI takes out is control sequences that
+   would corrupt the terminal (cursor movement, line/screen erase); colour
+   passes through.
 7. **Finishing.** The last thing on the stream is the in-container exit
-   code. The CLI mirrors it exactly: exit 0 prints a short success summary
-   (or the full buffered output with `--full`); the CLI process itself then
-   exits with that same code, so `rpi command` can be chained in scripts and
-   its exit status trusted like any other tool's.
+   code. The CLI mirrors it exactly: one closing verdict line on stderr
+   (success, or the failing code), then the CLI process itself exits with
+   that same code, so `rpi command` can be chained in scripts and its exit
+   status trusted like any other tool's.
 
 ### Failure branches
 
@@ -118,6 +125,13 @@ sequenceDiagram
   argv), builds the exec target (service, Compose file, override file,
   workdir), enforces the run's time budget, and returns the in-container
   exit code.
+- `crates/bin/src/cli/commands.rs` — the CLI side of `rpi command`: the
+  no-name listing (deployed commands plus the "declared but never deployed"
+  hint), and the run path that streams every output line straight to stdout
+  and mirrors the remote exit code as its own.
+- `crates/bin/src/output/mod.rs` — the one place that writes a streamed
+  payload line to stdout: no frame, no window, no width truncation, with only
+  terminal-corrupting control sequences removed.
 - `crates/bin/src/cli/sse.rs` — the client-side parser that turns the raw
   `event:`/`data:` text of the HTTP response into discrete events; this is
   what the CLI uses to read the "log" and "exit" events this flow streams

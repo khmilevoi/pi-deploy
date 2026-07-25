@@ -317,7 +317,7 @@ service = "server"                    # optional; omitted => ingress service
 - Values are a string (split with shell-word rules — quotes work, but no variables/pipes/redirects; need a shell? spell out `sh -c '…'`) or an explicit argv array. Names must match `[a-z0-9][a-z0-9_-]*`.
 - Commands are registered on the agent **at deploy time** and run via `docker compose exec -T` in the `ingress.service` container by default. The agent only executes deployed commands — there is no generic remote exec.
 - `rpi command` (no name) lists the deployed commands; extra args after `--` are appended to the declared argv. The remote exit code becomes the `rpi` exit code. Ctrl+C detaches and best-effort kills the run.
-- The live pane shows only the last 10 lines while streaming; on success only that tail stays on screen. Pass `--full` to also dump the complete captured output after it finishes. On failure the full output is always dumped.
+- Output streams to stdout line by line as the command runs — complete and untruncated, with no pane or tail window — so `rpi command migrate > migrate.log` captures exactly what ran. Only the closing verdict goes to stderr.
 
 ## Environments
 
