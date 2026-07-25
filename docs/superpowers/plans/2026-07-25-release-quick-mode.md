@@ -48,8 +48,15 @@ new dependencies in either repo.
   `rpi-v<X.Y.Z>-x86_64-pc-windows-msvc.zip`,
   `rpi-v<X.Y.Z>-x86_64-unknown-linux-musl.tar.gz`,
   `rpi-v<X.Y.Z>-aarch64-unknown-linux-musl.tar.gz`, `SHA256SUMS`.
-- **Release workflow jobs** are exactly four: `check`, `build`, `release`,
-  `npm-publish`.
+- **Release workflow jobs**, as *reported by GitHub* for `v0.25.1` — not as
+  keyed in `release.yml`: `check`, three matrix instances
+  `build (windows-latest, x86_64-pc-windows-msvc)`,
+  `build (ubuntu-latest, x86_64-unknown-linux-musl)`,
+  `build (ubuntu-24.04-arm, aarch64-unknown-linux-musl)`, then `release`
+  and `npm-publish`. A bare `build` job never exists. Any check over job
+  names must match a matrix parent by the `<name> (` prefix — requiring
+  that separator, so `builder` does not satisfy `build` — and require every
+  instance to be green.
 - **Quick-mode commit types:** allowed
   `fix docs chore ci test style refactor`; refusing types include
   `feat perf`; merge commits are excluded from classification entirely.
