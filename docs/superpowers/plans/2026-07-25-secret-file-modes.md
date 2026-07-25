@@ -1378,6 +1378,7 @@ rtk git commit -m "test(e2e): container reads a bind-mounted secret as a non-age
 
 **Files:**
 - Modify: `docs/architecture/flows/secrets.md` (the two `mode 0600` labels in the diagram, walkthrough item 4, the `secretsfile.rs` source anchor)
+- Modify: `docs/architecture/flows/agent-setup.md` (the data dir is now created and repaired at `0750`, and the repair report can name the mode as well as ownership), `docs/architecture/flows/observability.md` (the new `data dir permissions` check in `rpi doctor`), and any statement about `/var/lib/rpi`'s permissions in `docs/architecture/storage.md` or `docs/architecture/overview.md` — Task 7's implementer flagged these as missing from this list. Check each against the code before editing; only touch what actually drifted.
 - Modify: `README.md` (the `[secrets]` section)
 - Modify: `plugins/rpi/skills/rpi-toml/SKILL.md`, `plugins/rpi/skills/rpi-cli/SKILL.md`
 - Modify: `docs/superpowers/specs/2026-07-07-secret-files-design.md` (one line marking the file-mode YAGNI item superseded)
