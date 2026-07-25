@@ -2233,7 +2233,7 @@ dependencies = [
 
 [[package]]
 name = "pi"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2271,7 +2271,7 @@ dependencies = [
 
 [[package]]
 name = "pi-application"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "async-trait",
  "mockall",
@@ -2283,7 +2283,7 @@ dependencies = [
 
 [[package]]
 name = "pi-domain"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "async-trait",
  "mockall",
@@ -2294,7 +2294,7 @@ dependencies = [
 
 [[package]]
 name = "pi-infrastructure"
-version = "0.24.0"
+version = "0.25.0"
 dependencies = [
  "age",
  "async-trait",

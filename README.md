@@ -317,7 +317,7 @@ service = "server"                    # optional; omitted => ingress service
 - Values are a string (split with shell-word rules — quotes work, but no variables/pipes/redirects; need a shell? spell out `sh -c '…'`) or an explicit argv array. Names must match `[a-z0-9][a-z0-9_-]*`.
 - Commands are registered on the agent **at deploy time** and run via `docker compose exec -T` in the `ingress.service` container by default. The agent only executes deployed commands — there is no generic remote exec.
 - `rpi command` (no name) lists the deployed commands; extra args after `--` are appended to the declared argv. The remote exit code becomes the `rpi` exit code. Ctrl+C detaches and best-effort kills the run.
-- Output streams to stdout line by line as the command runs — complete and untruncated, with no pane or tail window — so `rpi command migrate > migrate.log` captures exactly what ran. Only the closing verdict goes to stderr.
+- Output streams to stdout line by line as the command runs — complete and untruncated, with no pane or tail window — so `rpi command migrate > migrate.log` captures exactly what ran. Only the closing verdict goes to stderr. (v0.25 removed `--full`, which existed for the old windowed pane — see [the migration note](docs/migration-command-full-flag.md).)
 
 ## Environments
 
@@ -694,6 +694,7 @@ The CLI warns when its version differs from the agent's. Update both sides to th
 - [CI deploys with GitHub Actions](docs/ci-github-actions.md)
 - [Migration: `pi` → `rpi` (v0.5 → v0.6)](docs/migration-v0.5-to-v0.6.md)
 - [Migration: `[env]` → `[secrets]`](docs/migration-env-to-secrets.md)
+- [Migration: `rpi command --full` removed (v0.25)](docs/migration-command-full-flag.md)
 - [Release notes](https://github.com/khmilevoi/rpi-deploy/releases) — full version history
 
 ## License

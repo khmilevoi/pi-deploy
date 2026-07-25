@@ -32,7 +32,7 @@ For the *why* behind this shape — the CLI↔agent boundary, command nesting, h
 - Tabular data: `output::table()`, UPPERCASE headers, `-` for absent cells, `println!("{table}")`. No ANSI styling inside cells (comfy-table width math breaks).
 - Sectioned lists: `output::heading("label:")` + indented `println!("  {item}")` (see `secrets_ls`).
 - One-shot confirmations: `output::success(...)`; hints: `output::note(...)`.
-- Streamed long-running output: `output::LogPane::new(label, 10)` + `push_line` + `finish_ok`/`finish_neutral`/`finish_err`; on failure `drop(tunnel)` then `std::process::exit(code)`.
+- Streamed long-running output, two shapes: progress a user watches (deploy) → `output::LogPane::new(label, 10)` + `push_line` + `finish_ok`/`finish_neutral`/`finish_err`; remote output that IS the payload (`rpi command`) → `output::log_line` per line, unframed and untruncated to stdout, verdict via `success`/`error`. Either way, on failure `drop(tunnel)` then `std::process::exit(code)`.
 - Machine-readable views get a `--json` flag: `serde_json::to_string_pretty` + early return before any table code.
 - Empty state: single plain `println!("no X ...")`, exit 0.
 - Durations: `human_duration`; PASS/FAIL strings: `styled_ok`/`styled_err` (pure, testable).
