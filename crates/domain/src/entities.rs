@@ -12,6 +12,9 @@ pub struct SecretsBundle {
     pub vars: BTreeMap<String, String>,
     /// Relative path (forward slashes) -> raw file bytes.
     pub files: BTreeMap<String, Vec<u8>>,
+    /// `[secrets].file_mode`, when the project set one. `None` means the
+    /// defaults in `crate::secretmode` apply.
+    pub file_mode: Option<u32>,
 }
 
 impl SecretsBundle {
@@ -27,6 +30,19 @@ impl SecretsBundle {
     /// Secret file paths only (sorted) — `rpi secrets ls`.
     pub fn file_paths(&self) -> Vec<String> {
         self.files.keys().cloned().collect()
+    }
+
+    /// Mode for files from `[secrets].files`.
+    pub fn secret_file_mode(&self) -> u32 {
+        self.file_mode
+            .unwrap_or(crate::secretmode::DEFAULT_SECRET_FILE_MODE)
+    }
+
+    /// Mode for the injected `.env`. Only widened when the project asked for
+    /// it explicitly.
+    pub fn env_mode(&self) -> u32 {
+        self.file_mode
+            .unwrap_or(crate::secretmode::DEFAULT_ENV_MODE)
     }
 }
 

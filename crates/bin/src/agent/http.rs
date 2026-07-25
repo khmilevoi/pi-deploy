@@ -748,6 +748,7 @@ async fn send_env_handler(
     let bundle = SecretsBundle {
         vars: req.vars,
         files: std::collections::BTreeMap::new(),
+        file_mode: None,
     };
     let saved = state
         .send_secrets
@@ -824,6 +825,7 @@ async fn send_secrets_handler(
     let bundle = SecretsBundle {
         vars: req.vars,
         files,
+        file_mode: None,
     };
     let saved = state
         .send_secrets
