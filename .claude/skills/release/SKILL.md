@@ -25,10 +25,65 @@ The project is pre-1.0; the rules as practiced here:
 
 Tiebreakers: mixed `feat` + `fix` → minor (feat wins). "Is this rendering change a feature?" — if a user looking at the terminal can tell the difference, yes → minor. If genuinely torn, name the two candidate versions and your reasoning to the user before bumping.
 
+## Quick mode (patch releases)
+
+`/release quick` asks for the short path. `node scripts/release-preflight.mjs`
+decides whether it is allowed — its verdict overrides the request, so a
+`quick: refused` line means the full checklist below, no exceptions.
+
+The mode rests on one fact: in a patch release the fix is already merged
+and already green on master, and the release commit touches only
+`Cargo.toml`, `package.json` and `Cargo.lock` — files that cannot break
+clippy or a test. So quick mode does not skip checks, it declines to re-run
+checks that already passed on the same tree. That reasoning does not
+survive a `feat:` commit, which is why preflight refuses one.
+
+1. `node scripts/release-preflight.mjs` → `quick: allowed (X.Y.Z)`.
+2. `node scripts/bump-version.mjs X.Y.Z` — writes the three files, runs
+   `cargo update --workspace`, and refuses if the lockfile picked up an
+   unrelated dependency bump or if anything else is in the tree.
+3. `rtk git commit -m "chore: release X.Y.Z"` with those three files, push.
+4. `rtk git tag -a vX.Y.Z -m "vX.Y.Z" && rtk git push origin vX.Y.Z` —
+   immediately, without waiting for `ci` on the release commit. The release
+   workflow's own `check` job re-runs versions and tests before `build` and
+   `publish`, so a failure leaves a dead tag, never a partial publish, and
+   the recovery in "If the release workflow fails after the tag" applies.
+5. `node scripts/release-verify.mjs X.Y.Z`.
+6. Release notes — required, same as any release, but short: one bullet per
+   `fix:` commit stating the old and the new behaviour. See "Release notes"
+   below.
+7. Landing: `cd` to the site repo, `rtk git pull`,
+   `npm run sync-version -- X.Y.Z`, `npm run og`, commit, push,
+   `rpi deploy`, then confirm the live page and re-fetch `og:image`.
+
+What quick mode does **not** do, and why it is safe:
+
+- **The local gate** (`fmt`, `clippy`, `test`, `node --test`, `npm pack`) —
+  replaced by preflight's "ci green on HEAD". Note this is a move between
+  two check surfaces, not a narrowing: the local gate runs on Windows and
+  catches things a Linux CI never will, and vice versa. It is acceptable
+  only because the release commit is version-only.
+- **The README `Status: vX.Y` line** — invariant under a patch bump
+  (`0.25.1 → 0.25.2` leaves `v0.25`). Other documentation is still updated
+  when the fix changes behaviour the docs describe.
+- **The four-auditor landing audit** — replaced by `sync-version`, which
+  guarantees versions by construction. Feature text, CLI transcripts and
+  `llms.txt` are still audited on every minor and major release.
+
 ## Release checklist (one commit, then one tag)
 
+0. **Preflight**: `node scripts/release-preflight.mjs`. It reports a clean
+   tree, `HEAD == origin/master`, the classified commit range, the current
+   and next-patch version, and whether `ci` is green on HEAD. Its `bump:`
+   line is input to the decision above, not a replacement for it — minor
+   versus major is still your call.
 1. **Clean start**: `rtk git status` clean, `rtk git pull` — you release exactly `origin/master` HEAD.
-2. **Bump versions**: `Cargo.toml` `[workspace.package] version` and `package.json` `version` to the same `X.Y.Z`; then `cargo update --workspace` and check `rtk git diff Cargo.lock` shows only the four `pi`/`pi-*` version lines. Stale lockfile = guaranteed CI failure (`--locked` everywhere).
+2. **Bump versions**: `node scripts/bump-version.mjs X.Y.Z`. It writes
+   `Cargo.toml` `[workspace.package] version` and `package.json` `version`,
+   runs `cargo update --workspace`, and fails if `Cargo.lock` carries any
+   change beyond the workspace version lines or if the tree holds anything
+   but those three files. A stale lockfile is a guaranteed CI failure
+   (`--locked` everywhere), which is what the assertion is for.
 3. **Update docs — this is part of the release commit, not optional polish**:
    - `README.md` "Status: vX.Y (...)" line near the top: new version + one-phrase feature summary, and fold the shipped features into the surrounding status paragraph / Supported features list (see how v0.7 prebuilt binaries is described there).
    - If the release changes behavior users must migrate through, add `docs/migration-*.md` (precedent: `migration-v0.5-to-v0.6.md`).
@@ -39,7 +94,7 @@ Tiebreakers: mixed `feat` + `fix` → minor (feat wins). "Is this rendering chan
    rtk cargo fmt --all -- --check
    rtk cargo clippy --all-targets --locked -- -D warnings
    rtk cargo test --locked
-   node --test "scripts/**/*.test.js"   # postinstall tests; CI runs these too
+   node --test "scripts/**/*.test.*"   # postinstall + release tooling tests; CI runs these too
    npm pack --dry-run                   # tarball must include bin/, scripts/, crates/, Cargo.toml, Cargo.lock
    ```
 5. **Commit and push**: `chore: release X.Y.Z` with `Cargo.toml package.json Cargo.lock README.md` (+ any docs). Wait for the `ci` workflow to go green: `rtk gh run list --workflow ci --limit 1`.
@@ -53,16 +108,12 @@ check (versions+tests) → build (3 archives named `rpi-vX.Y.Z-<triple>.*`) → 
 ## Post-release verification
 
 ```
-rtk gh run list --workflow release --limit 1   # 4 jobs green
-gh release view vX.Y.Z                         # 3 archives + SHA256SUMS
-npm view rpi-deploy version                    # X.Y.Z
+node scripts/release-verify.mjs X.Y.Z
 ```
 
-The `npx rpi-deploy@X.Y.Z --version` check must run in a throwaway Docker container, never directly on the dev machine — a local machine can have a global `rpi-deploy` install or npx cache that shadows the version resolution and silently passes/fails against stale state instead of the real published package:
+It checks the release workflow's jobs, the release assets, the published npm version, and an `npx` smoke test, and exits non-zero if any of them is wrong — the workflow's jobs must all be green; let the script's own output say which.
 
-```
-docker run --rm node:20-slim npx -y rpi-deploy@X.Y.Z --version   # must print rpi X.Y.Z, and install must be fast (prebuilt binary), not a multi-minute cargo build
-```
+The npx check runs inside a throwaway Docker container, never directly on the dev machine — a local machine can have a global `rpi-deploy` install or npx cache that shadows the version resolution and silently passes/fails against stale state instead of the real published package. The script also times the install and flags anything slower than ~90s, since that means npx fell back to a source build instead of the prebuilt binary.
 
 ## Release notes: describe what changed (required)
 
@@ -81,11 +132,17 @@ The landing (`rpi-deploy-site`, live at https://rpi.iiskelo.com) once sat five r
 The audit brief lives in the site repo, not here — **read `docs/landing-audit.md` in `rpi-deploy-site` before doing any of this** (step 1 below gets you a local copy). It defines the four auditor lenses, the shared context each needs, and the report format; this section only covers the release-side mechanics.
 
 1. **Sync the site repo.** Local checkout is a sibling directory: `C:\Users\Khmil\RustProjects\rpi-deploy-site` — `cd` there and `rtk git pull` first; only `git clone git@github.com:khmilevoi/rpi-deploy-site.git` as a fallback if the directory doesn't exist. Then read `docs/landing-audit.md`.
-2. **Spawn four read-only auditor subagents in parallel** (one message; Explore-type agents fit — they must not edit anything), one per section of `docs/landing-audit.md` (facts and numbers; CLI output fidelity; features and quick start; discovery files — `llms.txt`/`sitemap.xml`/`robots.txt`). Each prompt must be self-contained: the site repo path, the pi repo path, the absolute path to `docs/landing-audit.md` in the site repo with which section to follow, and the report format defined there.
-3. **Apply the confirmed fixes yourself** in the site repo (auditors only report, except Auditor 4's discovery-file fixes, which are low-risk enough to apply directly per the brief). When you rewrite any terminal block, transcribe it from the rendering code — the canonical deploy transcript and colour map in the Auditor 2 section of `docs/landing-audit.md` — never from memory or invention.
-4. **Regenerate the OG image before publishing — always, not only "if it changed".** `src/assets/og.png` is a rendered screenshot of the hero (`npm run og`, `scripts/generate-og.mjs`), so any edit to the hero, its terminal, the logo, copy, or styling silently stales it, and a stale OG is what everyone sees when the link is shared. Run `npm run og` and confirm `git status` shows `src/assets/og.png` restaged (or unchanged only if the hero genuinely did not move). Never commit hero changes without this.
-5. **Deploy and verify**: commit (include the regenerated `og.png` and any discovery-file fixes), push, then `rpi deploy` from the site repo root; check the live page reflects the fixes and re-fetch the OG (`og:image`) to confirm it is the new hero. The npm version *badge* is the only element that updates itself — every other number and claim on the page, and in `llms.txt`/`sitemap.xml`, is hand-written.
-6. **Purge the CDN cache if the deploy touched `styles.css`, `copy.js`, or `src/assets/**`.** These have no content hash in their filename, so Cloudflare's edge cache doesn't know they changed and keeps serving pre-deploy bytes until its TTL expires — `index.html` updates instantly (never cached) while CSS/JS/fonts silently lag behind for up to hours. See the "Post-deploy: purge the CDN cache" section of `docs/landing-audit.md` in the site repo for the purge command and how to verify it took (`Cf-Cache-Status` + a byte-diff against local, not just eyeballing the page).
+2. **Sync the version first**: `npm run sync-version -- X.Y.Z` in the site
+   repo. It rewrites every semver under `src/` and fails loudly if they are
+   not all the same string, so the auditors never spend attention on
+   numbers. If it reports a mixed set, resolve that by hand before
+   continuing — a foreign semver on the page is exactly the kind of thing
+   the audit exists to catch.
+3. **Spawn four read-only auditor subagents in parallel** (one message; Explore-type agents fit — they must not edit anything), one per section of `docs/landing-audit.md` (facts and numbers; CLI output fidelity; features and quick start; discovery files — `llms.txt`/`sitemap.xml`/`robots.txt`). Each prompt must be self-contained: the site repo path, the pi repo path, the absolute path to `docs/landing-audit.md` in the site repo with which section to follow, and the report format defined there. Version strings are already handled by `sync-version`; auditors report on feature text, CLI transcripts and discovery files.
+4. **Apply the confirmed fixes yourself** in the site repo (auditors only report, except Auditor 4's discovery-file fixes, which are low-risk enough to apply directly per the brief). When you rewrite any terminal block, transcribe it from the rendering code — the canonical deploy transcript and colour map in the Auditor 2 section of `docs/landing-audit.md` — never from memory or invention.
+5. **Regenerate the OG image before publishing — always, not only "if it changed".** `src/assets/og.png` is a rendered screenshot of the hero (`npm run og`, `scripts/generate-og.mjs`), so any edit to the hero, its terminal, the logo, copy, or styling silently stales it, and a stale OG is what everyone sees when the link is shared. Run `npm run og` and confirm `git status` shows `src/assets/og.png` restaged (or unchanged only if the hero genuinely did not move). Never commit hero changes without this.
+6. **Deploy and verify**: commit (include the regenerated `og.png` and any discovery-file fixes), push, then `rpi deploy` from the site repo root; check the live page reflects the fixes and re-fetch the OG (`og:image`) to confirm it is the new hero. The npm version *badge* is the only element that updates itself — every other number and claim on the page, and in `llms.txt`/`sitemap.xml`, is hand-written.
+7. **Purge the CDN cache if the deploy touched `styles.css`, `copy.js`, or `src/assets/**`.** These have no content hash in their filename, so Cloudflare's edge cache doesn't know they changed and keeps serving pre-deploy bytes until its TTL expires — `index.html` updates instantly (never cached) while CSS/JS/fonts silently lag behind for up to hours. See the "Post-deploy: purge the CDN cache" section of `docs/landing-audit.md` in the site repo for the purge command and how to verify it took (`Cf-Cache-Status` + a byte-diff against local, not just eyeballing the page).
 
 ## If the release workflow fails after the tag
 
