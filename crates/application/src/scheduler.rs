@@ -223,6 +223,20 @@ impl DeployScheduler {
             Running,
             No,
         }
+        // A slot's `running` entry is registered before the run starts and
+        // cleared only after the run future returns — but that future writes the
+        // terminal status just before returning. Between those two points the
+        // slot still says "running" for a deployment that is already finished,
+        // so honouring the slot there would signal a token nobody listens to and
+        // report CancelRequested for a finished deploy. History is the authority
+        // on terminal state: a recorded terminal status means the run is over.
+        // A read failure is not fatal here — fall through to the slot rather
+        // than fail a cancel that would otherwise have worked.
+        if let Ok(Some(recorded)) = self.history.get(deployment_id).await {
+            if recorded.status.is_terminal() {
+                return Ok(CancelOutcome::NotActive);
+            }
+        }
         let found = {
             let mut slots = self
                 .slots
@@ -351,7 +365,23 @@ mod tests {
         history
             .expect_record_finished()
             .returning(|_, _, _, _, _| Ok(()));
+        // `cancel` reads the recorded status before trusting the slot; no row
+        // means nothing is known, so it falls through to the slot as before.
+        history.expect_get().returning(|_| Ok(None));
         history
+    }
+
+    fn recorded(id: &str, status: DeploymentStatus) -> Deployment {
+        Deployment {
+            id: id.into(),
+            project: "a".into(),
+            git_ref: "main".into(),
+            commit_sha: None,
+            started_at: 100,
+            finished_at: status.is_terminal().then_some(100),
+            status,
+            log_tail: String::new(),
+        }
     }
 
     fn clock() -> MockClock {
@@ -513,6 +543,9 @@ mod tests {
             })
             .times(1)
             .returning(|_, _, _, _, _| Ok(()));
+        history
+            .expect_get()
+            .returning(|id| Ok(Some(recorded(id, DeploymentStatus::Queued))));
         let scheduler = scheduler_with(&runner, history);
 
         scheduler
@@ -688,6 +721,9 @@ mod tests {
         history
             .expect_record_finished()
             .returning(|_, _, _, _, _| Err(DomainError::Storage("db locked".into())));
+        history
+            .expect_get()
+            .returning(|id| Ok(Some(recorded(id, DeploymentStatus::Queued))));
         let scheduler = scheduler_with(&runner, history);
 
         scheduler
@@ -724,6 +760,60 @@ mod tests {
         })
         .await;
         assert_eq!(runner.started_ids(), vec!["d1"], "d2 must never start");
+    }
+
+    #[tokio::test]
+    async fn cancel_of_a_deployment_already_recorded_terminal_is_not_active() {
+        // The slot holds its `running` entry until the run future returns, but
+        // the terminal status is written *inside* that future, just before it
+        // returns. In between, the slot says "running" while history says
+        // "success" — and a cancel landing there used to signal a token nobody
+        // listens to and answer CancelRequested, which the HTTP layer renders as
+        // 200 {"status":"canceling"} for a deploy that already finished instead
+        // of 409 "already finished". History is the authority on terminal state.
+        let runner = FakeRunner::new();
+        let mut history = MockDeploymentHistory::new();
+        history.expect_record_queued().returning(|_| Ok(()));
+        history
+            .expect_record_finished()
+            .returning(|_, _, _, _, _| Ok(()));
+        history
+            .expect_get()
+            .returning(|id| Ok(Some(recorded(id, DeploymentStatus::Success))));
+        let scheduler = scheduler_with(&runner, history);
+
+        let sink = CollectSink::new();
+        scheduler
+            .submit(
+                "d1".into(),
+                config("a"),
+                DeployRef::Branch("main".into()),
+                sink.clone(),
+            )
+            .await
+            .unwrap();
+        wait_until("d1 started", || runner.started_ids() == vec!["d1"]).await;
+
+        // d1 is still inside `runner.run` (the gate is shut), so the slot still
+        // registers it as running: exactly the window above.
+        assert_eq!(
+            scheduler.cancel("d1").await.unwrap(),
+            CancelOutcome::NotActive,
+            "a deployment recorded as terminal is not cancellable"
+        );
+
+        // And the token must not have been signalled: the run finishes on its
+        // own terms (Success), not as Canceled.
+        runner.gate.add_permits(1);
+        wait_until("d1 finished", || {
+            runner.finished_count.load(Ordering::SeqCst) == 1
+        })
+        .await;
+        assert_eq!(
+            *sink.finished.lock().unwrap(),
+            vec![DeploymentStatus::Success],
+            "cancel must not have signalled the finished deploy's token"
+        );
     }
 
     #[tokio::test]
