@@ -169,13 +169,17 @@ async fn ensure_dir(
     sys: &dyn Sys,
     path: &str,
     owner_group: Option<&str>,
+    mode: Option<&str>,
     dry: bool,
     rep: &mut SetupReport,
     repair: bool,
 ) {
     if sys.exists(Path::new(path)) {
-        // Repair ownership of pre-existing state dir to current rpi-agent UID (PR #7 K1):
-        // after uninstall+reinstall the kept files keep an old numeric UID.
+        // Repair pre-existing state dir toward the wanted ownership/mode (PR #7
+        // K1 for ownership): after uninstall+reinstall the kept files keep an
+        // old numeric UID, and a host provisioned before this dir was tightened
+        // may still carry a wider mode.
+        let mut repairs: Vec<&str> = Vec::new();
         if let Some(og) = owner_group {
             if !dry {
                 let want = format!("{og}:{og}");
@@ -183,12 +187,27 @@ async fn ensure_dir(
                 if cur.ok().as_deref() != Some(want.as_str())
                     && sys.run("chown", &["-R", &want, path]).await.is_ok()
                 {
-                    rep.repaired.push(format!("{path} (ownership)"));
-                    return;
+                    repairs.push("ownership");
                 }
             }
         }
-        rep.skipped.push(path.to_string());
+        if let Some(m) = mode {
+            if !dry {
+                // `stat -c %a` prints no leading zero, hence the trim.
+                let cur = sys.run("stat", &["-c", "%a", path]).await;
+                if cur.ok().as_deref().map(str::trim) != Some(m.trim_start_matches('0'))
+                    && sys.run("chmod", &[m, path]).await.is_ok()
+                {
+                    repairs.push("mode");
+                }
+            }
+        }
+        if repairs.is_empty() {
+            rep.skipped.push(path.to_string());
+        } else {
+            rep.repaired
+                .push(format!("{path} ({})", repairs.join(", ")));
+        }
         return;
     }
     if dry {
@@ -199,10 +218,15 @@ async fn ensure_dir(
         }
         return;
     }
-    let args: Vec<&str> = match owner_group {
-        Some(og) => vec!["-d", "-o", og, "-g", og, path],
-        None => vec!["-d", path],
-    };
+    let mut args: Vec<&str> = vec!["-d"];
+    if let Some(m) = mode {
+        args.push("-m");
+        args.push(m);
+    }
+    if let Some(og) = owner_group {
+        args.extend(["-o", og, "-g", og]);
+    }
+    args.push(path);
     match sys.run("install", &args).await {
         Ok(_) => {
             if repair {
@@ -407,9 +431,27 @@ pub async fn setup(sys: &dyn Sys, opts: &SetupOpts) -> SetupReport {
     }
 
     // 4-6. directories
-    ensure_dir(sys, "/var/lib/rpi", Some("rpi-agent"), dry, &mut rep, false).await;
-    ensure_dir(sys, "/var/log/rpi", Some("rpi-agent"), dry, &mut rep, true).await; // repair (§2.5)
-    ensure_dir(sys, "/etc/rpi", None, dry, &mut rep, false).await;
+    ensure_dir(
+        sys,
+        "/var/lib/rpi",
+        Some("rpi-agent"),
+        Some("0750"),
+        dry,
+        &mut rep,
+        false,
+    )
+    .await;
+    ensure_dir(
+        sys,
+        "/var/log/rpi",
+        Some("rpi-agent"),
+        None,
+        dry,
+        &mut rep,
+        true,
+    )
+    .await; // repair (§2.5)
+    ensure_dir(sys, "/etc/rpi", None, None, dry, &mut rep, false).await;
 
     // 7. agent.toml (only if absent)
     if sys.exists(Path::new(AGENT_TOML_PATH)) {
@@ -1774,7 +1816,7 @@ mod tests {
         assert!(calls.iter().any(|c| c == "usermod -aG rpi-agent piuser"));
         assert!(calls
             .iter()
-            .any(|c| c.contains("install -d -o rpi-agent -g rpi-agent /var/lib/rpi")));
+            .any(|c| c.contains("install -d -m 0750 -o rpi-agent -g rpi-agent /var/lib/rpi")));
         assert!(calls
             .iter()
             .any(|c| c.contains("install -d -o rpi-agent -g rpi-agent /var/log/rpi")));
@@ -1811,6 +1853,10 @@ mod tests {
         sys.ok.insert(
             FakeSys::key("stat", &["-c", "%U:%G", "/var/lib/rpi"]),
             "rpi-agent:rpi-agent".into(),
+        );
+        sys.ok.insert(
+            FakeSys::key("stat", &["-c", "%a", "/var/lib/rpi"]),
+            "750".into(),
         );
         sys.files.insert(UNIT_PATH.into(), UNIT.into());
         sys.files.insert(AGENT_TOML_PATH.into(), AGENT_TOML.into());
@@ -1850,6 +1896,11 @@ mod tests {
         sys.ok.insert(
             FakeSys::key("stat", &["-c", "%U:%G", "/var/lib/rpi"]),
             "999:999".into(),
+        );
+        // Mode is already correct, so only the ownership branch fires.
+        sys.ok.insert(
+            FakeSys::key("stat", &["-c", "%a", "/var/lib/rpi"]),
+            "750".into(),
         );
         // useradd succeeds (новый UID)
         sys.ok.insert(
@@ -1895,12 +1946,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn data_dir_is_created_at_mode_0750() {
+        let sys = fresh_sys();
+        let opts = SetupOpts {
+            login_user: "piuser".into(),
+            with_cloudflared: false,
+            dry_run: false,
+            cf_token: None,
+            domain: None,
+            tunnel_name: None,
+        };
+        let _ = setup(&sys, &opts).await;
+        let calls = sys.calls();
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "install -d -m 0750 -o rpi-agent -g rpi-agent /var/lib/rpi"),
+            "calls: {calls:?}"
+        );
+        assert!(
+            calls
+                .iter()
+                .any(|c| c == "install -d -o rpi-agent -g rpi-agent /var/log/rpi"),
+            "only the data dir gets a mode: {calls:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn existing_data_dir_with_a_wider_mode_is_repaired() {
+        let mut sys = fresh_sys();
+        sys.paths.insert("/var/lib/rpi".into());
+        // Ownership is already correct, so only the mode drifts.
+        sys.ok.insert(
+            FakeSys::key("stat", &["-c", "%U:%G", "/var/lib/rpi"]),
+            "rpi-agent:rpi-agent".into(),
+        );
+        sys.ok.insert(
+            FakeSys::key("stat", &["-c", "%a", "/var/lib/rpi"]),
+            "755".into(),
+        );
+        let opts = SetupOpts {
+            login_user: "piuser".into(),
+            with_cloudflared: false,
+            dry_run: false,
+            cf_token: None,
+            domain: None,
+            tunnel_name: None,
+        };
+        let report = setup(&sys, &opts).await;
+        assert!(
+            sys.calls().iter().any(|c| c == "chmod 0750 /var/lib/rpi"),
+            "calls: {:?}",
+            sys.calls()
+        );
+        assert!(
+            report
+                .repaired
+                .iter()
+                .any(|r| r.contains("/var/lib/rpi (mode)")),
+            "mode repair reported: {:?}",
+            report.repaired
+        );
+    }
+
+    #[tokio::test]
+    async fn a_data_dir_already_at_0750_is_left_alone() {
+        let mut sys = fresh_sys();
+        sys.paths.insert("/var/lib/rpi".into());
+        sys.ok.insert(
+            FakeSys::key("stat", &["-c", "%U:%G", "/var/lib/rpi"]),
+            "rpi-agent:rpi-agent".into(),
+        );
+        sys.ok.insert(
+            FakeSys::key("stat", &["-c", "%a", "/var/lib/rpi"]),
+            "750".into(),
+        );
+        let opts = SetupOpts {
+            login_user: "piuser".into(),
+            with_cloudflared: false,
+            dry_run: false,
+            cf_token: None,
+            domain: None,
+            tunnel_name: None,
+        };
+        let report = setup(&sys, &opts).await;
+        assert!(!sys.calls().iter().any(|c| c.starts_with("chmod 0750")));
+        assert!(report.skipped.iter().any(|s| s == "/var/lib/rpi"));
+    }
+
+    #[tokio::test]
     async fn ensure_dir_skips_when_ownership_already_correct() {
         let mut sys = fresh_sys();
         sys.paths.insert("/var/lib/rpi".into());
         sys.ok.insert(
             FakeSys::key("stat", &["-c", "%U:%G", "/var/lib/rpi"]),
             "rpi-agent:rpi-agent".into(),
+        );
+        sys.ok.insert(
+            FakeSys::key("stat", &["-c", "%a", "/var/lib/rpi"]),
+            "750".into(),
         );
         let opts = SetupOpts {
             login_user: "piuser".into(),
@@ -2108,7 +2252,16 @@ mod tests {
         let mut sys = fresh_sys();
         sys.err.insert(FakeSys::key(
             "install",
-            &["-d", "-o", "rpi-agent", "-g", "rpi-agent", "/var/lib/rpi"],
+            &[
+                "-d",
+                "-m",
+                "0750",
+                "-o",
+                "rpi-agent",
+                "-g",
+                "rpi-agent",
+                "/var/lib/rpi",
+            ],
         ));
         let opts = SetupOpts {
             login_user: "piuser".into(),

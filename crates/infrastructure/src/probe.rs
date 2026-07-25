@@ -91,6 +91,34 @@ fn memory_cgroup_check(controllers: Option<String>, v1_present: bool) -> Diagnos
     }
 }
 
+/// `/var/lib/rpi` holds every project's plaintext secrets. It must be owned by
+/// the agent and no wider than 0750; the file modes inside it are deliberately
+/// container-readable, so this directory is what keeps other local users out.
+fn data_dir_permissions_check(stat: Result<String, String>) -> DiagnosticCheck {
+    let hint = "tighten the agent data dir: sudo rpi agent setup";
+    match stat {
+        Ok(out) => {
+            let mut parts = out.split_whitespace();
+            let owner = parts.next().unwrap_or_default().to_string();
+            let mode = parts.next().unwrap_or_default().to_string();
+            let wide = mode.chars().last().is_some_and(|c| c != '0');
+            let passed = owner == "rpi-agent" && !wide;
+            DiagnosticCheck {
+                name: "data dir permissions".into(),
+                passed,
+                detail: format!("/var/lib/rpi: owner {owner}, mode {mode}"),
+                hint: if passed { None } else { Some(hint.into()) },
+            }
+        }
+        Err(err) => DiagnosticCheck {
+            name: "data dir permissions".into(),
+            passed: false,
+            detail: err,
+            hint: Some(hint.into()),
+        },
+    }
+}
+
 pub struct HostSystemProbe {
     runner: Arc<dyn ProbeRunner>,
     disk: Arc<dyn DiskProbe>,
@@ -211,6 +239,12 @@ impl SystemProbe for HostSystemProbe {
                 hint: Some("add rpi-agent to the 'docker' group".into()),
             },
         });
+
+        checks.push(data_dir_permissions_check(
+            self.runner
+                .run("stat", &["-c", "%U %a", "/var/lib/rpi"])
+                .await,
+        ));
 
         checks.push(
             match self
@@ -737,5 +771,22 @@ mod tests {
         let check = memory_cgroup_check(None, false);
         assert!(!check.passed);
         assert_eq!(check.name, "memory cgroup");
+    }
+
+    #[test]
+    fn data_dir_permissions_check_fails_on_a_world_readable_dir() {
+        let check = data_dir_permissions_check(Ok("rpi-agent 755".into()));
+        assert!(!check.passed);
+        assert!(check.hint.unwrap().contains("rpi agent setup"));
+    }
+
+    #[test]
+    fn data_dir_permissions_check_passes_at_0750() {
+        assert!(data_dir_permissions_check(Ok("rpi-agent 750".into())).passed);
+    }
+
+    #[test]
+    fn data_dir_permissions_check_passes_when_tighter() {
+        assert!(data_dir_permissions_check(Ok("rpi-agent 700".into())).passed);
     }
 }
