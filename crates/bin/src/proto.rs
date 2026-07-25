@@ -153,6 +153,9 @@ pub struct SecretsSendRequest {
     /// Relative path (forward slashes) -> base64-encoded contents.
     #[serde(default)]
     pub files: BTreeMap<String, String>,
+    /// `[secrets].file_mode`, already parsed. Absent -> agent defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_mode: Option<u32>,
     #[serde(default)]
     pub apply: bool,
 }

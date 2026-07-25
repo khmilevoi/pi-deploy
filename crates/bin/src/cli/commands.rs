@@ -204,9 +204,21 @@ pub async fn secrets_send(
     if is_env {
         compat.gate(crate::compat::Feature::Environments)?;
     }
+    let file_mode = match &rpitoml.secrets.file_mode {
+        Some(text) => Some(
+            pi_domain::secretmode::parse(text)
+                .map_err(|e| anyhow::anyhow!("rpi.toml [secrets].file_mode: {e}"))?,
+        ),
+        None => None,
+    };
+    if file_mode.is_some() {
+        compat.gate(crate::compat::Feature::SecretModes)?;
+    }
 
     let (n, m) = (vars.len(), files.len());
-    let resp = api.send_secrets(&project_name, vars, files, apply).await?;
+    let resp = api
+        .send_secrets(&project_name, vars, files, file_mode, apply)
+        .await?;
     output::success(format!(
         "saved {n} key(s) and {m} file(s) for project '{project_name}'"
     ));

@@ -30,6 +30,7 @@ pub enum Feature {
     SourceCheck,
     Stats,
     Environments,
+    SecretModes,
 }
 
 impl Feature {
@@ -39,6 +40,7 @@ impl Feature {
         Feature::SourceCheck,
         Feature::Stats,
         Feature::Environments,
+        Feature::SecretModes,
     ];
 
     /// The string this feature advertises in the `/v1/version` handshake.
@@ -49,6 +51,7 @@ impl Feature {
             Feature::SourceCheck => "source-check",
             Feature::Stats => "stats",
             Feature::Environments => "environments",
+            Feature::SecretModes => "secret-modes",
         }
     }
 
@@ -60,6 +63,7 @@ impl Feature {
             Feature::SourceCheck => "deploy-key preflight",
             Feature::Stats => "stats",
             Feature::Environments => "environments",
+            Feature::SecretModes => "secret file modes",
         }
     }
 
@@ -70,6 +74,7 @@ impl Feature {
             Feature::SourceCheck => Policy::Silent,
             Feature::Stats => Policy::Required,
             Feature::Environments => Policy::Required,
+            Feature::SecretModes => Policy::Required,
         }
     }
 
@@ -82,6 +87,7 @@ impl Feature {
             Feature::SourceCheck => "0.18.0",
             Feature::Stats => "0.9.0",
             Feature::Environments => "0.24.0",
+            Feature::SecretModes => "0.26.0",
         }
     }
 
@@ -322,6 +328,14 @@ mod tests {
         assert_eq!(Feature::SourceCheck.capability(), "source-check");
         assert_eq!(Feature::Stats.capability(), "stats");
         assert_eq!(Feature::Environments.capability(), "environments");
+    }
+
+    #[test]
+    fn secret_modes_is_registered_and_required() {
+        assert!(Feature::ALL.contains(&Feature::SecretModes));
+        assert_eq!(Feature::SecretModes.capability(), "secret-modes");
+        assert_eq!(Feature::SecretModes.since(), "0.26.0");
+        assert!(matches!(Feature::SecretModes.policy(), Policy::Required));
     }
 
     #[test]
