@@ -1,0 +1,28 @@
+schema = 1
+
+[project]
+name = "e2e-fixture"
+
+[source]
+repo = "git://git-fixture/fixture.git"
+branch = "main"
+
+[build]
+compose = "compose.yaml"
+
+[ingress]
+service = "web"
+port = 8080
+
+[healthcheck]
+path = "/health"
+expect = "200"
+timeout = "30s"
+
+# The file itself is created by scenario.sh at run time, so it never enters
+# the fixture git repo: the CLI reads it locally, the agent materializes it.
+[secrets]
+files = ["app_secret"]
+
+[commands]
+read-secret = ["sh", "-c", "cat /run/secrets/app_secret"]
