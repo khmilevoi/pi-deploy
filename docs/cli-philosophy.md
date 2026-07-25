@@ -69,7 +69,9 @@ command is doing too much, not a reason to bolt on a second help system.
 ## 4. Output: stdout is data, stderr is status
 
 - stdout carries the payload a script or a human parses: tables
-  (`output::table()`), JSON (`--json`), or a one-line result.
+  (`output::table()`), JSON (`--json`), a one-line result, or — for `rpi
+  command` — the remote command's own output, streamed line by line and
+  untruncated (`output::log_line()`), because that output *is* the payload.
 - stderr carries everything about *how the operation is going*: `success`,
   `warn`, `note`, `error`, and the live `LogPane` for streamed operations.
 

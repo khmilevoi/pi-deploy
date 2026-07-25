@@ -501,7 +501,6 @@ fn format_command_line(name: &str, spec: &pi_domain::entities::CommandSpec) -> S
 pub async fn command(
     name: Option<String>,
     args: Vec<String>,
-    full: bool,
     env: Option<String>,
     vars: Vec<String>,
     connect: ConnectOpts,
@@ -549,21 +548,18 @@ pub async fn command(
         return Ok(());
     };
 
-    let mut pane = output::LogPane::new(format!("command '{name}'"), 10);
+    // The remote output *is* the result the operator came for, so it streams
+    // straight to stdout — unframed, unwindowed, untruncated — and only the
+    // verdict goes to stderr. That keeps `rpi command … > file` a clean capture.
     let code = api
-        .run_command(&project_name, &name, &args, |line| pane.push_line(line))
+        .run_command(&project_name, &name, &args, output::log_line)
         .await?;
     if code != 0 {
-        pane.finish_err(&format!("command '{name}' exited with code {code}"));
+        output::error(format!("command '{name}' exited with code {code}"));
         drop(tunnel);
         std::process::exit(code);
     }
-    let summary = format!("command '{name}' finished (exit 0)");
-    if full {
-        pane.finish_ok_dump(&summary);
-    } else {
-        pane.finish_ok_keep(&summary);
-    }
+    output::success(format!("command '{name}' finished (exit 0)"));
     Ok(())
 }
 

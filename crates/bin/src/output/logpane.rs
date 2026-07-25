@@ -223,35 +223,6 @@ impl LogPane {
         crate::output::success(summary);
     }
 
-    /// Success variant that leaves the streamed frame on screen instead of
-    /// clearing it — used by `rpi command`, where the command's output *is* the
-    /// result the user came to read. The frame (its last `max_visible` lines)
-    /// stays exactly as last rendered, with the cursor already just beneath it,
-    /// so the summary prints directly below. Unlike `finish_err` the captured
-    /// log is not re-dumped — the visible tail is enough. Non-interactive runs
-    /// already streamed every line, so this matches `finish_ok` there.
-    pub fn finish_ok_keep(self, summary: &str) {
-        crate::output::success(summary);
-    }
-
-    /// Success variant that dumps the full captured log below the streamed
-    /// frame, for callers that asked to see everything (e.g. `rpi command
-    /// --full`) rather than just the last `max_visible` lines. Non-interactive
-    /// runs already streamed every line via `push_line`.
-    pub fn finish_ok_dump(self, summary: &str) {
-        if self.interactive {
-            (self.print_line)(
-                &console_style(Sem::Muted)
-                    .apply_to("— full log —")
-                    .to_string(),
-            );
-            for l in &self.full {
-                (self.print_line)(l);
-            }
-        }
-        crate::output::success(summary);
-    }
-
     /// Neutral outcome (e.g. deploy superseded) — same as success: clear, no dump.
     pub fn finish_neutral(self, summary: &str) {
         if self.interactive {
@@ -416,24 +387,6 @@ mod tests {
         pane.push_line("two");
         pane.finish_err("boom");
         assert_eq!(*printed.lock().unwrap(), vec!["one", "two"]);
-    }
-
-    #[test]
-    fn finish_ok_keep_leaves_frame_without_redumping_the_log() {
-        // Success variant for `rpi command`: the streamed frame stays on screen
-        // so its output remains readable. Unlike finish_err it must NOT re-dump
-        // the captured log — the frame already holds the visible tail — so
-        // nothing goes through print_line.
-        let printed = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-        let mut pane = LogPane::new_recording("test", 3, true, printed.clone());
-        pane.push_line("one");
-        pane.push_line("two");
-        pane.finish_ok_keep("done");
-        assert!(
-            printed.lock().unwrap().is_empty(),
-            "keep-mode must not re-dump the log: {:?}",
-            printed.lock().unwrap()
-        );
     }
 
     #[test]
