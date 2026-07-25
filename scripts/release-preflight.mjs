@@ -27,8 +27,12 @@ export function parseCommits(raw) {
     .map((chunk) => chunk.trim())
     .filter(Boolean)
     .map((chunk) => {
-      const [sha, subject, ...rest] = chunk.split(FIELD);
-      return { sha, subject: (subject ?? "").trim(), body: rest.join(FIELD).trim() };
+      const [sha, ...rest] = chunk.split(FIELD);
+      const message = rest.join(FIELD);
+      const newline = message.indexOf("\n");
+      const subject = (newline === -1 ? message : message.slice(0, newline)).trim();
+      const body = (newline === -1 ? "" : message.slice(newline + 1)).trim();
+      return { sha, subject, body };
     });
 }
 
@@ -46,7 +50,8 @@ export function classifyRange(commits) {
         reason: `unclassifiable commit subject: "${c.subject}"`,
       };
     }
-    if (m[3] === "!" || /^BREAKING CHANGE:/m.test(c.body)) {
+    const wholeMessage = c.body ? `${c.subject}\n${c.body}` : c.subject;
+    if (m[3] === "!" || /^BREAKING[- ]CHANGE:/m.test(wholeMessage)) {
       return {
         bump: "minor",
         quickAllowed: false,
@@ -104,7 +109,7 @@ function main() {
   checks.push(head === upstream ? "ok HEAD == origin/master" : `x  HEAD ${head.slice(0, 7)} != origin/master ${upstream.slice(0, 7)}`);
 
   const lastTag = git("describe", "--tags", "--abbrev=0");
-  const raw = git("log", "--no-merges", "--format=%H%x00%s%x00%b%x01", `${lastTag}..HEAD`);
+  const raw = git("log", "--no-merges", "--format=%H%x00%B%x01", `${lastTag}..HEAD`);
   const commits = parseCommits(raw);
   const verdict = classifyRange(commits);
   checks.push(`   range ${lastTag}..HEAD: ${commits.length} non-merge commit(s), bump = ${verdict.bump}`);
@@ -119,7 +124,7 @@ function main() {
     const runs = JSON.parse(
       execFileSync(
         "gh",
-        ["run", "list", "--workflow", "ci", "--branch", "master", "--limit", "20", "--json", "headSha,status,conclusion"],
+        ["run", "list", "--workflow", "ci", "--branch", "master", "--limit", "100", "--json", "headSha,status,conclusion"],
         { encoding: "utf8" },
       ),
     );

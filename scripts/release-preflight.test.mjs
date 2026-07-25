@@ -9,6 +9,8 @@ import {
 } from "./release-preflight.mjs";
 
 const commit = (subject, body = "") => ({ sha: "a".repeat(40), subject, body });
+const FIELD = "\u0000";
+const RECORD = "\u0001";
 
 test("a fix-only range allows quick", () => {
   const result = classifyRange([
@@ -68,11 +70,41 @@ test("nextPatch increments only the patch component", () => {
 });
 
 test("parseCommits splits the NUL-delimited log", () => {
-  const raw = ["abc123\u0000fix: one\u0000", "def456\u0000fix: two\u0000BREAKING CHANGE: x"].join("\u0001");
+  const raw = [`abc123${FIELD}fix: one`, `def456${FIELD}fix: two\nBREAKING CHANGE: x`].join(RECORD);
   const commits = parseCommits(raw);
   assert.equal(commits.length, 2);
   assert.equal(commits[0].subject, "fix: one");
+  assert.equal(commits[0].body, "");
+  assert.equal(commits[1].subject, "fix: two");
   assert.equal(commits[1].body, "BREAKING CHANGE: x");
+});
+
+test("BREAKING CHANGE glued to the subject with no blank line still refuses quick (regression)", () => {
+  const raw = `${"a".repeat(40)}${FIELD}fix: some header\nBREAKING CHANGE: it's broken`;
+  const result = classifyRange(parseCommits(raw));
+  assert.equal(result.quickAllowed, false);
+  assert.match(result.reason, /breaking/i);
+});
+
+test("BREAKING CHANGE with a proper blank line before it also refuses quick", () => {
+  const raw = `${"a".repeat(40)}${FIELD}fix: some header\n\nBREAKING CHANGE: it's broken`;
+  const result = classifyRange(parseCommits(raw));
+  assert.equal(result.quickAllowed, false);
+  assert.match(result.reason, /breaking/i);
+});
+
+test("BREAKING-CHANGE (hyphen spelling) also refuses quick", () => {
+  const raw = `${"a".repeat(40)}${FIELD}fix: some header\nBREAKING-CHANGE: it's broken`;
+  const result = classifyRange(parseCommits(raw));
+  assert.equal(result.quickAllowed, false);
+  assert.match(result.reason, /breaking/i);
+});
+
+test("a multi-paragraph fix commit with no footer is still allowed", () => {
+  const raw = `${"a".repeat(40)}${FIELD}fix: some header\n\nExplains the change in more detail.\n\nA second paragraph, still no footer.`;
+  const result = classifyRange(parseCommits(raw));
+  assert.equal(result.bump, "patch");
+  assert.equal(result.quickAllowed, true);
 });
 
 test("parseCommits returns nothing for an empty log", () => {
