@@ -114,18 +114,22 @@ flowchart TD
 
 7. **Secrets are only ever written to plain disk at deploy time, narrowly.**
    When a project deploys, its current secrets are decrypted and written
-   into that project's own checkout — its variables into a single file,
-   permissioned so only the agent's own account can read it, and any secret
-   files at the paths the project declared, in freshly-created directories
-   permissioned the same way. Every path is validated before use, so nothing
-   in a project's Git history can point a write (or a later read) outside
-   its own checkout — including via a directory a later commit replaces with
-   a symlink. Writing secrets fully replaces what was there before: a secret
-   file dropped from a project's declared list is deleted on the next
-   deploy rather than left behind forever. The full mechanics of collecting,
-   validating, and delivering secrets are covered in `flows/secrets.md`;
-   this document only answers where they live before and after that
-   handoff.
+   into that project's own checkout — its variables into a single `.env`
+   file, permissioned by default so only the agent's own account can read
+   it, and any secret files at the paths the project declared, permissioned
+   by default so a container running under a different, unrelated uid can
+   read them too (a project-wide `[secrets].file_mode` can override both),
+   in freshly-created directories that are always traversable by anyone —
+   directory modes protect nothing here, the file modes do. Every path is
+   validated before use, so nothing in a project's Git history can point a
+   write (or a later read) outside its own checkout — including via a
+   directory a later commit replaces with a symlink. Writing secrets fully
+   replaces what was there before: a secret file dropped from a project's
+   declared list is deleted on the next deploy rather than left behind
+   forever. The full mechanics of collecting, validating, and delivering
+   secrets — including exactly which mode each artifact gets and why — are
+   covered in `flows/secrets.md`; this document only answers where they
+   live before and after that handoff.
 
 8. **Logs live in their own directory, separate from the data directory.**
    Rolling log files for the agent and for individual deploys are written to

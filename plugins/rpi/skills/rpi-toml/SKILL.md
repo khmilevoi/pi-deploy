@@ -41,6 +41,7 @@ env = ".env"                     # optional, default ".env"
 files = [                        # optional; recreated at the same paths on the Pi
   "certs/server.pem",
 ]
+# file_mode = "0640"             # optional; default 0644 for files, 0600 for .env
 ```
 
 Worker, bot, or internal service without public HTTP ingress:
@@ -77,6 +78,7 @@ port = 3000
 | `healthcheck.timeout` | no | `"60s"` | Duration string or bare seconds. |
 | `secrets.env` | no | `".env"` | Local env file read by `rpi secrets send`. |
 | `secrets.files` | no | none | Optional list of local secret file paths (certs, keys), forward-slash relative, `..` rejected; recreated verbatim on the Pi on every deploy. |
+| `secrets.file_mode` | no | none | `^0?[0-7]{3}$` (e.g. `"0640"`/`"640"`); owner read required, owner write optional, group/other read optional, nothing else. Overrides both the `0644` default for `secrets.files` and the `0600` default for `.env` at once — a container consuming a bind-mounted secret usually isn't the agent's uid, so the file mode is what decides whether it can read it. Requires an agent `>= 0.26.0` (`secret-modes` capability); the mode travels with the bundle, so it takes effect on the next `rpi secrets send`, not a `rpi deploy` that reuses an already-stored bundle. |
 | `commands.<name>` | no | none | String (shell-word split, quotes only) or argv array. Name: `[a-z0-9][a-z0-9_-]*`. Registered at deploy, run via `rpi command`. |
 | `timeouts.command` | no | `"600s"` | Budget for one `rpi command` run. |
 
@@ -156,7 +158,8 @@ Rules:
   `[commands]` and array fields (`secrets.files`) replace **wholesale** — an
   overlay `[commands]` table drops every base command not repeated in it; an
   explicit empty string (`""`) on an optional field (e.g. `ingress.hostname`,
-  `secrets.env`) resets it to unset rather than being ignored.
+  `secrets.env`, `secrets.file_mode`) resets it to unset rather than being
+  ignored.
 - **Interpolation** (`${VAR}`) is allowed only in `source.branch` and
   `ingress.hostname` — anywhere else is a parse error, including inside
   `[commands]`, an argv array, or a command table's `service`. Supported
@@ -249,6 +252,10 @@ services:
 - `[ingress]`, `[project]`, and `[source]` are required.
 - Invalid healthcheck expectation values are rejected.
 - Invalid duration strings in `[healthcheck].timeout` and `[timeouts]` are rejected.
+- `secrets.file_mode` is validated in `RpiToml::validate_common()` (base and
+  overlay alike) and, independently, again by the agent before it writes a
+  secret to disk — a bad mode that somehow reaches the agent is a hard error
+  (`DomainError::Invalid`), not a silently-widened file.
 - An empty `[commands]` section, an empty argv, bad command names, and unbalanced quotes in a string command are all rejected by `crates/bin/src/cli/rpitoml.rs`.
 
 When editing the parser or adding fields, update:

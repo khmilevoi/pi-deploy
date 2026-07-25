@@ -130,6 +130,18 @@ rpi env reset-data test    # drops volumes only; next `rpi deploy --env test` re
   elapsed since its last successful deploy. See
   `docs/architecture/flows/environments.md` for the full flow.
 
+## Secrets File Mode
+
+`rpi secrets ls` reports the effective mode secret files (and, if set,
+`.env`) will be written with — `file mode: 0644` when the bundle has none
+configured, or whatever `[secrets].file_mode` resolved to. Setting
+`[secrets].file_mode` in `rpi.toml` requires an agent `>= 0.26.0` (the
+`secret-modes` capability); `rpi secrets send`/`send --apply` refuse with an
+upgrade hint against an older agent instead of silently ignoring the
+setting. The mode travels with the stored bundle, so it only changes on the
+next `rpi secrets send` (or `--apply`) — a `rpi deploy` that reuses an
+already-stored bundle keeps whatever mode that bundle carries.
+
 ## Client Profile
 
 The CLI reads the user config at:

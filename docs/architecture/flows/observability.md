@@ -182,9 +182,11 @@ sequenceDiagram
    endpoint, and only once that succeeds does it also send one more request
    that asks the agent to run its own list of environment checks on the Pi
    (for example, whether the cgroup memory accounting that `rpi stats`'s
-   per-service memory numbers depend on is enabled) and report each one as
-   pass or fail with a plain-English detail and, on failure, a suggested
-   fix. The CLI adds the version comparison itself as one more row alongside
+   per-service memory numbers depend on is enabled, or whether `/var/lib/rpi`
+   — which holds every project's secret files, deliberately readable beyond
+   the agent's own account by default, see `flows/secrets.md` — is still
+   owned by the agent and no wider than `0750`) and report each one as pass
+   or fail with a plain-English detail and, on failure, a suggested fix. The CLI adds the version comparison itself as one more row alongside
    that same successful-version-check step, pointing at whichever side is
    behind if the two don't match.
 

@@ -79,10 +79,15 @@ sequenceDiagram
    to `sudo` or any admin group. The operator's own login user is added to
    the `rpi-agent` group too, so their SSH login can reach the agent's Unix
    socket without needing `sudo` for every command.
-6. **Creates the directories the agent owns.** `/var/lib/rpi` (state) and
-   `/var/log/rpi` (file logs) are created owned by `rpi-agent`; `/etc/rpi`
-   (config) is created owned by root, since the agent only ever reads its
-   config, never writes it.
+6. **Creates the directories the agent owns.** `/var/lib/rpi` (state) is
+   created owned by `rpi-agent` at mode **0750** — every project's plaintext
+   secrets live under it, and since the secret files themselves are, by
+   default, deliberately readable beyond the agent's own account (see
+   `flows/secrets.md`), this directory mode is what keeps other local users
+   off the tree. `/var/log/rpi` (file logs) is also created owned by
+   `rpi-agent`, at the installer's default mode. `/etc/rpi` (config) is
+   created owned by root, since the agent only ever reads its config, never
+   writes it.
 7. **Config adoption, not overwrite.** The default `agent.toml` is written
    only when the file is completely absent — an existing config from a
    previous run (or a hand-edited one) is left untouched. The same rule
@@ -114,7 +119,10 @@ sequenceDiagram
     is idempotent: an existing user, group membership, directory, or
     identical config/unit file is reported as already present and left
     untouched; only real drift (e.g. a directory owned by a stale UID after
-    a reinstall, or a systemd unit whose contents changed) is repaired. The
+    a reinstall, a directory whose mode no longer matches — `/var/lib/rpi`
+    widened past `0750` by an older setup or a manual `chmod` — or a systemd
+    unit whose contents changed) is repaired, and the report names which of
+    ownership and mode it fixed, e.g. `repaired: /var/lib/rpi (mode)`. The
     binary is only restarted if it was actually replaced by step 4 — running
     setup again with nothing new to install never bounces the service.
 13. **Privilege split, end to end.** Root is only ever needed for this

@@ -22,7 +22,7 @@ sequenceDiagram
     Store->>Store: encrypt with agent's age key, write 0600
     alt --apply flag set
         API->>API: arm log masking with the bundle just received
-        API->>Co: write .env + secret files into the existing checkout, mode 0600
+        API->>Co: write .env + secret files into the existing checkout, .env 0600, files 0644 (or [secrets].file_mode)
         API->>Runtime: up -d (recreate affected containers)
     else no --apply (default)
         Note over API: bundle stored only, nothing injected yet
@@ -33,7 +33,7 @@ sequenceDiagram
     opt secrets were sent for this project
         Store->>Store: decrypt with agent's age key
         Dep->>Dep: arm log masking with the loaded bundle
-        Dep->>Co: write .env + secret files into the freshly fetched checkout, mode 0600
+        Dep->>Co: write .env + secret files into the freshly fetched checkout, .env 0600, files 0644 (or [secrets].file_mode)
     end
 ```
 
@@ -59,28 +59,51 @@ sequenceDiagram
    written one file per project: the secret store's own copy of a bundle is
    never written to disk unencrypted. (A bundle's values do reach disk as
    plaintext elsewhere — deliberately, when injected into a checkout; see
-   item 4.)
+   item 4.) `/var/lib/rpi` itself — the tree everything above lives under —
+   is created and repaired at mode 0750, owned by the agent; that directory
+   mode, not any individual file's mode, is what keeps other local users off
+   the whole tree.
 
 4. **Two moments secrets get injected.** Plaintext secret values are
    written into a checkout only during one of these two operations, never
    in between:
    - **Immediately, with `--apply`.** Right after saving, if the caller
      passed `--apply`, the agent writes `.env` and the secret files straight
-     into the project's existing checkout (mode 0600) and recreates the
-     affected containers — using the bundle it already has in memory from
-     the request itself, with no decrypt step involved.
+     into the project's existing checkout and recreates the affected
+     containers — using the bundle it already has in memory from the
+     request itself, with no decrypt step involved.
    - **Later, on `rpi deploy`.** Every deploy loads whatever is currently
      stored for that project — decrypting it in the process — and writes it
-     into the freshly fetched checkout (mode 0600) before the stack starts.
-     This is the only place a previously-stored bundle's values are
-     decrypted and written back out onto disk as plaintext.
+     into the freshly fetched checkout before the stack starts. This is the
+     only place a previously-stored bundle's values are decrypted and
+     written back out onto disk as plaintext.
+
+   Both moments write the same two artifacts with different default modes,
+   because they have different readers. `.env` lands at **0600**: Compose
+   reads it as the agent itself, so nothing needs it wider. Every file from
+   `[secrets].files` lands at **0644**: it is typically bind-mounted as a
+   Compose `file:`-sourced secret into a container running under its
+   image's own, unrelated uid, and Docker silently ignores a `file:`
+   secret's `mode`/`uid`/`gid` outside Swarm — the host file's own mode is
+   the only thing that decides whether that container can read it.
+   Directories the writer creates along the way (and a directory it created
+   before this change, at exactly 0700, that it still owns) are always
+   **0755**, independent of everything else: a directory mode protects
+   nothing here, the file mode does. A project can override both `.env` and
+   the secret files' mode at once with `[secrets].file_mode` in `rpi.toml`
+   (see the `rpi-toml` skill and README); `.rpi-secrets-manifest.json`, the
+   writer's own bookkeeping, stays 0600 unconditionally regardless of
+   `file_mode`. The mode travels with the bundle, so changing `file_mode`
+   takes effect the next time a bundle carrying it is actually written —
+   `rpi secrets send --apply`, or a `rpi deploy` that loads a bundle sent
+   after the change — not by itself.
 
    `rpi secrets ls` also decrypts a previously-stored bundle, but only in
-   memory and only to read the secret and file names it contains — the
-   values themselves are discarded and never written to disk or shown.
-   Re-sending a bundle later fully replaces the previous one: any variable
-   or file left out of the new bundle is removed from a checkout the next
-   time secrets are injected.
+   memory and only to read the secret and file names (and configured mode)
+   it contains — the values themselves are discarded and never written to
+   disk or shown. Re-sending a bundle later fully replaces the previous one:
+   any variable or file left out of the new bundle is removed from a
+   checkout the next time secrets are injected.
 
 5. **Masking secret values in logs.** From the moment either injection above
    arms it, every line the agent would otherwise log during that operation
@@ -119,10 +142,10 @@ sequenceDiagram
 ## Source anchors
 
 - `crates/application/src/secrets.rs` — send/list secrets use cases: validates the bundle isn't empty, saves it, and (with `--apply`) re-injects it and restarts the affected containers immediately.
-- `crates/bin/src/cli/rpitoml.rs` (`SecretsSection` only) — the `[secrets]` table in `rpi.toml`: names the local env file `rpi secrets send` reads (`[secrets].env`, default `.env`) and the extra files it reads verbatim (`[secrets].files`).
+- `crates/bin/src/cli/rpitoml.rs` (`SecretsSection` only) — the `[secrets]` table in `rpi.toml`: names the local env file `rpi secrets send` reads (`[secrets].env`, default `.env`), the extra files it reads verbatim (`[secrets].files`), and the optional `[secrets].file_mode` override, parsed and validated by `pi_domain::secretmode`.
 - `crates/application/src/mask.rs` — `MaskingSink`: replaces armed secret values (6+ characters) with `***KEY***` in every line logged afterward.
 - `crates/infrastructure/src/secrets.rs` — `EncryptedFileStore`: age-encrypts and decrypts the bundle at rest, one file per project, using an agent identity key kept at file mode 0600.
-- `crates/infrastructure/src/secretsfile.rs` — `FsSecretsWriter`: writes `.env` and secret files into a checkout (files 0600, directories 0700), replaces the previous bundle's files via a small manifest, and guards every write and cleanup against symlink escapes.
+- `crates/infrastructure/src/secretsfile.rs` — `FsSecretsWriter`: writes `.env` (0600 by default) and secret files (0644 by default; both overridable by `bundle.file_mode`/`[secrets].file_mode`) into a checkout, creates directories at 0755 and widens a directory it created earlier at exactly 0700, replaces the previous bundle's files via a small manifest (always 0600), and guards every write and cleanup against symlink escapes.
 - `crates/infrastructure/src/secretpath.rs` — shared relative-path validation and symlink-safe path resolution, used by both the CLI (before sending) and the agent (before writing).
 - `crates/infrastructure/src/dotenv.rs` — `.env` parsing and serialization shared by the CLI (reading the local file to send) and the agent (writing the injected file).
 - `crates/application/src/deploy.rs` — the deploy pipeline's secret-injection point: loads the stored bundle, arms masking, and writes it into the freshly fetched checkout before the stack starts.
