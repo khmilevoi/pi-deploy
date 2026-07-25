@@ -20,13 +20,17 @@ new dependencies in either repo.
 
 ## Global Constraints
 
-- **Do not commit.** The working tree of `pi` contains unrelated
-  uncommitted work by another agent (`crates/infrastructure/src/fsutil.rs`,
-  `secrets.rs`, `secretsfile.rs`). Do not stage, commit, stash, revert or
-  reformat those files. Do not run `git add .`, `git add -A`,
-  `git checkout -- .`, or `cargo fmt --all`. Each task ends by running its
-  tests and reporting; committing happens once at the end, outside this
-  plan.
+- **Work happens in a worktree.** This repo's work is done in
+  `C:\Users\Khmil\RustProjects\pi\.worktrees\release-quick-mode`, on branch
+  `feat/release-quick-mode` based on `master`. Never `cd` to the parent
+  checkout `C:\Users\Khmil\RustProjects\pi` — it sits on an unrelated
+  branch. Commit your task's work there with `git add <exact paths>`; never
+  `git add .` or `git add -A`.
+- **The site repo is not a worktree.** Task 1 works directly in
+  `C:\Users\Khmil\RustProjects\rpi-deploy-site` on branch `main`, whose tree
+  is clean. Commit there with explicit paths too.
+- **No Rust file is touched by this plan.** Do not run `cargo fmt --all`,
+  and do not "fix" any Rust file you happen to see.
 - **New scripts are ESM `.mjs`.** `pi/package.json` has no `"type"` field,
   so `.js` there is CommonJS (`scripts/check-version.js`,
   `scripts/postinstall.js`). New files use the `.mjs` extension so they can
@@ -334,10 +338,14 @@ Expected: three replacements listed with `file:line`, `src/index.html`
 modified, then restored by the checkout. `git checkout -- src/` is safe
 here: this repo's tree is clean apart from what this task creates.
 
-- [ ] **Step 7: Report**
+- [ ] **Step 7: Commit and report**
 
-Do not commit. Report: the test output, and the two command outputs from
-Step 6.
+```bash
+git add scripts/sync-version.mjs scripts/sync-version.test.mjs package.json
+git commit -m "feat: add sync-version script for release version sync"
+```
+
+Report the test output and the two command outputs from Step 6.
 
 ---
 
@@ -641,10 +649,20 @@ repository currently has an unrelated dirty tree, so `quick: refused
 working, not a failure. Confirm the range listing shows the commits since
 `v0.25.1` and that `docs:`-only commits classify as `patch`.
 
-- [ ] **Step 6: Report**
+- [ ] **Step 6: Commit and report**
 
-Do not commit. Report the test output and the real-repository output
-verbatim.
+```bash
+git add scripts/release-preflight.mjs scripts/release-preflight.test.mjs
+git commit -m "feat(release): add release-preflight gate script"
+```
+
+Report the test output and the real-repository output verbatim.
+
+Note on Step 5's real run: this worktree sits on branch
+`feat/release-quick-mode`, not `master`, so `HEAD == origin/master` will be
+false and the verdict will be `quick: refused`. That is the check working.
+Confirm the range listing and the `bump:` line are correct; do not change
+the script to make the verdict come out `allowed` here.
 
 ---
 
@@ -918,21 +936,53 @@ Expected: PASS, 10/10.
 
 - [ ] **Step 5: Verify the dirty-tree guard on the real repository**
 
+The worktree is clean, so make it dirty deliberately, confirm the guard
+fires, then clean up:
+
 ```bash
-node scripts/bump-version.mjs 0.25.2
+echo scratch > dirty-guard-probe.txt
+node scripts/bump-version.mjs 0.25.2 ; echo "exit=$?"
+git status --porcelain
+rm dirty-guard-probe.txt
 ```
+
 Expected: exit 1 with `bump-version: working tree is dirty, refusing to
-bump:` followed by the foreign `crates/infrastructure/...` entries. **This
-is the expected and correct result** — the guard fires before anything is
-written, so no file is modified. Confirm with `git status --porcelain` that
-`Cargo.toml`, `package.json` and `Cargo.lock` are untouched.
+bump:` listing `?? dirty-guard-probe.txt`, and `git status --porcelain`
+showing that `Cargo.toml`, `package.json` and `Cargo.lock` were **not**
+modified — the guard fires before anything is written.
 
-Do not attempt to make this command succeed. Do not clean the tree.
+- [ ] **Step 6: Verify the happy path, then revert it**
 
-- [ ] **Step 6: Report**
+```bash
+node scripts/bump-version.mjs 0.25.2 ; echo "exit=$?"
+git diff --stat
+git checkout -- Cargo.toml package.json Cargo.lock
+git status --porcelain
+```
 
-Do not commit. Report the test output and the Step 5 output, plus the
-`git status --porcelain` proof that no version file was modified.
+Expected: exit 0, ending with
+`bump-version: ready to commit \`chore: release 0.25.2\`` and
+`check-version: ok (0.25.2)` from the nested check. `git diff --stat` must
+show exactly three files. The `git checkout` then restores them, and the
+final `git status --porcelain` must print nothing but your new script files.
+
+This is the only end-to-end proof that the two assertions pass on a real
+`cargo update --workspace` run rather than only on the fixtures. If
+`assertLockfileDiff` rejects the real lockfile, that is a bug in the
+assertion — fix it, do not loosen it to "anything goes".
+
+**Do not commit the version bump.** Only `scripts/bump-version.mjs` and
+`scripts/bump-version.test.mjs` belong in this task's commit.
+
+- [ ] **Step 7: Commit and report**
+
+```bash
+git add scripts/bump-version.mjs scripts/bump-version.test.mjs
+git commit -m "feat(release): add bump-version script"
+```
+
+Report the test output, the Step 5 and Step 6 outputs, and confirmation
+that `git status --porcelain` is clean afterwards.
 
 ---
 
@@ -1216,9 +1266,14 @@ If Docker is not running on this machine, the smoke line will fail with a
 Docker error. In that case report exactly that: do not weaken the check or
 add a fallback that runs npx outside a container.
 
-- [ ] **Step 6: Report**
+- [ ] **Step 6: Commit and report**
 
-Do not commit. Report the test output and the full output of Step 5.
+```bash
+git add scripts/release-verify.mjs scripts/release-verify.test.mjs
+git commit -m "feat(release): add release-verify script"
+```
+
+Report the test output and the full output of Step 5.
 
 ---
 
@@ -1388,10 +1443,21 @@ Expected: the two `.mjs` files listed, and `sync-version wired ok`. The
 preflight `--help` invocation may simply run the preflight — that is fine,
 the point is that the file resolves.
 
-- [ ] **Step 7: Report**
+- [ ] **Step 7: Commit and report**
 
-Do not commit. Report a diff summary of both documents
-(`git diff --stat` in each repo) and confirm Step 6's output.
+In the worktree:
+```bash
+git add .claude/skills/release/SKILL.md
+git commit -m "docs(release): document quick mode and the release scripts"
+```
+
+In the site repo:
+```bash
+git add docs/landing-audit.md
+git commit -m "docs: note scripted version sync in the landing audit brief"
+```
+
+Report a diff summary of both documents and confirm Step 6's output.
 
 ---
 
@@ -1412,6 +1478,5 @@ node --test scripts/sync-version.test.mjs
 Expected: 6 tests passing.
 
 The repo's own gate (`cargo fmt`, `cargo clippy`, `cargo test`) is not
-affected by this plan — no Rust file is touched. It currently fails on
-unrelated uncommitted work in `crates/infrastructure/src/fsutil.rs`; that
-is not this plan's to fix.
+affected by this plan — no Rust file is touched, and the worktree branches
+from released `master`.
