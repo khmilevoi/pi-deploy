@@ -29,7 +29,11 @@ Tiebreakers: mixed `feat` + `fix` → minor (feat wins). "Is this rendering chan
 
 `/release quick` asks for the short path. `node scripts/release-preflight.mjs`
 decides whether it is allowed — its verdict overrides the request, so a
-`quick: refused` line means the full checklist below, no exceptions.
+`quick: refused` line means the full checklist below, no exceptions,
+whichever of its four independent grounds fired: a dirty working tree,
+`HEAD` not equal to `origin/master`, a commit in range that is minor-level
+or unclassifiable (`feat:`/`perf:`, an `!` or `BREAKING CHANGE` marker, or
+an unrecognised prefix), or no green `ci` run for HEAD.
 
 The mode rests on one fact: in a patch release the fix is already merged
 and already green on master, and the release commit touches only
@@ -63,9 +67,10 @@ What quick mode does **not** do, and why it is safe:
   two check surfaces, not a narrowing: the local gate runs on Windows and
   catches things a Linux CI never will, and vice versa. It is acceptable
   only because the release commit is version-only.
-- **The README `Status: vX.Y` line** — invariant under a patch bump
-  (`0.25.1 → 0.25.2` leaves `v0.25`). Other documentation is still updated
-  when the fix changes behaviour the docs describe.
+- **A README edit** — a patch release usually needs none at all. `README.md`
+  `## Highlights` is updated only when the fix changes behaviour described
+  there; other documentation is still updated when the fix changes
+  documented behaviour it describes.
 - **The four-auditor landing audit** — replaced by `sync-version`, which
   guarantees versions by construction. Feature text, CLI transcripts and
   `llms.txt` are still audited on every minor and major release.
@@ -85,7 +90,9 @@ What quick mode does **not** do, and why it is safe:
    but those three files. A stale lockfile is a guaranteed CI failure
    (`--locked` everywhere), which is what the assertion is for.
 3. **Update docs — this is part of the release commit, not optional polish**:
-   - `README.md` "Status: vX.Y (...)" line near the top: new version + one-phrase feature summary, and fold the shipped features into the surrounding status paragraph / Supported features list (see how v0.7 prebuilt binaries is described there).
+   - `README.md` `## Highlights` section: update it when the release changes or adds
+     something it describes. The npm version badge near the top updates itself and needs
+     no edit.
    - If the release changes behavior users must migrate through, add `docs/migration-*.md` (precedent: `migration-v0.5-to-v0.6.md`).
    - The landing page lives in a separate repo and is a **post-release follow-up** — run the "Landing page audit" section below after the tag; never fold it into the release commit.
 4. **Local gate** (mirrors CI's `check` job and `ci.yml`; catch it here, not in CI):
@@ -125,9 +132,9 @@ gh release edit vX.Y.Z --notes-file notes.md
 
 The release is not done until the notes describe the changes — a green npm publish with a bare commit list does not close the checklist.
 
-## Landing page audit (after every release, in subagents)
+## Landing page audit (minor and major releases, in subagents)
 
-The landing (`rpi-deploy-site`, live at https://rpi.iiskelo.com) once sat five releases stale — quick-start step 1 still printed `rpi 0.12.0` when v0.17.1 was current — because this step used to say "check whether this release changed anything the landing shows", and that check got answered from memory ("probably not") instead of by reading the page. Drift accumulates across releases, so the audit is unconditional: run it even when this release "obviously" changed nothing user-visible — the drift you find is usually from earlier releases.
+The landing (`rpi-deploy-site`, live at https://rpi.iiskelo.com) once sat five releases stale — quick-start step 1 still printed `rpi 0.12.0` when v0.17.1 was current — because this step used to say "check whether this release changed anything the landing shows", and that check got answered from memory ("probably not") instead of by reading the page. Drift accumulates across releases, so the audit is unconditional **on every minor and major release**: run it even when this release "obviously" changed nothing user-visible — "obviously nothing" is the exact reasoning that let the landing sit stale before, and the drift you find is usually from earlier releases. Patch releases do not run this audit — quick mode's step 7 above covers them with `sync-version` alone, which guarantees version strings by construction but not feature text; that gap is deliberate and accumulates until the next minor or major runs the full audit.
 
 The audit brief lives in the site repo, not here — **read `docs/landing-audit.md` in `rpi-deploy-site` before doing any of this** (step 1 below gets you a local copy). It defines the four auditor lenses, the shared context each needs, and the report format; this section only covers the release-side mechanics.
 
