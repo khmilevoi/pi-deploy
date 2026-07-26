@@ -577,10 +577,12 @@ impl ApiClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::extract::{Path, Query};
     use axum::http::StatusCode;
     use axum::response::{IntoResponse, Response};
-    use axum::routing::{get, post, put};
+    use axum::routing::{delete, get, post, put};
     use axum::Router;
+    use std::sync::{Arc, Mutex};
 
     /// Binds an ephemeral port, serves `app` in the background, and returns
     /// the base URL to point an `ApiClient` at.
@@ -840,6 +842,259 @@ mod tests {
             .to_string();
         assert!(err.contains("secrets"), "{err}");
         assert!(err.contains(">= 0.9.0"), "{err}");
+        assert!(err.contains("update the agent on the Pi"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn push_secret_group_round_trips_request_and_response() {
+        // Captures what the server actually received, so assertions run in
+        // the test's own task rather than inside the (spawned) handler.
+        let captured: Arc<Mutex<Option<(String, String, crate::proto::SecretGroupPushRequest)>>> =
+            Arc::new(Mutex::new(None));
+        let captured2 = captured.clone();
+        let app = Router::new().route(
+            "/v1/projects/{base}/secret-groups/{group}",
+            put(
+                move |Path((base, group)): Path<(String, String)>,
+                      axum::Json(req): axum::Json<crate::proto::SecretGroupPushRequest>| {
+                    let captured2 = captured2.clone();
+                    async move {
+                        *captured2.lock().unwrap() = Some((base, group, req));
+                        axum::Json(serde_json::json!({ "revision": 4, "keys": 1, "files": 1 }))
+                    }
+                },
+            ),
+        );
+        let client = ApiClient::new(spawn_app(app).await);
+
+        let mut vars = BTreeMap::new();
+        vars.insert("KEY".to_string(), "value".to_string());
+        let mut files = BTreeMap::new();
+        files.insert("cert.pem".to_string(), "UEVN".to_string());
+        let req = crate::proto::SecretGroupPushRequest {
+            vars,
+            files,
+            file_mode: Some(0o640),
+            expected_revision: Some(3),
+            merge: true,
+        };
+        let resp = client
+            .push_secret_group("myapp", "preview", &req)
+            .await
+            .unwrap();
+        assert_eq!(resp.revision, 4);
+        assert_eq!(resp.keys, 1);
+        assert_eq!(resp.files, 1);
+
+        let (base, group, received) = captured.lock().unwrap().take().unwrap();
+        assert_eq!(base, "myapp");
+        assert_eq!(group, "preview");
+        assert_eq!(received.vars.get("KEY").map(String::as_str), Some("value"));
+        assert_eq!(
+            received.files.get("cert.pem").map(String::as_str),
+            Some("UEVN")
+        );
+        assert_eq!(received.file_mode, Some(0o640));
+        assert_eq!(received.expected_revision, Some(3));
+        assert!(received.merge);
+    }
+
+    #[tokio::test]
+    async fn head_secret_group_round_trips_response() {
+        let captured: Arc<Mutex<Option<(String, String)>>> = Arc::new(Mutex::new(None));
+        let captured2 = captured.clone();
+        let app = Router::new().route(
+            "/v1/projects/{base}/secret-groups/{group}",
+            get(move |Path((base, group)): Path<(String, String)>| {
+                let captured2 = captured2.clone();
+                async move {
+                    *captured2.lock().unwrap() = Some((base, group));
+                    axum::Json(serde_json::json!({
+                        "revision": 7,
+                        "vars": {"KEY": "deadbeefcafebabe"},
+                        "files": {"cert.pem": {"size": 3, "digest": "0123456789abcdef"}},
+                        "file_mode": 416
+                    }))
+                }
+            }),
+        );
+        let client = ApiClient::new(spawn_app(app).await);
+
+        let head = client.head_secret_group("myapp", "preview").await.unwrap();
+        assert_eq!(head.revision, 7);
+        assert_eq!(
+            head.vars.get("KEY").map(String::as_str),
+            Some("deadbeefcafebabe")
+        );
+        let file = head.files.get("cert.pem").unwrap();
+        assert_eq!(file.size, 3);
+        assert_eq!(file.digest, "0123456789abcdef");
+        assert_eq!(head.file_mode, Some(0o640));
+
+        assert_eq!(
+            captured.lock().unwrap().take().unwrap(),
+            ("myapp".to_string(), "preview".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn head_secret_group_bare_404_means_old_agent_and_prompts_update() {
+        let app = Router::new(); // no secret-groups route at all -> bare 404
+        let api = ApiClient::new(spawn_app(app).await);
+        let err = api
+            .head_secret_group("myapp", "preview")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("secret groups"), "{err}");
+        assert!(err.contains(">= 0.27.0"), "{err}");
+        assert!(err.contains("update the agent on the Pi"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn list_secret_groups_round_trips_response() {
+        let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let captured2 = captured.clone();
+        let app = Router::new().route(
+            "/v1/projects/{base}/secret-groups",
+            get(move |Path(base): Path<String>| {
+                let captured2 = captured2.clone();
+                async move {
+                    *captured2.lock().unwrap() = Some(base);
+                    axum::Json(serde_json::json!({
+                        "groups": [{
+                            "name": "preview",
+                            "revision": 2,
+                            "keys": 1,
+                            "files": 0,
+                            "bytes": 0,
+                            "updated_at": 1234,
+                            "attached_by": ["myapp--branch"]
+                        }]
+                    }))
+                }
+            }),
+        );
+        let client = ApiClient::new(spawn_app(app).await);
+
+        let listed = client.list_secret_groups("myapp").await.unwrap();
+        assert_eq!(listed.groups.len(), 1);
+        let g = &listed.groups[0];
+        assert_eq!(g.name, "preview");
+        assert_eq!(g.revision, 2);
+        assert_eq!(g.attached_by, vec!["myapp--branch".to_string()]);
+
+        assert_eq!(captured.lock().unwrap().take().unwrap(), "myapp");
+    }
+
+    #[tokio::test]
+    async fn delete_secret_group_sends_the_force_flag_and_succeeds() {
+        #[derive(serde::Deserialize)]
+        struct ForceQuery {
+            #[serde(default)]
+            force: bool,
+        }
+
+        let captured: Arc<Mutex<Option<(String, String, bool)>>> = Arc::new(Mutex::new(None));
+        let captured2 = captured.clone();
+        let app = Router::new().route(
+            "/v1/projects/{base}/secret-groups/{group}",
+            delete(
+                move |Path((base, group)): Path<(String, String)>, Query(q): Query<ForceQuery>| {
+                    let captured2 = captured2.clone();
+                    async move {
+                        *captured2.lock().unwrap() = Some((base, group, q.force));
+                        axum::Json(serde_json::json!({ "removed": "preview" }))
+                    }
+                },
+            ),
+        );
+        let client = ApiClient::new(spawn_app(app).await);
+
+        client
+            .delete_secret_group("myapp", "preview", true)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            captured.lock().unwrap().take().unwrap(),
+            ("myapp".to_string(), "preview".to_string(), true)
+        );
+    }
+
+    #[tokio::test]
+    async fn head_key_secrets_round_trips_response() {
+        let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let captured2 = captured.clone();
+        let app = Router::new().route(
+            "/v1/projects/{name}/secrets/head",
+            get(move |Path(name): Path<String>| {
+                let captured2 = captured2.clone();
+                async move {
+                    *captured2.lock().unwrap() = Some(name);
+                    axum::Json(serde_json::json!({
+                        "revision": 5,
+                        "vars": {"A": "aaaaaaaaaaaaaaaa"},
+                        "files": {},
+                        "file_mode": null
+                    }))
+                }
+            }),
+        );
+        let client = ApiClient::new(spawn_app(app).await);
+
+        let head = client.head_key_secrets("myapp--branch").await.unwrap();
+        assert_eq!(head.revision, 5);
+        assert_eq!(
+            head.vars.get("A").map(String::as_str),
+            Some("aaaaaaaaaaaaaaaa")
+        );
+        assert!(head.files.is_empty());
+        assert_eq!(head.file_mode, None);
+
+        assert_eq!(
+            captured.lock().unwrap().take().unwrap(),
+            "myapp--branch".to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_key_secrets_round_trips_response() {
+        let captured: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+        let captured2 = captured.clone();
+        let app = Router::new().route(
+            "/v1/projects/{name}/secrets/apply",
+            post(move |Path(name): Path<String>| {
+                let captured2 = captured2.clone();
+                async move {
+                    *captured2.lock().unwrap() = Some(name);
+                    axum::Json(serde_json::json!({ "keys": 2, "files": 1 }))
+                }
+            }),
+        );
+        let client = ApiClient::new(spawn_app(app).await);
+
+        let resp = client.apply_key_secrets("myapp--branch").await.unwrap();
+        assert_eq!(resp.keys, 2);
+        assert_eq!(resp.files, 1);
+
+        assert_eq!(
+            captured.lock().unwrap().take().unwrap(),
+            "myapp--branch".to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn apply_key_secrets_bare_404_means_old_agent_and_prompts_update() {
+        let app = Router::new(); // no secrets/apply route at all -> bare 404
+        let api = ApiClient::new(spawn_app(app).await);
+        let err = api
+            .apply_key_secrets("myapp--branch")
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("secret groups"), "{err}");
+        assert!(err.contains(">= 0.27.0"), "{err}");
         assert!(err.contains("update the agent on the Pi"), "{err}");
     }
 
