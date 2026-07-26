@@ -180,7 +180,109 @@ pub async fn deploy_cancel(
     Ok(())
 }
 
-pub async fn secrets_send(
+/// Base project that owns a group. With `--env` the resolved
+/// `project.name` is the derived deploy key (`myapp--branch--login`), so a
+/// group addressed by it would land under a directory no project owns — the
+/// base always comes from the environment selection.
+pub fn resolve_base(resolved: &crate::cli::overlay::Resolved) -> String {
+    match &resolved.env {
+        Some(env) => env.base.clone(),
+        None => resolved.rpitoml.project.name.clone(),
+    }
+}
+
+/// What a push would change, by name. Values never appear here — the remote
+/// side only ever gave us digests.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct NameDiff {
+    pub added: Vec<String>,
+    pub changed: Vec<String>,
+    pub removed: Vec<String>,
+    pub unchanged: usize,
+}
+
+impl NameDiff {
+    /// Forward contract (secret-groups spec, plan Task 9): lets a future
+    /// caller short-circuit on "nothing to do" without re-deriving it from
+    /// the three vectors; `secrets_push`/`secrets_diff` render unconditionally.
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.changed.is_empty() && self.removed.is_empty()
+    }
+
+    pub fn render(&self) -> String {
+        let mut parts = Vec::new();
+        for (label, names) in [
+            ("+", &self.added),
+            ("~", &self.changed),
+            ("-", &self.removed),
+        ] {
+            for name in names {
+                parts.push(format!("{label}{name}"));
+            }
+        }
+        if parts.is_empty() {
+            return format!("no changes ({} unchanged)", self.unchanged);
+        }
+        format!("{} ({} unchanged)", parts.join(" "), self.unchanged)
+    }
+}
+
+/// Compares local values against remote digests. `remote` maps name ->
+/// digest, so the comparison is digest-to-digest and no local value is sent
+/// anywhere to make it.
+pub fn diff_vars(local: &BTreeMap<String, String>, remote: &BTreeMap<String, String>) -> NameDiff {
+    let mut d = NameDiff::default();
+    for (name, value) in local {
+        match remote.get(name) {
+            None => d.added.push(name.clone()),
+            Some(digest) if *digest != pi_domain::secretgroup::digest(value.as_bytes()) => {
+                d.changed.push(name.clone())
+            }
+            Some(_) => d.unchanged += 1,
+        }
+    }
+    for name in remote.keys() {
+        if !local.contains_key(name) {
+            d.removed.push(name.clone());
+        }
+    }
+    d
+}
+
+/// Same comparison for files: local bytes are already base64 here (that is
+/// what `collect_secrets` produces), so decode before digesting.
+pub fn diff_files(
+    local: &BTreeMap<String, String>,
+    remote: &BTreeMap<String, crate::proto::SecretFileHeadDto>,
+) -> NameDiff {
+    let mut d = NameDiff::default();
+    for (path, b64) in local {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap_or_default();
+        match remote.get(path) {
+            None => d.added.push(path.clone()),
+            Some(head) if head.digest != pi_domain::secretgroup::digest(&bytes) => {
+                d.changed.push(path.clone())
+            }
+            Some(_) => d.unchanged += 1,
+        }
+    }
+    for path in remote.keys() {
+        if !local.contains_key(path) {
+            d.removed.push(path.clone());
+        }
+    }
+    d
+}
+
+/// `rpi secrets push`. Without `--group` this targets the deploy key's own
+/// bundle and behaves exactly like the pre-groups `rpi secrets send`.
+pub async fn secrets_push(
+    group: Option<String>,
+    merge: bool,
+    force: bool,
     apply: bool,
     env: Option<String>,
     vars: Vec<String>,
@@ -188,12 +290,19 @@ pub async fn secrets_send(
 ) -> anyhow::Result<()> {
     let resolved = crate::cli::overlay::resolve(env.as_deref(), &vars)?;
     let is_env = resolved.env.is_some();
-    let rpitoml = resolved.rpitoml;
-    let project_name = rpitoml.project.name.clone();
-    let (vars, files) = collect_secrets(Path::new("."), &rpitoml.secrets)?;
-    if vars.is_empty() && files.is_empty() {
+    let base = resolve_base(&resolved);
+    let project_name = resolved.rpitoml.project.name.clone();
+    let (vars_map, files) = collect_secrets(Path::new("."), &resolved.rpitoml.secrets)?;
+    if vars_map.is_empty() && files.is_empty() {
         anyhow::bail!("no secrets to send: env file has no variables and [secrets].files is empty");
     }
+    let file_mode = match &resolved.rpitoml.secrets.file_mode {
+        Some(text) => Some(
+            pi_domain::secretmode::parse(text)
+                .map_err(|e| anyhow::anyhow!("rpi.toml [secrets].file_mode: {e}"))?,
+        ),
+        None => None,
+    };
 
     let AgentConn {
         tunnel: _tunnel,
@@ -204,28 +313,150 @@ pub async fn secrets_send(
     if is_env {
         compat.gate(crate::compat::Feature::Environments)?;
     }
-    let file_mode = match &rpitoml.secrets.file_mode {
-        Some(text) => Some(
-            pi_domain::secretmode::parse(text)
-                .map_err(|e| anyhow::anyhow!("rpi.toml [secrets].file_mode: {e}"))?,
-        ),
-        None => None,
-    };
     if file_mode.is_some() {
         compat.gate(crate::compat::Feature::SecretModes)?;
     }
 
-    let (n, m) = (vars.len(), files.len());
-    let resp = api
-        .send_secrets(&project_name, vars, files, file_mode, apply)
-        .await?;
-    output::success(format!(
-        "saved {n} key(s) and {m} file(s) for project '{project_name}'"
-    ));
-    if resp.applied {
-        output::success("secrets applied to running containers");
+    match group {
+        Some(group) => {
+            pi_domain::secretgroup::validate_group_name(&group)
+                .map_err(|e| anyhow::anyhow!("--group: {e}"))?;
+            compat.gate(crate::compat::Feature::SecretGroups)?;
+            let head = api.head_secret_group(&base, &group).await.ok();
+            let expected = if force {
+                None
+            } else {
+                Some(head.as_ref().map(|h| h.revision).unwrap_or(0))
+            };
+            if let Some(head) = &head {
+                let vd = diff_vars(&vars_map, &head.vars);
+                let fd = diff_files(&files, &head.files);
+                output::info(format!("env keys: {}", vd.render()));
+                output::info(format!("files: {}", fd.render()));
+            }
+            let resp = api
+                .push_secret_group(
+                    &base,
+                    &group,
+                    &crate::proto::SecretGroupPushRequest {
+                        vars: vars_map,
+                        files,
+                        file_mode,
+                        expected_revision: expected,
+                        merge,
+                    },
+                )
+                .await?;
+            output::success(format!(
+                "group '{base}/{group}' now at revision {} ({} key(s), {} file(s))",
+                resp.revision, resp.keys, resp.files
+            ));
+            if apply {
+                apply_to_resolved_project(&api, &project_name, &base, &group).await?;
+            }
+        }
+        None => {
+            if !compat.supports(crate::compat::Feature::SecretGroups) {
+                output::warn(
+                    "this agent predates secret groups: the overwrite guard is unavailable, \
+                     so a concurrent change on the agent will be replaced silently",
+                );
+            }
+            let (n, m) = (vars_map.len(), files.len());
+            let resp = api
+                .send_secrets(&project_name, vars_map, files, file_mode, apply)
+                .await?;
+            output::success(format!(
+                "saved {n} key(s) and {m} file(s) for project '{project_name}'"
+            ));
+            if resp.applied {
+                output::success("secrets applied to running containers");
+            }
+        }
     }
     Ok(())
+}
+
+/// `--apply` after a group push: apply to the project the current config
+/// resolves to, and name the others that declare the group as untouched. A
+/// fan-out that restarts every attached environment from one command is too
+/// abrupt a default.
+async fn apply_to_resolved_project(
+    api: &crate::cli::api::ApiClient,
+    project: &str,
+    base: &str,
+    group: &str,
+) -> anyhow::Result<()> {
+    let listed = api.list_secret_groups(base).await?;
+    let others: Vec<String> = listed
+        .groups
+        .iter()
+        .filter(|g| g.name == group)
+        .flat_map(|g| g.attached_by.iter().cloned())
+        .filter(|k| k != project)
+        .collect();
+    api.apply_key_secrets(project).await?;
+    output::success(format!("applied to '{project}'"));
+    if !others.is_empty() {
+        output::info(format!(
+            "also declared by (not applied): {}",
+            others.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+/// `rpi secrets diff` — local sources against the agent, by digest.
+pub async fn secrets_diff(
+    group: Option<String>,
+    env: Option<String>,
+    vars: Vec<String>,
+    connect: ConnectOpts,
+) -> anyhow::Result<()> {
+    let resolved = crate::cli::overlay::resolve(env.as_deref(), &vars)?;
+    let base = resolve_base(&resolved);
+    let project_name = resolved.rpitoml.project.name.clone();
+    let (vars_map, files) = collect_secrets(Path::new("."), &resolved.rpitoml.secrets)?;
+
+    let AgentConn {
+        tunnel: _tunnel,
+        api,
+        compat,
+    } = crate::cli::connect::connect_agent(connect).await?;
+    compat.gate(crate::compat::Feature::SecretGroups)?;
+
+    let (label, head) = match &group {
+        Some(group) => (
+            format!("group '{base}/{group}'"),
+            api.head_secret_group(&base, group).await?,
+        ),
+        None => (
+            format!("project '{project_name}'"),
+            api.head_key_secrets(&project_name).await?,
+        ),
+    };
+    output::heading(format!("{label} at revision {}", head.revision));
+    output::info(format!(
+        "env keys: {}",
+        diff_vars(&vars_map, &head.vars).render()
+    ));
+    output::info(format!(
+        "files: {}",
+        diff_files(&files, &head.files).render()
+    ));
+    Ok(())
+}
+
+/// Deprecated alias kept so existing scripts keep working; `push` without
+/// `--group` is the same operation.
+pub async fn secrets_send(
+    apply: bool,
+    env: Option<String>,
+    vars: Vec<String>,
+    connect: ConnectOpts,
+) -> anyhow::Result<()> {
+    output::warn("`rpi secrets send` is deprecated; use `rpi secrets push`");
+    secrets_push(None, false, false, apply, env, vars, connect).await
 }
 
 /// Assemble the outgoing bundle per secrets spec §3: an explicitly configured
@@ -901,6 +1132,32 @@ mod tests {
     use super::*;
     use crate::cli::rpitoml::SecretsSection;
 
+    /// Minimal `rpi.toml` text, mirroring `cli::overlay::tests::BASE`.
+    const SAMPLE_BASE: &str = r#"
+schema = 1
+
+[project]
+name = "myapp"
+
+[source]
+repo = "git@github.com:acme/myapp.git"
+branch = "main"
+
+[ingress]
+hostname = "app.example.com"
+service = "web"
+port = 3000
+
+[healthcheck]
+path = "/health"
+
+[secrets]
+env = ".env"
+
+[commands]
+seed = "node seed.js"
+"#;
+
     fn section(env: Option<&str>, files: &[&str]) -> SecretsSection {
         SecretsSection {
             env: env.map(str::to_string),
@@ -1181,5 +1438,58 @@ mod tests {
                 "create-invite  ->  node x.cjs  [service: server]"
             );
         }
+    }
+
+    #[test]
+    fn base_comes_from_the_environment_not_the_derived_key() {
+        // With --env the resolved project name is the derived key; addressing
+        // a group under that key would point at a directory no project owns.
+        let resolved = crate::cli::overlay::resolve_from(
+            SAMPLE_BASE,
+            Some((
+                "branch",
+                "[ingress]\nhostname = \"x.example.com\"\n\n[secrets]\ngroups = [\"preview\"]\n",
+            )),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(resolved.rpitoml.project.name, "myapp--branch");
+        assert_eq!(resolve_base(&resolved), "myapp");
+
+        let plain = crate::cli::overlay::resolve_from(SAMPLE_BASE, None, &[]).unwrap();
+        assert_eq!(resolve_base(&plain), "myapp");
+    }
+
+    #[test]
+    fn diff_summary_reports_added_changed_and_removed_by_name_only() {
+        let local = {
+            let mut m = BTreeMap::new();
+            m.insert("KEEP".to_string(), "same".to_string());
+            m.insert("CHANGED".to_string(), "new-value".to_string());
+            m.insert("ADDED".to_string(), "fresh".to_string());
+            m
+        };
+        let remote = {
+            let mut m = BTreeMap::new();
+            m.insert("KEEP".to_string(), digest_of("same"));
+            m.insert("CHANGED".to_string(), digest_of("old-value"));
+            m.insert("REMOVED".to_string(), digest_of("gone"));
+            m
+        };
+
+        let d = diff_vars(&local, &remote);
+        assert_eq!(d.added, vec!["ADDED".to_string()]);
+        assert_eq!(d.changed, vec!["CHANGED".to_string()]);
+        assert_eq!(d.removed, vec!["REMOVED".to_string()]);
+        assert_eq!(d.unchanged, 1);
+
+        let rendered = d.render();
+        for value in ["same", "new-value", "old-value", "gone", "fresh"] {
+            assert!(!rendered.contains(value), "a value leaked: {rendered}");
+        }
+    }
+
+    fn digest_of(value: &str) -> String {
+        pi_domain::secretgroup::digest(value.as_bytes())
     }
 }

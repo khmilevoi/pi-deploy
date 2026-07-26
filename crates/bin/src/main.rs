@@ -284,6 +284,43 @@ enum SecretsCmd {
         #[command(flatten)]
         connect: cli::config::ConnectOpts,
     },
+    /// Push the env file and [secrets].files to a group, or to this project's own bundle
+    Push {
+        /// Target group (omit to target this deploy key's own bundle)
+        #[arg(long)]
+        group: Option<String>,
+        /// Upsert instead of replacing the group wholesale
+        #[arg(long)]
+        merge: bool,
+        /// Overwrite even if the group changed since it was read
+        #[arg(long)]
+        force: bool,
+        /// Also apply the new secrets to running containers
+        #[arg(long)]
+        apply: bool,
+        /// Deploy/operate an environment defined by rpi.<env>.toml
+        #[arg(long)]
+        env: Option<String>,
+        /// Overlay variables, e.g. --vars BRANCH_NAME=feature/login (repeatable)
+        #[arg(long = "vars")]
+        vars: Vec<String>,
+        #[command(flatten)]
+        connect: cli::config::ConnectOpts,
+    },
+    /// Compare local secret sources against the agent (by digest, never values)
+    Diff {
+        /// Target group (omit to compare against this deploy key's own bundle)
+        #[arg(long)]
+        group: Option<String>,
+        /// Deploy/operate an environment defined by rpi.<env>.toml
+        #[arg(long)]
+        env: Option<String>,
+        /// Overlay variables, e.g. --vars BRANCH_NAME=feature/login (repeatable)
+        #[arg(long = "vars")]
+        vars: Vec<String>,
+        #[command(flatten)]
+        connect: cli::config::ConnectOpts,
+    },
 }
 
 #[derive(Subcommand)]
@@ -525,6 +562,27 @@ async fn run() -> anyhow::Result<()> {
         Cmd::Secrets {
             cmd: SecretsCmd::Ls { env, vars, connect },
         } => cli::commands::secrets_ls(env, vars, connect).await,
+        Cmd::Secrets {
+            cmd:
+                SecretsCmd::Push {
+                    group,
+                    merge,
+                    force,
+                    apply,
+                    env,
+                    vars,
+                    connect,
+                },
+        } => cli::commands::secrets_push(group, merge, force, apply, env, vars, connect).await,
+        Cmd::Secrets {
+            cmd:
+                SecretsCmd::Diff {
+                    group,
+                    env,
+                    vars,
+                    connect,
+                },
+        } => cli::commands::secrets_diff(group, env, vars, connect).await,
         Cmd::Agent {
             cmd: AgentCmd::Run { .. },
         } => unreachable!(),
@@ -853,6 +911,35 @@ mod tests {
         assert!(
             Cli::try_parse_from(["pi", "env", "send"]).is_err(),
             "env is removed"
+        );
+    }
+
+    #[test]
+    fn secrets_push_and_diff_parse_with_group_flags() {
+        let cli = Cli::try_parse_from([
+            "pi", "secrets", "push", "--group", "preview", "--merge", "--force", "--apply",
+        ])
+        .unwrap();
+        match cli.cmd.unwrap() {
+            Cmd::Secrets {
+                cmd:
+                    SecretsCmd::Push {
+                        group,
+                        merge,
+                        force,
+                        apply,
+                        ..
+                    },
+            } => {
+                assert_eq!(group.as_deref(), Some("preview"));
+                assert!(merge && force && apply);
+            }
+            _ => panic!("expected secrets push"),
+        }
+        assert!(Cli::try_parse_from(["pi", "secrets", "diff"]).is_ok());
+        assert!(
+            Cli::try_parse_from(["pi", "secrets", "send"]).is_ok(),
+            "alias kept"
         );
     }
 

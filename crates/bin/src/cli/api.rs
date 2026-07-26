@@ -466,6 +466,112 @@ impl ApiClient {
             .json()
             .await?)
     }
+
+    pub async fn push_secret_group(
+        &self,
+        base: &str,
+        group: &str,
+        req: &crate::proto::SecretGroupPushRequest,
+    ) -> anyhow::Result<crate::proto::SecretGroupPushResponse> {
+        let resp = self
+            .http
+            .put(format!(
+                "{}/v1/projects/{base}/secret-groups/{group}",
+                self.base
+            ))
+            .json(req)
+            .send()
+            .await?;
+        Ok(expect_feature(resp, crate::compat::Feature::SecretGroups)
+            .await?
+            .json()
+            .await?)
+    }
+
+    pub async fn head_secret_group(
+        &self,
+        base: &str,
+        group: &str,
+    ) -> anyhow::Result<crate::proto::SecretGroupHeadResponse> {
+        let resp = self
+            .http
+            .get(format!(
+                "{}/v1/projects/{base}/secret-groups/{group}",
+                self.base
+            ))
+            .send()
+            .await?;
+        Ok(expect_feature(resp, crate::compat::Feature::SecretGroups)
+            .await?
+            .json()
+            .await?)
+    }
+
+    pub async fn list_secret_groups(
+        &self,
+        base: &str,
+    ) -> anyhow::Result<crate::proto::SecretGroupsListResponse> {
+        let resp = self
+            .http
+            .get(format!("{}/v1/projects/{base}/secret-groups", self.base))
+            .send()
+            .await?;
+        Ok(expect_feature(resp, crate::compat::Feature::SecretGroups)
+            .await?
+            .json()
+            .await?)
+    }
+
+    /// Forward contract (secret-groups spec, plan Task 9): `rpi secrets
+    /// group rm` is the only caller and is not wired until that task.
+    #[allow(dead_code)]
+    pub async fn delete_secret_group(
+        &self,
+        base: &str,
+        group: &str,
+        force: bool,
+    ) -> anyhow::Result<()> {
+        let resp = self
+            .http
+            .delete(format!(
+                "{}/v1/projects/{base}/secret-groups/{group}?force={force}",
+                self.base
+            ))
+            .send()
+            .await?;
+        expect_feature(resp, crate::compat::Feature::SecretGroups).await?;
+        Ok(())
+    }
+
+    pub async fn head_key_secrets(
+        &self,
+        project: &str,
+    ) -> anyhow::Result<crate::proto::SecretGroupHeadResponse> {
+        let resp = self
+            .http
+            .get(format!("{}/v1/projects/{project}/secrets/head", self.base))
+            .send()
+            .await?;
+        Ok(expect_feature(resp, crate::compat::Feature::SecretGroups)
+            .await?
+            .json()
+            .await?)
+    }
+
+    pub async fn apply_key_secrets(
+        &self,
+        project: &str,
+    ) -> anyhow::Result<crate::proto::SecretsApplyResponse> {
+        let resp = self
+            .http
+            .post(format!("{}/v1/projects/{project}/secrets/apply", self.base))
+            .send()
+            .await?;
+        Ok(expect_feature(resp, crate::compat::Feature::SecretGroups)
+            .await?
+            .json()
+            .await?)
+    }
 }
 
 #[cfg(test)]
