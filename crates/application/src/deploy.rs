@@ -283,6 +283,8 @@ impl DeployProject {
                 config.expose.bind_addr(),
                 project.host_port,
                 config.container_port,
+                &[],
+                &Default::default(),
             )
             .await?;
 
@@ -599,11 +601,11 @@ mod tests {
         let stage_order = Arc::clone(&order);
         m.overrides
             .expect_write()
-            .withf(|p, s, bind, hp, cp| {
+            .withf(|p, s, bind, hp, cp, _, _| {
                 p == "rateme" && s == "web" && bind == "127.0.0.1" && *hp == 8000 && *cp == 3000
             })
             .times(1)
-            .returning(move |_, _, _, _, _| {
+            .returning(move |_, _, _, _, _, _, _| {
                 stage_order.lock().unwrap().push("override");
                 Ok(PathBuf::from("/var/lib/rpi/overrides/rateme.yml"))
             });
@@ -796,11 +798,11 @@ mod tests {
         m.secrets_writer.expect_write().times(0);
         m.overrides
             .expect_write()
-            .withf(|p, s, bind, hp, cp| {
+            .withf(|p, s, bind, hp, cp, _, _| {
                 p == "rateme" && s == "web" && bind == "0.0.0.0" && *hp == 8000 && *cp == 3000
             })
             .times(1)
-            .returning(|_, _, _, _, _| Ok(PathBuf::from("/ov.yml")));
+            .returning(|_, _, _, _, _, _, _| Ok(PathBuf::from("/ov.yml")));
         m.runtime.expect_build().returning(|_, _| Ok(()));
         m.runtime.expect_up().returning(|_, _| Ok(()));
         m.runtime.expect_ps().returning(|_| Ok(vec![]));
@@ -1010,7 +1012,7 @@ mod tests {
         m.secrets_writer.expect_write().times(0);
         m.overrides
             .expect_write()
-            .returning(|_, _, _, _, _| Ok(PathBuf::from("/ov.yml")));
+            .returning(|_, _, _, _, _, _, _| Ok(PathBuf::from("/ov.yml")));
         m.runtime
             .expect_build()
             .returning(|_, _| Err(DomainError::Runtime("compose build exited with 1".into())));
@@ -1076,7 +1078,7 @@ mod tests {
         });
         m.overrides
             .expect_write()
-            .returning(|_, _, _, _, _| Ok(PathBuf::from("/ov.yml")));
+            .returning(|_, _, _, _, _, _, _| Ok(PathBuf::from("/ov.yml")));
         m.history.expect_mark_running().returning(|_, _| Ok(()));
         m.history
             .expect_record_finished()
@@ -1288,7 +1290,7 @@ mod tests {
             .returning(|_| Ok(SecretsBundle::default()));
         m.overrides
             .expect_write()
-            .returning(|_, _, _, _, _| Ok(PathBuf::from("/o.yml")));
+            .returning(|_, _, _, _, _, _, _| Ok(PathBuf::from("/o.yml")));
         m.runtime.expect_build().returning(|_, _| Ok(()));
         m.runtime.expect_up().returning(|_, _| Ok(()));
         m.runtime.expect_ps().returning(|_| Ok(vec![]));
@@ -1554,7 +1556,7 @@ mod tests {
         m.secrets_writer.expect_write().times(0);
         m.overrides
             .expect_write()
-            .returning(|p, _, _, _, _| Ok(PathBuf::from("/ov").join(p)));
+            .returning(|p, _, _, _, _, _, _| Ok(PathBuf::from("/ov").join(p)));
         m.health.expect_check().returning(|_, _, _| Ok(()));
         m.ingress
             .expect_upsert()
@@ -1852,7 +1854,7 @@ mod tests {
         m.secrets_writer.expect_write().times(0);
         m.overrides
             .expect_write()
-            .returning(|_, _, _, _, _| Ok(PathBuf::from("/ov.yml")));
+            .returning(|_, _, _, _, _, _, _| Ok(PathBuf::from("/ov.yml")));
         m.runtime.expect_build().returning(|_, _| Ok(()));
         m.runtime.expect_up().returning(|_, _| Ok(()));
         m.runtime.expect_ps().returning(|_| Ok(vec![]));
@@ -1918,7 +1920,7 @@ mod tests {
         m.secrets_writer.expect_write().times(0);
         m.overrides
             .expect_write()
-            .returning(|_, _, _, _, _| Ok(PathBuf::from("/ov.yml")));
+            .returning(|_, _, _, _, _, _, _| Ok(PathBuf::from("/ov.yml")));
         m.runtime.expect_build().returning(|_, _| Ok(()));
         m.runtime.expect_up().returning(|_, _| Ok(()));
         m.runtime.expect_ps().returning(|_| Ok(vec![]));
@@ -1972,7 +1974,7 @@ mod tests {
         m.secrets_writer.expect_write().times(0);
         m.overrides
             .expect_write()
-            .returning(|_, _, _, _, _| Ok(PathBuf::from("/ov.yml")));
+            .returning(|_, _, _, _, _, _, _| Ok(PathBuf::from("/ov.yml")));
         m.runtime.expect_build().returning(|_, _| Ok(()));
         m.runtime.expect_up().returning(|_, _| Ok(()));
         m.runtime.expect_ps().returning(|_| Ok(vec![]));

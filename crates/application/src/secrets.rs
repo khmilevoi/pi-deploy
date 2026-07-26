@@ -96,6 +96,8 @@ impl SendSecrets {
                 registered.config.expose.bind_addr(),
                 registered.host_port,
                 config.container_port,
+                &[],
+                &Default::default(),
             )
             .await?;
         let stack = ComposeStack {
@@ -298,11 +300,11 @@ mod tests {
             .returning(|_, _| Ok(()));
         m.overrides
             .expect_write()
-            .withf(|p, s, bind, hp, cp| {
+            .withf(|p, s, bind, hp, cp, _, _| {
                 p == "rateme" && s == "web" && bind == "127.0.0.1" && *hp == 8000 && *cp == 3000
             })
             .times(1)
-            .returning(|_, _, _, _, _| Ok(PathBuf::from("/ov/rateme.yml")));
+            .returning(|_, _, _, _, _, _, _| Ok(PathBuf::from("/ov/rateme.yml")));
         m.runtime
             .expect_up()
             .withf(|stack, _| {

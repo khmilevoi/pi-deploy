@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -180,6 +181,12 @@ pub trait DeploymentHistory: Send + Sync {
 pub trait OverrideStore: Send + Sync {
     /// Returns the expected path of the override file for the project.
     fn path(&self, project: &str) -> PathBuf;
+    /// `service` is the public service (ports plus restart policy);
+    /// `services` is every service that should receive `env`, and may or may
+    /// not contain `service`. Each parameter is an independent input the
+    /// emitter needs verbatim; grouping them into a struct would only move the
+    /// same list one indirection away, so the arity is accepted here.
+    #[allow(clippy::too_many_arguments)]
     async fn write(
         &self,
         project: &str,
@@ -187,6 +194,8 @@ pub trait OverrideStore: Send + Sync {
         bind: &str,
         host_port: u16,
         container_port: u16,
+        services: &[String],
+        env: &BTreeMap<String, String>,
     ) -> Result<PathBuf, DomainError>;
     async fn remove(&self, project: &str) -> Result<(), DomainError>;
 }
