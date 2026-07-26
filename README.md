@@ -44,7 +44,7 @@
 - **Encrypted secrets** — `.env` plus arbitrary secret files, sent encrypted, stored age-encrypted on the agent, written into the checkout at deploy time (`.env` `0600`, secret files `0644` by default, both overridable with `[secrets].file_mode`). A named **secret group** is pushed once and attached from `[secrets].groups`, so every branch preview of the project inherits it instead of uploading its own copy.
 - **Cloudflare Tunnel ingress** — one command installs `cloudflared`, creates or adopts the tunnel, and manages DNS entirely through the Cloudflare API. Hand-built tunnels are adopted without a rewrite or downtime.
 - **Stable ports & health checks** — the agent allocates a stable host port per project, writes a Compose override, and probes HTTP (or TCP) before declaring success.
-- **Latest-wins deploy queue** — a newer deploy supersedes the one in flight; `rpi deploy --cancel` aborts.
+- **Latest-wins deploy queue** — a deploy pushed while another is running queues behind it, and a newer one supersedes whatever is *waiting*, so a burst of pushes runs the first and the last, not every one; `rpi deploy --cancel` aborts the running deploy.
 - **Admin commands** — declare `[commands]` in `rpi.toml` and run them inside the service container with `rpi command`.
 - **Ops built in** — `rpi logs`, `rpi stats` (`-w` for a live dashboard TUI: CPU / memory / temperature cards with mini charts, plus a per-service table with status pills and memory bars), `rpi status`, `rpi doctor`, `rpi agent logs`, `rpi gc`.
 - **Version-skew aware** — the CLI and agent handshake on `connect`, gate commands against advertised agent features, and print a banner instead of a confusing error when they're out of sync.
@@ -131,7 +131,7 @@ developer machine / CI                      Raspberry Pi
 
 - `rpi agent run` is a daemon on the Pi, managed by `systemd`. It stores state in SQLite, selects a stable host port from `port_min..port_max`, writes a Compose override binding `127.0.0.1:<host-port>`, runs `docker compose build`, then `docker compose up -d --remove-orphans`, and health-checks the result.
 - `rpi deploy`, `rpi ls`, `rpi secrets …`, and the other client commands run on a developer machine or CI runner and open an SSH tunnel to the agent's Unix socket.
-- Deployments queue latest-wins: pushing a newer deploy supersedes the one in progress.
+- Deployments queue latest-wins: at most one deploy waits per project, and a newer submit supersedes the waiting one. The deploy already in progress runs to completion unless `rpi deploy --cancel` aborts it.
 - Each deployable project carries an `rpi.toml` at its root. Run `rpi deploy` from the root of *that* project — not from this repository.
 
 ## Installation
