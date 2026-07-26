@@ -41,7 +41,7 @@
 - **No open ports** — the CLI tunnels over your existing SSH access; the agent listens on a Unix socket only.
 - **Staged pipeline view** — `fetch → build → start → health → route → gc`, each stage collapsing into a timed `✓ build (48.3s)` summary.
 - **Private repos without friction** — a deploy-key preflight verifies repo access before the pipeline and registers a read-only deploy key through your local `gh` (the token never leaves your machine, the private key never leaves the Pi). Without `gh` it prints the key and continues by itself once you add it — even picking up a `gh auth login` you run mid-wait.
-- **Encrypted secrets** — `.env` plus arbitrary secret files, sent encrypted, stored age-encrypted on the agent, written into the checkout at deploy time (`.env` `0600`, secret files `0644` by default, both overridable with `[secrets].file_mode`).
+- **Encrypted secrets** — `.env` plus arbitrary secret files, sent encrypted, stored age-encrypted on the agent, written into the checkout at deploy time (`.env` `0600`, secret files `0644` by default, both overridable with `[secrets].file_mode`). A named **secret group** is pushed once and attached from `[secrets].groups`, so every branch preview of the project inherits it instead of uploading its own copy.
 - **Cloudflare Tunnel ingress** — one command installs `cloudflared`, creates or adopts the tunnel, and manages DNS entirely through the Cloudflare API. Hand-built tunnels are adopted without a rewrite or downtime.
 - **Stable ports & health checks** — the agent allocates a stable host port per project, writes a Compose override, and probes HTTP (or TCP) before declaring success.
 - **Latest-wins deploy queue** — a newer deploy supersedes the one in flight; `rpi deploy --cancel` aborts.
@@ -302,7 +302,7 @@ Field notes:
 
 - `healthcheck.path` is probed through the allocated host port; without a path the agent uses a TCP probe.
 - `secrets.files` are sent encrypted, stored age-encrypted on the agent, and written `0644` (readable beyond the agent's own account, because a container running as its image's own uid needs to read a bind-mounted secret) into the checkout on every deploy; `secrets.env`'s `.env` file stays `0600`. Paths are relative with forward slashes; `..` is rejected.
-- `secrets.file_mode` overrides both of the modes above with one value — accepted forms are `"0644"`/`"644"` (owner read, optionally write; group/other read only; no execute or setuid/setgid/sticky bits). It requires an agent `>= 0.26.0` (the `secret-modes` capability) and, since the mode travels with the bundle, only takes effect on the next `rpi secrets send` — a `rpi deploy` that reuses an already-stored bundle keeps whatever mode that bundle was sent with.
+- `secrets.file_mode` overrides both of the modes above with one value — accepted forms are `"0644"`/`"644"` (owner read, optionally write; group/other read only; no execute or setuid/setgid/sticky bits). It requires an agent `>= 0.26.0` (the `secret-modes` capability) and, since the mode travels with the bundle, only takes effect on the next `rpi secrets push` — a `rpi deploy` that reuses an already-stored bundle keeps whatever mode that bundle was sent with.
 - `expose = "lan"` binds the host port on `0.0.0.0`. On a host with a public IPv4 that means the public internet, and Docker bypasses host firewalls (UFW/iptables) for published ports — use it only on trusted networks or behind an external firewall.
 
 ### `[commands]` — admin commands (optional)
@@ -721,7 +721,7 @@ sudo systemctl restart rpi-agent
 
 ### Compose does not see secrets
 
-Run `rpi secrets send` before `rpi deploy` (or `rpi secrets send --apply` for a running project).
+Run `rpi secrets push` before `rpi deploy` (or `rpi secrets push --apply` for a running project). If `rpi.toml` declares `[secrets].groups`, `rpi secrets ls` shows the effective merged set and where each entry comes from.
 
 ### Health check fails
 

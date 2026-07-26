@@ -9,7 +9,7 @@ be written into a checkout, and how their values are kept out of logs.
 
 ```mermaid
 sequenceDiagram
-    participant CLI as rpi secrets send
+    participant CLI as rpi secrets push
     participant API as Agent HTTP API
     participant Store as Secret store (age-encrypted)
     participant Runtime as Container runtime
@@ -49,7 +49,7 @@ sequenceDiagram
 
 ## Walkthrough
 
-1. **What can be a secret.** `rpi secrets send` reads the project's `.env`
+1. **What can be a secret.** `rpi secrets push` reads the project's `.env`
    file (the default, or whichever file `[secrets].env` names) plus every
    file listed under `[secrets].files` — arbitrary files such as TLS
    certificates, not just key/value variables. Every one of those paths is
@@ -126,7 +126,7 @@ sequenceDiagram
    writer's own bookkeeping, stays 0600 unconditionally regardless of
    `file_mode`. The mode travels with the bundle, so changing `file_mode`
    takes effect the next time a bundle carrying it is actually written —
-   `rpi secrets send --apply`, or a `rpi deploy` that loads a bundle sent
+   `rpi secrets push --apply`, or a `rpi deploy` that loads a bundle sent
    after the change — not by itself.
 
    `rpi secrets ls` also decrypts a previously-stored bundle, but only in
@@ -193,7 +193,7 @@ sequenceDiagram
    that condition still needs their logs.
 
 7. **Failure: sending to a project that doesn't exist.**
-   `rpi secrets send --apply` for a project the agent has never deployed
+   `rpi secrets push --apply` for a project the agent has never deployed
    fails — the response reports the project isn't deployed yet and to run
    `rpi deploy` first. The bundle is still saved, encrypted, before this
    check runs, so a subsequent `rpi deploy` picks it up normally. Sending
@@ -330,7 +330,7 @@ sequenceDiagram
 - `crates/bin/src/agent/http.rs` (secrets + secret-group routes) — validates and decodes an incoming bundle once (`decode_secret_payload`, shared by the per-key and group write paths), validates a group name with the same rule the `rpi.toml` parser uses (`pi_domain::secretgroup::validate_group_name`) on both the group routes' path segments (`valid_group_path`) and every entry of a deploy request's `secret_groups` (in `create_deployment`, alongside the project/service/command-name checks and before `projects.upsert`, so a junk name never reaches the registry), and serves both route families; no handler ever serializes a secret value. `ApiError`'s `IntoResponse` maps `DomainError::Conflict` (item 13's stale-revision case) to HTTP 409 for every route in this file, not only the secret ones.
 - `crates/bin/src/proto.rs` (secrets + secret-group DTOs) — wire shapes for both route families; group and head responses carry names, digests, sizes and revisions only. `SecretsListResponse.layers` (`Vec<SecretLayerDto>`) carries the per-layer provenance `rpi secrets ls` renders; absent (not merely empty) from an agent older than 0.27.0, which is how the CLI tells "nothing to show" apart from "this agent doesn't know about layers."
 - `crates/bin/src/cli/commands.rs` (`collect_secrets`, `secrets_push`, `secrets_diff`, `secrets_ls`, `secrets_group_ls`, `secrets_group_rm`) — `collect_secrets` reads the local env file and secret files, rejects any path escaping the project root, and refuses a secret key using the reserved `RPI_` prefix, so a stored secret can never contend with the agent-injected runtime variable of the same name; every push goes through it, a group's as much as a deploy key's own. The rest are the CLI side of every route above; `effective_rows` turns a `SecretsListResponse` into (name, winning layer, shadowed?) rows for `secrets_ls`'s effective view, and `render_group_head` renders one group's head (revision, names, digests, sizes) for `secrets_ls --group`. `validate_group_arg` is the single local entry point for a group name off the command line, called first by all four of `push`/`ls`/`diff`/`group rm` so the same typo produces the same message and never reaches URL construction. `rm_confirmation_text` (used by `rm`) and `group_rm_confirmation_text` (used by `secrets group rm`) are the pure functions behind item 12's and item 11's confirmation wording; each command feeds them best-effort `list_secret_groups`/`list_environments` results before prompting. `gate_deploy_features` holds `deploy`'s use-site compat gates — `Environments` when an env is selected, `SecretGroups` when `[secrets].groups` is non-empty (item 11). `secrets_push` is also where item 13's client half lives, and it differs by path: on the group branch the head is always fetched (`head_secret_group(...).ok()`, both for the diff lines and for `expected_revision`), with `--force` only zeroing the latter; on the per-key branch `should_look_up_key_revision` decides whether the head read (`head_key_secrets`) happens at all, and it never does when `--force` is set or the agent predates secret groups (the lookup route itself wouldn't exist there).
-- `crates/bin/src/cli/rpitoml.rs` (`SecretsSection` only) — the `[secrets]` table in `rpi.toml`: names the local env file `rpi secrets send` reads (`[secrets].env`, default `.env`), the extra files it reads verbatim (`[secrets].files`), the declared group list (`[secrets].groups`, carried into `ProjectConfig.secret_groups` in declared order by `to_project_config`), and the optional `[secrets].file_mode` override, parsed and validated by `pi_domain::secretmode`.
+- `crates/bin/src/cli/rpitoml.rs` (`SecretsSection` only) — the `[secrets]` table in `rpi.toml`: names the local env file `rpi secrets push` reads (`[secrets].env`, default `.env`), the extra files it reads verbatim (`[secrets].files`), the declared group list (`[secrets].groups`, carried into `ProjectConfig.secret_groups` in declared order by `to_project_config`), and the optional `[secrets].file_mode` override, parsed and validated by `pi_domain::secretmode`.
 - `crates/infrastructure/src/overrides.rs` — `FsOverrideStore`, the only writer of the generated compose override. `--apply` rewrites that file from scratch, which is why this path has to re-derive the full service list and `RPI_*` map rather than patch the ports alone; the file's contents are covered in `flows/deploy.md`.
 - `crates/domain/src/runtimevars.rs` — the `RPI_*` map `--apply` writes into the override, derived from the registry row. With no deploy in flight, `RPI_COMMIT_SHA` is the project's last successfully deployed sha.
 - `crates/application/src/mask.rs` — `MaskingSink`: replaces armed secret values (6+ characters) with `***KEY***` in every line logged afterward.

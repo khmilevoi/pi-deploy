@@ -90,7 +90,7 @@ sequenceDiagram
 ## Walkthrough
 
 1. `rpi deploy --env <env> [--vars KEY=VALUE ...]` — and, identically,
-   `rpi command`, `rpi secrets send`, `rpi secrets ls`, and
+   `rpi command`, every `rpi secrets` subcommand, and
    `rpi config show`, all of which accept the same `--env`/`--vars` pair —
    resolves `./rpi.toml` plus `./rpi.<env>.toml` entirely locally, before the
    agent is ever contacted. `--vars` does not require `--env`: a base
@@ -229,7 +229,7 @@ sequenceDiagram
    derived key), which is the whole point of a group meant to be shared by
    more than one deploy. A fresh environment's first deploy therefore
    inherits every group its overlay declares immediately, with no separate
-   `rpi secrets send` needed for those groups; only its own implicit key
+   `rpi secrets push` needed for those groups; only its own implicit key
    bundle starts empty, and the base project's own key bundle is never
    copied to it.
 8. The agent validates shape before ever touching the registry. A request
@@ -396,7 +396,7 @@ sequenceDiagram
   base file's, captured before the merge), and the
   `resolve`/`resolve_from`/`render_resolved` entry points that
   `rpi deploy`, `rpi config show`, `rpi command`, and
-  `rpi secrets send/ls` all call.
+  `rpi secrets push/send/ls/diff` and `rpi secrets group ls/rm` all call.
 - `crates/bin/src/cli/rpitoml.rs` — `from_value`/`validate_common`, the typed
   validation every substituted document is re-run through, including
   `validate_hostname` (RFC-1123-style: length, labels, charset) on both the
@@ -474,7 +474,7 @@ sequenceDiagram
   (`Feature::Environments`, since `0.24.0`) that `rpi deploy --env` and
   `rpi env *` check before talking to an older agent.
 - `crates/bin/src/main.rs` — the clap surface: `--env`/`--vars` on `deploy`,
-  `command`, `secrets send/ls` and `config show`, and `env destroy`/
+  `command`, every `secrets` subcommand and `config show`, and `env destroy`/
   `reset-data`'s `--full-key`, declared with `conflicts_with_all = ["env",
   "vars"]`. The flag is `--full-key` rather than `--key` because the
   flattened `ConnectOpts` already owns `--key` for the SSH private key path.

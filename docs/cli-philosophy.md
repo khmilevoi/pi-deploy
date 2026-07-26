@@ -37,11 +37,16 @@ This means:
 ## 2. Command structure and nesting
 
 Commands read `rpi <noun> <verb>` and stop at two levels:
-`rpi secrets send`, `rpi agent setup`, `rpi command <name>`. There is no
-`rpi agent secrets rotate`-style third level anywhere in the tree, and new
-commands shouldn't introduce one. If a feature seems to need a third level,
-it usually means the noun is wrong — split it into its own top-level group
-instead of nesting deeper.
+`rpi secrets push`, `rpi agent setup`, `rpi command <name>`. The single
+third level in the tree is `rpi secrets group ls|rm`, and it earns its depth
+by naming a different object: a secret *group* has its own lifetime and is
+owned by the base project rather than by the deploy key doing the pushing,
+so `rpi secrets ls` and `rpi secrets group ls` genuinely list different
+things. A `rpi agent secrets rotate`-style third level — one that is really
+just a flag's worth of variation on the noun's own verbs — still doesn't
+belong, and new commands shouldn't introduce one. If a feature seems to need
+one, it usually means the noun is wrong: split it into its own top-level
+group instead of nesting deeper.
 
 Flat top-level verbs (`rpi deploy`, `rpi ls`, `rpi logs`, `rpi status`,
 `rpi doctor`, `rpi gc`) are for the handful of operations a user reaches for
@@ -88,9 +93,9 @@ the moment.
   network surface is the SSH the user already has. A new command must not
   introduce a listener reachable other than through the tunnel.
 - **Secrets are encrypted in transit and at rest, and the CLI doesn't linger
-  over them.** `rpi secrets send` encrypts before it leaves the developer's
-  machine; the agent stores them age-encrypted; `rpi secrets ls` never
-  transmits values, only keys and paths. A new command touching secret
+  over them.** `rpi secrets push` encrypts before it leaves the developer's
+  machine; the agent stores them age-encrypted; `rpi secrets ls` and
+  `rpi secrets diff` never transmit values, only keys, paths and digests. A new command touching secret
   material follows the same shape — encrypt before sending, never echo a
   secret value back for display.
 - **Destructive or hard-to-reverse operations require explicit confirmation.**

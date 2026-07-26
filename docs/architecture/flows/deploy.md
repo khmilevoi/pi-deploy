@@ -122,7 +122,7 @@ stateDiagram-v2
    environment of every `docker compose` call that reads this project's
    compose file — this deploy's own service listing, build and start, and
    later `rpi command`, `rpi start`/`stop`/`restart`,
-   `rpi secrets send --apply`, `rpi rm` and `rpi env destroy`/`reset-data` —
+   `rpi secrets push --apply`, `rpi rm` and `rpi env destroy`/`reset-data` —
    so a `${RPI_*}` reference inside the project's own compose file resolves
    there too. (The label-only calls behind `rpi logs`, `rpi status` and
    `rpi stats` never read the compose file at all, so they need nothing.)

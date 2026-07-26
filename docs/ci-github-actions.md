@@ -83,7 +83,7 @@ jobs:
   CLI exits with code 0 and the job stays green (latest wins, §8.1). Red
   statuses are `failed`, `canceled`, and `interrupted`.
 - **Project secrets** are not sent from CI on every deploy: the bundle is
-  already stored on the Pi (`rpi secrets send` is run manually when values change, §10).
+  already stored on the Pi (`rpi secrets push` is run manually when values change, §10).
 - **A stuck build** is killed by the agent's staged timeout (`timeout: build`,
   default 30 minutes), so the job fails with a clear reason instead of the
   runner timeout.

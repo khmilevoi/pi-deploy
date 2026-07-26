@@ -7,7 +7,7 @@ description: Use when creating, editing, validating, reviewing, or troubleshooti
 
 ## Overview
 
-Use this skill for `rpi.toml`, the project-level deployment config read by `rpi deploy`, `rpi deploy --cancel`, `rpi command`, `rpi secrets send`, `rpi secrets ls`, `rpi config show`, and `rpi env destroy`/`reset-data`. Keep config advice aligned with `crates/bin/src/cli/rpitoml.rs` and `README.md`.
+Use this skill for `rpi.toml`, the project-level deployment config read by `rpi deploy`, `rpi deploy --cancel`, `rpi command`, every `rpi secrets` subcommand, `rpi config show`, and `rpi env destroy`/`reset-data`. Keep config advice aligned with `crates/bin/src/cli/rpitoml.rs` and `README.md`.
 
 ## Minimal Shape
 
@@ -77,9 +77,9 @@ port = 3000
 | `healthcheck.path` | no | none | HTTP path; omitted means TCP probe. |
 | `healthcheck.expect` | no | none | `"2xx"`, `"3xx"`, or exact 3-digit code. |
 | `healthcheck.timeout` | no | `"60s"` | Duration string or bare seconds. |
-| `secrets.env` | no | `".env"` | Local env file read by `rpi secrets send`. |
+| `secrets.env` | no | `".env"` | Local env file read by `rpi secrets push`. |
 | `secrets.files` | no | none | Optional list of local secret file paths (certs, keys), forward-slash relative, `..` rejected; recreated verbatim on the Pi on every deploy. |
-| `secrets.file_mode` | no | none | `^0?[0-7]{3}$` (e.g. `"0640"`/`"640"`); owner read required, owner write optional, group/other read optional, nothing else. Overrides both the `0644` default for `secrets.files` and the `0600` default for `.env` at once — a container consuming a bind-mounted secret usually isn't the agent's uid, so the file mode is what decides whether it can read it. Requires an agent `>= 0.26.0` (`secret-modes` capability); the mode travels with the bundle, so it takes effect on the next `rpi secrets send`, not a `rpi deploy` that reuses an already-stored bundle. |
+| `secrets.file_mode` | no | none | `^0?[0-7]{3}$` (e.g. `"0640"`/`"640"`); owner read required, owner write optional, group/other read optional, nothing else. Overrides both the `0644` default for `secrets.files` and the `0600` default for `.env` at once — a container consuming a bind-mounted secret usually isn't the agent's uid, so the file mode is what decides whether it can read it. Requires an agent `>= 0.26.0` (`secret-modes` capability); the mode travels with the bundle, so it takes effect on the next `rpi secrets push`, not a `rpi deploy` that reuses an already-stored bundle. |
 | `secrets.groups` | no | none | Ordered array of secret-group names attached from this project's base namespace, e.g. `["common", "preview"]`. Each name must match `^[a-z][a-z0-9-]*$`, max 40 characters. Applied in declared order at deploy time, then this deploy key's own bundle on top — a later layer replaces an earlier one per variable/file, and `file_mode` comes from the last layer that set one. An overlay's `groups` field replaces the base's list wholesale, same as `secrets.files`; `groups = []` in an overlay detaches every group. A declared group that is missing or empty fails the deploy naming the group and the `rpi secrets push --group <name>` command to fix it. Requires an agent `>= 0.27.0` (`secret-groups` capability). See `rpi-cli`'s secrets section for the `rpi secrets push --group`/`group ls`/`group rm` commands that manage groups, and `docs/architecture/flows/secrets.md` for the full layering and conditional-write rules. |
 | `commands.<name>` | no | none | String (shell-word split, quotes only) or argv array. Name: `[a-z0-9][a-z0-9_-]*`. Registered at deploy, run via `rpi command`. |
 | `timeouts.command` | no | `"600s"` | Budget for one `rpi command` run. |
@@ -202,7 +202,7 @@ Rules:
 ## Environment Overlays
 
 An overlay file `rpi.<env>.toml` next to `rpi.toml` lets `rpi deploy --env <env>`
-(and `rpi command`, `rpi secrets send/ls`, `rpi config show` with the same
+(and `rpi command`, every `rpi secrets` subcommand, `rpi config show` with the same
 `--env`/`--vars` flags) deploy a variant of the project — a shared `test`
 environment, or a per-branch preview — under its own derived key, isolated
 runtime state, and its own secrets bundle:

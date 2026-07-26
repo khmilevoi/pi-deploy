@@ -100,8 +100,8 @@ rpi command create-invite -- --email x@y.com  # `--` separates extra args, appen
 ## Configuration Variables
 
 `--vars KEY=VALUE` (repeatable) supplies user variables to any command that
-reads a configuration: `rpi deploy`, `rpi command`, `rpi secrets send`,
-`rpi secrets ls`, `rpi config show`, and `rpi env destroy`/`reset-data`.
+reads a configuration: `rpi deploy`, `rpi command`, every `rpi secrets`
+subcommand, `rpi config show`, and `rpi env destroy`/`reset-data`.
 
 - **`--vars` does not require `--env`.** It works against the base
   `rpi.toml` alone.
@@ -147,8 +147,8 @@ and deploys anyway, with no `RPI_*` reaching any container.
 `--env <name>` (with an optional repeatable `--vars KEY=VALUE`) deploys or
 operates a variant of the current project defined by an `rpi.<env>.toml`
 overlay next to `rpi.toml` — a shared `test` environment, or a per-branch
-preview. Accepted by `rpi deploy`, `rpi command`, `rpi secrets send`, and
-`rpi secrets ls`; see the `rpi-toml` skill for the overlay file's schema and
+preview. Accepted by `rpi deploy`, `rpi command`, and every `rpi secrets`
+subcommand; see the `rpi-toml` skill for the overlay file's schema and
 merge rules.
 
 ```bash
@@ -263,10 +263,10 @@ rpi secrets group rm shared --force --yes    # --force: delete though a project 
 `.env`) will be written with — `file mode: 0644` when the bundle has none
 configured, or whatever `[secrets].file_mode` resolved to. Setting
 `[secrets].file_mode` in `rpi.toml` requires an agent `>= 0.26.0` (the
-`secret-modes` capability); `rpi secrets send`/`send --apply` refuse with an
+`secret-modes` capability); `rpi secrets push`/`push --apply` refuse with an
 upgrade hint against an older agent instead of silently ignoring the
 setting. The mode travels with the stored bundle, so it only changes on the
-next `rpi secrets send` (or `--apply`) — a `rpi deploy` that reuses an
+next `rpi secrets push` (or `--apply`) — a `rpi deploy` that reuses an
 already-stored bundle keeps whatever mode that bundle carries.
 
 ## Client Profile
@@ -318,7 +318,7 @@ Before `rpi deploy`:
 1. Run from the deployable project's root, not necessarily from this repository root.
 2. Confirm `./rpi.toml` exists and has the intended project name, repo, branch, service, and port.
 3. Confirm the Pi can read `source.repo`; private repos may require a deploy key on the Pi.
-4. If `[secrets]` is configured (env file and/or files) and secrets are required, run `rpi secrets send` before the first deploy.
+4. If `[secrets]` is configured (env file and/or files) and secrets are required, run `rpi secrets push` before the first deploy; if it also declares `[secrets].groups`, each declared group must have been pushed with `rpi secrets push --group <name>` first.
 5. Prefer Compose `expose` for the managed service; avoid fixed host `ports` that conflict with rpi's allocator.
 
 ## Troubleshooting
@@ -335,7 +335,7 @@ For deploy failures:
 
 - `Permission denied (publickey)`: the Pi cannot fetch `source.repo`; add the printed deploy key to the repository.
 - Docker `/home/rpi-agent` errors: ensure the systemd unit sets `HOME=/var/lib/rpi`, `XDG_CONFIG_HOME`, `XDG_CACHE_HOME`, and `WorkingDirectory=/var/lib/rpi`.
-- Compose does not see secrets: run `rpi secrets send`, or `rpi secrets send --apply` for an already running stack.
+- Compose does not see secrets: run `rpi secrets push`, or `rpi secrets push --apply` for an already running stack. With `[secrets].groups` declared, `rpi secrets ls` shows the effective merged set and which layer each entry comes from.
 - Health check fails: verify the app listens on `0.0.0.0`, `[ingress].port` is the container port, and `[healthcheck]` matches the endpoint.
 - Host port conflict: remove fixed host `ports:` from Compose and let rpi write the override.
 

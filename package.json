@@ -1,6 +1,6 @@
 {
   "name": "rpi-deploy",
-  "version": "0.26.1",
+  "version": "0.27.0",
   "description": "Deployment tool for Docker Compose projects on Raspberry Pi. Builds the Rust CLI from source on install.",
   "license": "MIT",
   "repository": {
