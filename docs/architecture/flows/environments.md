@@ -201,11 +201,21 @@ sequenceDiagram
     filter; `--all`, or running outside any project directory, lists every
     environment on the agent instead. Only rows with `env_name` set are ever
     returned.
-13. `rpi env destroy <env> [--vars ...]` and `rpi env reset-data <env>
-    [--vars ...]` both first run the exact same local overlay resolution
-    `rpi deploy` uses to compute the target key — so a typo'd `--vars`
-    fails the same way it would on deploy — then prompt for the key to be
-    typed back as confirmation unless `--yes` is passed.
+13. `rpi env destroy <env> [--vars ...]` / `rpi env destroy --full-key
+    <key>` and the same two forms for `rpi env reset-data` compute the
+    target key one of two ways: the `<env>` form runs the exact same local
+    overlay resolution `rpi deploy --env` uses — so a typo'd `--vars` fails
+    the same way it would on deploy, and the key is whatever the merged
+    `source.branch` derives — while `--full-key <key>` reads no
+    configuration file at all (not `rpi.toml`, not the overlay) and instead
+    validates the string's own shape (`base--env` or `base--env--slug`, each
+    part lowercase `[a-z0-9-]` with no leading/trailing `-`), rejecting
+    anything else with a message pointing at `rpi env ls`. `--full-key` is
+    mutually exclusive with both `<env>` and `--vars`, and exactly one of
+    `<env>`/`--full-key` is required — this is the escape hatch for cleaning
+    up an environment whose overlay was deleted or no longer resolves, since
+    the `<env>` form has no such fallback. Either way, the CLI then prompts
+    for the key to be typed back as confirmation unless `--yes` is passed.
     - `destroy` (`DELETE /v1/environments/{key}`) is idempotent: a missing
       key reports "already absent" rather than 404. A base-project key is
       409. Otherwise it delegates to the same `RemoveProject` teardown a
@@ -221,7 +231,7 @@ sequenceDiagram
       it only tears down the stack's containers and named volumes
       (`compose down -v`) and clears `on_create_done` back to `false` — the
       registry row, secrets, and ingress route all survive — so the very
-      next `rpi deploy --env <env>` re-runs `on_create` against a clean
+      next deploy of that environment re-runs `on_create` against a clean
       database. A missing key is a genuine 404 here (there's nothing to
       reset); a base-project key, or a key with an active deployment, is
       409.
@@ -265,13 +275,16 @@ sequenceDiagram
   to the sanitized `${RPI_ENV_SLUG}`) substituted into `[ingress].hostname`
   is caught post-substitution.
 - `crates/bin/src/cli/envcmds.rs` — `rpi env ls/destroy/reset-data`.
-  `destroy`/`reset-data`'s `resolve_key` reads only `./rpi.toml` (never the
-  overlay file) to get the base name, then derives the key locally from
-  `--env`/`--vars` — so destroying or resetting an environment never
-  requires `rpi.<env>.toml` to still exist or still resolve; `env ls`
-  distinguishes "no `rpi.toml` here" (its friendly `--all` hint) from any
-  other resolution failure, which now propagates instead of being folded
-  into the same message.
+  `destroy`/`reset-data`'s `target_key` picks the key one of two ways: given
+  `<env>`, it calls the same `overlay::resolve` `rpi deploy --env` uses (so
+  it needs `rpi.<env>.toml` to still exist and resolve, exactly like a
+  deploy); given `--full-key <key>` instead, it reads no configuration file
+  at all and validates the key's own `base--env[--slug]` shape
+  (`is_valid_key_part` per segment) — the escape hatch for a project whose
+  overlay was deleted or no longer resolves. `<env>` and `--full-key` are
+  mutually exclusive and one is required. `env ls` distinguishes "no
+  `rpi.toml` here" (its friendly `--all` hint) from any other resolution
+  failure, which propagates instead of being folded into the same message.
 - `crates/bin/src/agent/http.rs` — `create_deployment`'s pre-registry shape
   guards (`is_valid_name`, `is_valid_env_part`, the `--`-rejection for plain
   deploys, the base/env/slug/key-match checks for environment deploys), the

@@ -26,8 +26,6 @@ pub fn validate_env_name(name: &str) -> anyhow::Result<()> {
 
 const MAX_SLUG_LEN: usize = 30;
 
-pub use crate::cli::vars::parse_vars;
-
 pub fn derive_slug(branch: &str) -> anyhow::Result<String> {
     let mut slug = String::new();
     for c in branch.chars() {

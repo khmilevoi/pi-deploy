@@ -226,7 +226,15 @@ enum EnvCmd {
     },
     /// Destroy an environment: stack, volumes, ingress, DNS, secrets, registry
     Destroy {
-        env: String,
+        /// Environment name from rpi.<env>.toml (resolves the overlay)
+        env: Option<String>,
+        /// Full environment key from `rpi env ls`; reads no config file
+        // Named `full_key`/`--full-key`, not `--key`: `ConnectOpts::key` (the
+        // flattened `connect` field below) already owns the literal `--key`
+        // flag (SSH private key path), and clap rejects two arguments with
+        // the same id/long name in one command outright.
+        #[arg(long = "full-key", conflicts_with_all = ["env", "vars"])]
+        full_key: Option<String>,
         #[arg(long = "vars")]
         vars: Vec<String>,
         #[arg(long)]
@@ -236,7 +244,15 @@ enum EnvCmd {
     },
     /// Remove the environment's volumes and re-run on_create on next deploy
     ResetData {
-        env: String,
+        /// Environment name from rpi.<env>.toml (resolves the overlay)
+        env: Option<String>,
+        /// Full environment key from `rpi env ls`; reads no config file
+        // Named `full_key`/`--full-key`, not `--key`: `ConnectOpts::key` (the
+        // flattened `connect` field below) already owns the literal `--key`
+        // flag (SSH private key path), and clap rejects two arguments with
+        // the same id/long name in one command outright.
+        #[arg(long = "full-key", conflicts_with_all = ["env", "vars"])]
+        full_key: Option<String>,
         #[arg(long = "vars")]
         vars: Vec<String>,
         #[arg(long)]
@@ -594,20 +610,22 @@ async fn run() -> anyhow::Result<()> {
             cmd:
                 EnvCmd::Destroy {
                     env,
+                    full_key,
                     vars,
                     yes,
                     connect,
                 },
-        } => cli::envcmds::env_destroy(env, vars, yes, connect).await,
+        } => cli::envcmds::env_destroy(env, full_key, vars, yes, connect).await,
         Cmd::Env {
             cmd:
                 EnvCmd::ResetData {
                     env,
+                    full_key,
                     vars,
                     yes,
                     connect,
                 },
-        } => cli::envcmds::env_reset_data(env, vars, yes, connect).await,
+        } => cli::envcmds::env_reset_data(env, full_key, vars, yes, connect).await,
     }
 }
 

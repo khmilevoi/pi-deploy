@@ -1,26 +1,47 @@
 use crate::cli::config::ConnectOpts;
 use crate::cli::connect::AgentConn;
-use crate::cli::overlay::{derive_key, derive_slug, parse_vars, validate_env_name};
+use crate::cli::overlay;
 use crate::output;
 
-/// Derive the target key for `rpi env destroy`/`rpi env reset-data` without
-/// reading the overlay file: both actions only need the key, and requiring
-/// `rpi.<env>.toml` to still exist (and still resolve cleanly) would make it
-/// impossible to destroy/reset an environment whose overlay was deleted or
-/// is currently broken — exactly the situation a cleanup command must
-/// survive. Only `./rpi.toml` is read (for the base project name).
-fn resolve_key(env: &str, vars: &[String]) -> anyhow::Result<String> {
-    validate_env_name(env)?;
-    let user_vars = parse_vars(vars)?;
-    let base = crate::cli::overlay::resolve(None, &[])?
-        .rpitoml
-        .project
-        .name;
-    let slug = user_vars
-        .get("BRANCH_NAME")
-        .map(|branch| derive_slug(branch))
-        .transpose()?;
-    Ok(derive_key(&base, env, slug.as_deref()))
+/// One part of a derived key (`base`, `env`, or `slug`): lowercase, no `--`,
+/// no leading or trailing `-`. Mirrors the agent's own `is_valid_env_part`.
+fn is_valid_key_part(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with('-')
+        && !s.ends_with('-')
+        && s.chars().all(|c| matches!(c, 'a'..='z' | '0'..='9' | '-'))
+}
+
+/// The environment key `destroy`/`reset-data` should act on.
+///
+/// `--key` names it outright and reads no configuration file at all — not
+/// the overlay, and not `rpi.toml` either. It is the escape hatch for a
+/// project directory that no longer resolves, so depending on any local file
+/// would defeat it. `rpi env ls` prints the exact string to pass.
+///
+/// The `<env>` form resolves the overlay the same way `rpi deploy` does,
+/// because the slug now derives from the merged `source.branch`.
+fn target_key(env: Option<String>, key: Option<String>, vars: &[String]) -> anyhow::Result<String> {
+    match (env, key) {
+        (Some(_), Some(_)) => {
+            anyhow::bail!("--key and <env> are mutually exclusive: pass one or the other")
+        }
+        (None, None) => anyhow::bail!("pass an environment name, or --key <full-key>"),
+        (None, Some(key)) => {
+            let parts: Vec<&str> = key.split("--").collect();
+            let shaped = matches!(parts.len(), 2 | 3) && parts.iter().all(|p| is_valid_key_part(p));
+            if !shaped {
+                anyhow::bail!(
+                    "--key '{key}' is not an environment key (expected base--env or base--env--slug); run `rpi env ls` to see the exact key"
+                );
+            }
+            Ok(key)
+        }
+        (Some(env), None) => {
+            let resolved = overlay::resolve(Some(&env), vars)?;
+            Ok(resolved.rpitoml.project.name)
+        }
+    }
 }
 
 fn confirm_key(action: &str, key: &str, yes: bool) -> anyhow::Result<()> {
@@ -98,12 +119,13 @@ pub async fn env_ls(all: bool, connect: ConnectOpts) -> anyhow::Result<()> {
 }
 
 pub async fn env_destroy(
-    env: String,
+    env: Option<String>,
+    key: Option<String>,
     vars: Vec<String>,
     yes: bool,
     connect: ConnectOpts,
 ) -> anyhow::Result<()> {
-    let key = resolve_key(&env, &vars)?;
+    let key = target_key(env, key, &vars)?;
     confirm_key(
         "DESTROY (stack, volumes, ingress, DNS, secrets, registry) of",
         &key,
@@ -127,12 +149,13 @@ pub async fn env_destroy(
 }
 
 pub async fn env_reset_data(
-    env: String,
+    env: Option<String>,
+    key: Option<String>,
     vars: Vec<String>,
     yes: bool,
     connect: ConnectOpts,
 ) -> anyhow::Result<()> {
-    let key = resolve_key(&env, &vars)?;
+    let key = target_key(env, key, &vars)?;
     confirm_key("REMOVE ALL DATA (volumes) of", &key, yes)?;
     let AgentConn {
         tunnel: _tunnel,
@@ -142,7 +165,63 @@ pub async fn env_reset_data(
     compat.gate(crate::compat::Feature::Environments)?;
     api.reset_environment(&key).await?;
     output::success(format!(
-        "environment '{key}' data removed - the next `rpi deploy --env {env}` re-runs on_create"
+        "environment '{key}' data removed - the next deploy of it re-runs on_create"
     ));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_key_is_accepted_as_is() {
+        assert_eq!(
+            target_key(None, Some("myapp--branch--feature-login".into()), &[]).unwrap(),
+            "myapp--branch--feature-login"
+        );
+        assert_eq!(
+            target_key(None, Some("myapp--test".into()), &[]).unwrap(),
+            "myapp--test"
+        );
+    }
+
+    #[test]
+    fn a_malformed_key_is_rejected_before_any_agent_call() {
+        for bad in [
+            "myapp",                    // no env part at all
+            "myapp--",                  // empty env part
+            "--test",                   // empty base
+            "myapp--Test",              // uppercase
+            "myapp--test--slug--extra", // too many parts
+            "myapp--test--",            // empty slug
+            "myapp---test",             // leading '-' in the env part
+        ] {
+            let err = target_key(None, Some(bad.into()), &[])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("--key"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn key_and_env_are_mutually_exclusive_and_one_is_required() {
+        let err = target_key(Some("test".into()), Some("myapp--test".into()), &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--key"), "got: {err}");
+
+        let err = target_key(None, None, &[]).unwrap_err().to_string();
+        assert!(err.contains("--key"), "got: {err}");
+    }
+
+    #[test]
+    fn key_path_ignores_vars_entirely() {
+        // --key exists for a directory that no longer resolves, so it must
+        // not consult --vars, rpi.toml, or the overlay.
+        assert_eq!(
+            target_key(None, Some("myapp--test".into()), &["TYPO=1".into()]).unwrap(),
+            "myapp--test"
+        );
+    }
 }
