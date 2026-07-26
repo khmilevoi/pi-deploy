@@ -12,6 +12,18 @@ fn is_valid_key_part(s: &str) -> bool {
         && s.chars().all(|c| matches!(c, 'a'..='z' | '0'..='9' | '-'))
 }
 
+/// Appends the two escape hatches to a `<env>` form that failed to resolve
+/// locally. Mirrors `base_filter`'s hint for `rpi env ls`: the resolution
+/// failure keeps its own message (a deleted overlay, a `${NAME}` this
+/// invocation was not given a `--vars` for), and the reader is told how to
+/// reach the environment anyway — otherwise a project directory that no
+/// longer resolves is a dead end, and `--full-key` exists precisely for it.
+fn with_escape_hatches(e: anyhow::Error) -> anyhow::Error {
+    anyhow::anyhow!(
+        "{e}\n  hint: pass the variables it needs with `--vars KEY=VALUE`, or name the environment outright with `--full-key <key>` (from `rpi env ls`), which reads no configuration file"
+    )
+}
+
 /// The environment key `destroy`/`reset-data` should act on.
 ///
 /// `--full-key` names it outright and reads no configuration file at all —
@@ -38,7 +50,7 @@ fn target_key(env: Option<String>, key: Option<String>, vars: &[String]) -> anyh
             Ok(key)
         }
         (Some(env), None) => {
-            let resolved = overlay::resolve(Some(&env), vars)?;
+            let resolved = overlay::resolve(Some(&env), vars).map_err(with_escape_hatches)?;
             Ok(resolved.rpitoml.project.name)
         }
     }
@@ -283,6 +295,21 @@ port = 3000
         assert!(err.contains("BRANCH_NAME"), "got: {err}");
         assert!(err.contains("--vars"), "got: {err}");
         assert!(err.contains("rpi env ls --all"), "got: {err}");
+    }
+
+    #[test]
+    fn an_unresolvable_env_form_names_both_escape_hatches() {
+        // `rpi env destroy branch` in a directory whose rpi.branch.toml was
+        // deleted: the key cannot be derived any more, and the message has to
+        // point at --full-key or the user is stuck with an environment they
+        // cannot tear down.
+        let err = with_escape_hatches(anyhow::anyhow!(
+            "cannot read rpi.branch.toml: No such file or directory (os error 2)"
+        ))
+        .to_string();
+        assert!(err.contains("rpi.branch.toml"), "got: {err}");
+        assert!(err.contains("--vars"), "got: {err}");
+        assert!(err.contains("--full-key"), "got: {err}");
     }
 
     #[test]

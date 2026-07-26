@@ -7,9 +7,11 @@ set -euo pipefail
 # a --vars key nothing references (with and without --env), an
 # on_create command absent from the merged [commands], an overlay silently
 # inheriting the base [ingress].hostname (production-route hijack), and a
-# base rpi.toml whose project name contains the reserved '--'. Agent-side:
-# `rpi env reset-data` of a nonexistent environment is a genuine error
-# (unlike destroy, which is idempotent), and a deploy whose on_create exits
+# base rpi.toml whose project name contains the reserved '--', and a
+# `rpi env reset-data <env>` whose overlay is gone (the key is no longer
+# derivable, so the error has to name `--full-key`). Agent-side:
+# `rpi env reset-data --full-key` of a nonexistent environment is a genuine
+# error (unlike destroy, which is idempotent), and a deploy whose on_create exits
 # nonzero fails at the on_create stage while keeping on_create_done false —
 # the registered key survives and the next deploy retries the command.
 
@@ -81,10 +83,20 @@ assert_log double-dash-name.log "must not contain '--' (reserved for environment
 
 # --- Agent-side failures ---
 
+# The `<env>` form derives the key from the merged overlay, so a missing
+# rpi.<env>.toml fails locally, before any agent call -- and the message must
+# name `--full-key`, or an environment whose overlay was deleted cannot be
+# torn down at all.
+expect_fail reset-nosuch.log rpi env reset-data nosuch --yes "${CONNECT[@]}"
+assert_log reset-nosuch.log 'cannot read rpi.nosuch.toml'
+assert_log reset-nosuch.log '--full-key'
+
 # reset-data of an environment that was never deployed: a genuine error, in
 # contrast to `env destroy`, which is idempotent (covered by env-overlay).
-expect_fail reset-nosuch.log rpi env reset-data nosuch --yes "${CONNECT[@]}"
-assert_log reset-nosuch.log 'environment e2e-fixture--nosuch'
+# `--full-key` reads no configuration file, so it is what reaches the agent
+# with a key no overlay backs.
+expect_fail reset-nokey.log rpi env reset-data --full-key e2e-fixture--nosuch --yes "${CONNECT[@]}"
+assert_log reset-nokey.log 'environment e2e-fixture--nosuch'
 
 # on_create exits 1: the deploy passes health, then fails at the on_create
 # stage; the key stays registered with on_create_done still false.

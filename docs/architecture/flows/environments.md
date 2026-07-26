@@ -300,7 +300,9 @@ sequenceDiagram
     overlay resolution `rpi deploy --env` uses — so a typo'd `--vars` fails
     the same way it would on deploy, and, when the configuration references
     `${env.slug}`, the slug part of the key is whatever the merged
-    `source.branch` derives — while `--full-key <key>` reads no
+    `source.branch` derives, and a resolution failure names both escape
+    hatches (pass the variables, or use `--full-key`) so a directory that no
+    longer resolves is not a dead end — while `--full-key <key>` reads no
     configuration file at all (not `rpi.toml`, not the overlay) and instead
     validates the string's own shape (`base--env` or `base--env--slug`, each
     part lowercase `[a-z0-9-]` with no leading/trailing `-`), rejecting
