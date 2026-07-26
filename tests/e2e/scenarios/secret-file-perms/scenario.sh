@@ -28,4 +28,14 @@ assert_log read.log 'top-secret-value'
 run_capture ls.log rpi secrets ls "${CONNECT[@]}"
 assert_log ls.log 'file mode: 0644'
 
+# Host-level confirmation, in the style of restart-policy/rm-root-owned: the
+# materialized secret file itself must actually be 0644, not just what the
+# CLI and deploy log claim -- otherwise this scenario's pass could hide a
+# regression in what rpi writes to disk while the assertions above still
+# happen to read the right log lines.
+perm=$("${SSH[@]}" stat -c '%a' /var/lib/rpi/workdirs/e2e-fixture/app_secret) || \
+  fail 'materialized secret file is missing on the target'
+[[ $perm == '644' ]] || \
+  fail "materialized secret file mode is '$perm', expected '644'"
+
 echo 'rpi e2e: PASS'
