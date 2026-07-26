@@ -193,7 +193,11 @@ impl DeployProject {
                 deployment.log_tail = tail.tail();
                 if let Err(err) = self
                     .projects
-                    .mark_deploy_success(&config.name, finished_at, None)
+                    .mark_deploy_success(
+                        &config.name,
+                        finished_at,
+                        deployment.commit_sha.as_deref(),
+                    )
                     .await
                 {
                     log.line(&format!(
@@ -275,6 +279,29 @@ impl DeployProject {
             ));
         }
 
+        // The RPI_* map is derived from registry state plus the sha this
+        // deploy just fetched, so the CLI never has to send it.
+        let env = pi_domain::runtimevars::rpi_vars(&project, Some(&fetched.commit_sha));
+
+        // Services are discovered before the override is written, from the
+        // compose file plus the repository's own override only. A failure
+        // here fails the deploy: a silently missing environment variable is a
+        // far worse outcome than an explicit error, and a compose file that
+        // cannot be parsed would fail `build` moments later anyway.
+        let discovery = ComposeStack {
+            project_name: config.name.clone(),
+            workdir: fetched.workdir.clone(),
+            compose_file: fetched.workdir.join(&config.compose_path),
+            override_file: self.overrides.path(&config.name),
+            env: env.clone(),
+        };
+        let services = self.runtime.services(&discovery).await?;
+        log.line(&format!(
+            "runtime env: {} vars over {} service(s)",
+            env.len(),
+            services.len()
+        ));
+
         let override_file = self
             .overrides
             .write(
@@ -283,8 +310,8 @@ impl DeployProject {
                 config.expose.bind_addr(),
                 project.host_port,
                 config.container_port,
-                &[],
-                &Default::default(),
+                &services,
+                &env,
             )
             .await?;
 
@@ -293,7 +320,7 @@ impl DeployProject {
             workdir: fetched.workdir.clone(),
             compose_file: fetched.workdir.join(&config.compose_path),
             override_file,
-            env: Default::default(),
+            env,
         };
         {
             let _build_slot = self
@@ -598,6 +625,12 @@ mod tests {
         });
         // empty bundle -> .env must NOT be written
         m.secrets_writer.expect_write().times(0);
+        m.runtime
+            .expect_services()
+            .returning(|_| Ok(vec!["web".into()]));
+        m.overrides
+            .expect_path()
+            .returning(|p| PathBuf::from("/ov").join(p));
         let stage_order = Arc::clone(&order);
         m.overrides
             .expect_write()
@@ -796,6 +829,12 @@ mod tests {
             .expect_load()
             .returning(|_| Ok(SecretsBundle::default()));
         m.secrets_writer.expect_write().times(0);
+        m.runtime
+            .expect_services()
+            .returning(|_| Ok(vec!["web".into()]));
+        m.overrides
+            .expect_path()
+            .returning(|p| PathBuf::from("/ov").join(p));
         m.overrides
             .expect_write()
             .withf(|p, s, bind, hp, cp, _, _| {
@@ -1010,6 +1049,12 @@ mod tests {
             .expect_load()
             .returning(|_| Ok(SecretsBundle::default()));
         m.secrets_writer.expect_write().times(0);
+        m.runtime
+            .expect_services()
+            .returning(|_| Ok(vec!["web".into()]));
+        m.overrides
+            .expect_path()
+            .returning(|p| PathBuf::from("/ov").join(p));
         m.overrides
             .expect_write()
             .returning(|_, _, _, _, _, _, _| Ok(PathBuf::from("/ov.yml")));
@@ -1076,9 +1121,48 @@ mod tests {
                 commit_sha: SHA.into(),
             })
         });
+        m.runtime
+            .expect_services()
+            .returning(|_| Ok(vec!["web".into()]));
+        // The discovery stack is built before `write` returns a path, so the
+        // deploy asks the store where the override lives.
+        m.overrides
+            .expect_path()
+            .returning(|p| PathBuf::from("/ov").join(p));
         m.overrides
             .expect_write()
             .returning(|_, _, _, _, _, _, _| Ok(PathBuf::from("/ov.yml")));
+        m.history.expect_mark_running().returning(|_, _| Ok(()));
+        m.history
+            .expect_record_finished()
+            .returning(|_, _, _, _, _| Ok(()));
+    }
+
+    /// `ok_pre_stages` minus the override expectation, for tests that assert
+    /// the override is never written.
+    fn ok_pre_stages_without_override(m: &mut Mocks) {
+        m.projects.expect_upsert().returning(|c| {
+            Ok(Project {
+                config: c.clone(),
+                host_port: 8000,
+                created_at: 1,
+                on_create_done: false,
+                last_success_at: None,
+                last_commit_sha: None,
+            })
+        });
+        m.source.expect_fetch().returning(|_, _, _| {
+            Ok(FetchedSource {
+                workdir: PathBuf::from("/wd"),
+                commit_sha: SHA.into(),
+            })
+        });
+        // The discovery stack is built before `write` returns a path, so the
+        // deploy asks the store where the override lives even when the deploy
+        // never gets far enough to write it.
+        m.overrides
+            .expect_path()
+            .returning(|p| PathBuf::from("/ov").join(p));
         m.history.expect_mark_running().returning(|_, _| Ok(()));
         m.history
             .expect_record_finished()
@@ -1288,6 +1372,12 @@ mod tests {
         m.secrets
             .expect_load()
             .returning(|_| Ok(SecretsBundle::default()));
+        m.runtime
+            .expect_services()
+            .returning(|_| Ok(vec!["web".into()]));
+        m.overrides
+            .expect_path()
+            .returning(|p| PathBuf::from("/o").join(p));
         m.overrides
             .expect_write()
             .returning(|_, _, _, _, _, _, _| Ok(PathBuf::from("/o.yml")));
@@ -1554,6 +1644,11 @@ mod tests {
             .expect_load()
             .returning(|_| Ok(SecretsBundle::default()));
         m.secrets_writer.expect_write().times(0);
+        // CountingRuntime resolves `services` itself; only the override path
+        // still comes from a mock here.
+        m.overrides
+            .expect_path()
+            .returning(|p| PathBuf::from("/ov").join(p));
         m.overrides
             .expect_write()
             .returning(|p, _, _, _, _, _, _| Ok(PathBuf::from("/ov").join(p)));
@@ -1852,6 +1947,12 @@ mod tests {
             .expect_load()
             .returning(|_| Ok(SecretsBundle::default()));
         m.secrets_writer.expect_write().times(0);
+        m.runtime
+            .expect_services()
+            .returning(|_| Ok(vec!["web".into()]));
+        m.overrides
+            .expect_path()
+            .returning(|p| PathBuf::from("/ov").join(p));
         m.overrides
             .expect_write()
             .returning(|_, _, _, _, _, _, _| Ok(PathBuf::from("/ov.yml")));
@@ -1918,6 +2019,12 @@ mod tests {
             .expect_load()
             .returning(|_| Ok(SecretsBundle::default()));
         m.secrets_writer.expect_write().times(0);
+        m.runtime
+            .expect_services()
+            .returning(|_| Ok(vec!["web".into()]));
+        m.overrides
+            .expect_path()
+            .returning(|p| PathBuf::from("/ov").join(p));
         m.overrides
             .expect_write()
             .returning(|_, _, _, _, _, _, _| Ok(PathBuf::from("/ov.yml")));
@@ -1972,6 +2079,12 @@ mod tests {
             .expect_load()
             .returning(|_| Ok(SecretsBundle::default()));
         m.secrets_writer.expect_write().times(0);
+        m.runtime
+            .expect_services()
+            .returning(|_| Ok(vec!["web".into()]));
+        m.overrides
+            .expect_path()
+            .returning(|p| PathBuf::from("/ov").join(p));
         m.overrides
             .expect_write()
             .returning(|_, _, _, _, _, _, _| Ok(PathBuf::from("/ov.yml")));
@@ -2047,5 +2160,165 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.status, DeploymentStatus::Success);
+    }
+
+    #[tokio::test]
+    async fn override_receives_every_discovered_service_and_the_runtime_env() {
+        let mut m = mocks();
+        m.projects.expect_upsert().returning(|c| {
+            Ok(Project {
+                config: c.clone(),
+                host_port: 8000,
+                created_at: 1,
+                on_create_done: false,
+                last_success_at: None,
+                last_commit_sha: None,
+            })
+        });
+        m.source.expect_fetch().returning(|_, _, _| {
+            Ok(FetchedSource {
+                workdir: PathBuf::from("/wd"),
+                commit_sha: SHA.into(),
+            })
+        });
+        m.secrets
+            .expect_load()
+            .returning(|_| Ok(SecretsBundle::default()));
+        m.overrides
+            .expect_path()
+            .returning(|p| PathBuf::from("/ov").join(p));
+        m.runtime
+            .expect_services()
+            .times(1)
+            .returning(|_| Ok(vec!["web".into(), "worker".into()]));
+        m.overrides
+            .expect_write()
+            .withf(|_, _, _, _, _, services, env| {
+                services == ["web".to_string(), "worker".to_string()]
+                    && env["RPI_PROJECT"] == "rateme"
+                    && env["RPI_BRANCH_NAME"] == "main"
+                    && env["RPI_HOST_PORT"] == "8000"
+                    && env["RPI_COMMIT_SHA"] == SHA
+                    && env["RPI_HOSTNAME"] == "rateme.isskelo.com"
+            })
+            .times(1)
+            .returning(|_, _, _, _, _, _, _| Ok(PathBuf::from("/ov.yml")));
+        m.runtime
+            .expect_build()
+            .withf(|stack, _| stack.env["RPI_COMMIT_SHA"] == SHA)
+            .returning(|_, _| Ok(()));
+        m.runtime
+            .expect_up()
+            .withf(|stack, _| stack.env["RPI_PROJECT"] == "rateme")
+            .returning(|_, _| Ok(()));
+        m.runtime.expect_ps().returning(|_| Ok(vec![]));
+        m.health.expect_check().returning(|_, _, _| Ok(()));
+        m.ingress
+            .expect_upsert()
+            .returning(|_, _, _| Ok(IngressOutcome::Applied));
+        m.history.expect_mark_running().returning(|_, _| Ok(()));
+        m.history
+            .expect_record_finished()
+            .returning(|_, _, _, _, _| Ok(()));
+
+        let result = build(m)
+            .execute(
+                "dep-env-vars".into(),
+                sample_config(),
+                DeployRef::Branch("main".into()),
+                CollectSink::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.status, DeploymentStatus::Success);
+    }
+
+    #[tokio::test]
+    async fn service_discovery_failure_fails_the_deploy_before_build() {
+        let mut m = mocks();
+        ok_pre_stages_without_override(&mut m);
+        m.secrets
+            .expect_load()
+            .returning(|_| Ok(SecretsBundle::default()));
+        m.runtime
+            .expect_services()
+            .returning(|_| Err(DomainError::Runtime("compose config: no such file".into())));
+        m.overrides.expect_write().times(0);
+        m.runtime.expect_build().times(0);
+        m.runtime.expect_up().times(0);
+
+        let err = build(m)
+            .execute(
+                "dep-svc".into(),
+                sample_config(),
+                DeployRef::Branch("main".into()),
+                CollectSink::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DomainError::Runtime(_)), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn successful_deploy_records_the_commit_sha_on_the_project() {
+        let mut m = mocks();
+        m.projects.checkpoint();
+        m.projects.expect_upsert().returning(|c| {
+            Ok(Project {
+                config: c.clone(),
+                host_port: 8000,
+                created_at: 1,
+                on_create_done: false,
+                last_success_at: None,
+                last_commit_sha: None,
+            })
+        });
+        m.projects
+            .expect_mark_deploy_success()
+            .withf(|name, _, sha| name == "rateme" && *sha == Some(SHA))
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+        m.source.expect_fetch().returning(|_, _, _| {
+            Ok(FetchedSource {
+                workdir: PathBuf::from("/wd"),
+                commit_sha: SHA.into(),
+            })
+        });
+        m.secrets
+            .expect_load()
+            .returning(|_| Ok(SecretsBundle::default()));
+        m.overrides
+            .expect_path()
+            .returning(|p| PathBuf::from("/ov").join(p));
+        m.runtime
+            .expect_services()
+            .returning(|_| Ok(vec!["web".into()]));
+        m.overrides
+            .expect_write()
+            .returning(|_, _, _, _, _, _, _| Ok(PathBuf::from("/ov.yml")));
+        m.runtime.expect_build().returning(|_, _| Ok(()));
+        m.runtime.expect_up().returning(|_, _| Ok(()));
+        m.runtime.expect_ps().returning(|_| Ok(vec![]));
+        m.health.expect_check().returning(|_, _, _| Ok(()));
+        m.ingress
+            .expect_upsert()
+            .returning(|_, _, _| Ok(IngressOutcome::Applied));
+        m.history.expect_mark_running().returning(|_, _| Ok(()));
+        m.history
+            .expect_record_finished()
+            .returning(|_, _, _, _, _| Ok(()));
+
+        build(m)
+            .execute(
+                "dep-sha".into(),
+                sample_config(),
+                DeployRef::Branch("main".into()),
+                CollectSink::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
     }
 }

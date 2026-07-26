@@ -1041,6 +1041,10 @@ mod tests {
         let mut runtime = MockContainerRuntime::new();
         runtime.expect_build().returning(|_, _| Ok(()));
         runtime.expect_up().returning(|_, _| Ok(()));
+        // The deploy lists the stack's services before writing the override.
+        runtime
+            .expect_services()
+            .returning(|_| Ok(vec!["web".into()]));
         runtime.expect_prune_images().returning(|_| Ok(()));
         runtime.expect_prune_builder().returning(|_| Ok(()));
         runtime.expect_ps().returning(|_| {
