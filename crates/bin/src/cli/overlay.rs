@@ -4,6 +4,7 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 
 use crate::cli::rpitoml::{CommandValue, RpiToml};
+use crate::cli::vars::{self, VarRef, VarSet};
 
 pub const RESERVED_ENV_NAMES: &[&str] = &["show", "ls", "destroy", "reset-data"];
 
@@ -25,38 +26,6 @@ pub fn validate_env_name(name: &str) -> anyhow::Result<()> {
 
 const MAX_SLUG_LEN: usize = 30;
 
-fn is_valid_var_name(s: &str) -> bool {
-    let mut chars = s.chars();
-    matches!(chars.next(), Some('A'..='Z'))
-        && chars.all(|c| matches!(c, 'A'..='Z' | '0'..='9' | '_'))
-}
-
-pub fn parse_vars(pairs: &[String]) -> anyhow::Result<BTreeMap<String, String>> {
-    let mut vars = BTreeMap::new();
-    for pair in pairs {
-        let Some((key, value)) = pair.split_once('=') else {
-            anyhow::bail!("--vars expects KEY=VALUE, got '{pair}'");
-        };
-        if !is_valid_var_name(key) {
-            anyhow::bail!("--vars: variable name '{key}' must match ^[A-Z][A-Z0-9_]*$");
-        }
-        if key.starts_with("RPI_") {
-            anyhow::bail!(
-                "--vars: the RPI_ prefix is reserved for rpi-provided variables ('{key}')"
-            );
-        }
-        if key != "BRANCH_NAME" {
-            anyhow::bail!(
-                "--vars: unknown variable '{key}' (this version supports only BRANCH_NAME)"
-            );
-        }
-        if vars.insert(key.to_string(), value.to_string()).is_some() {
-            anyhow::bail!("--vars: duplicate variable '{key}'");
-        }
-    }
-    Ok(vars)
-}
-
 pub fn derive_slug(branch: &str) -> anyhow::Result<String> {
     let mut slug = String::new();
     for c in branch.chars() {
@@ -71,7 +40,7 @@ pub fn derive_slug(branch: &str) -> anyhow::Result<String> {
     let slug = slug.trim_end_matches('-').to_string();
     if slug.is_empty() {
         anyhow::bail!(
-            "cannot derive RPI_ENV_SLUG from BRANCH_NAME '{branch}' (no [a-z0-9] characters)"
+            "cannot derive ${{env.slug}} from branch '{branch}' (no [a-z0-9] characters)"
         );
     }
     Ok(slug)
@@ -159,8 +128,17 @@ pub struct EnvironmentSection {
 
 impl RpiTomlOverlay {
     pub fn parse(text: &str, file: &str) -> anyhow::Result<RpiTomlOverlay> {
-        let parsed: RpiTomlOverlay =
+        let value: toml::Value =
             toml::from_str(text).map_err(|e| anyhow::anyhow!("{file}: {e}"))?;
+        RpiTomlOverlay::from_value(value, file)
+    }
+
+    /// Same checks as `parse`, but starting from an already-parsed (and, in
+    /// the resolver's case, already-substituted) document.
+    pub fn from_value(value: toml::Value, file: &str) -> anyhow::Result<RpiTomlOverlay> {
+        let parsed: RpiTomlOverlay = value
+            .try_into()
+            .map_err(|e| anyhow::anyhow!("{file}: {e}"))?;
         if parsed.schema.is_some() {
             anyhow::bail!("{file}: `schema` is not allowed in an overlay (set it in rpi.toml)");
         }
@@ -178,144 +156,100 @@ impl RpiTomlOverlay {
     }
 }
 
-/// Substitute ${VAR} in one allowed field. Marks `used` when a reference was found.
-fn substitute(
-    field: &str,
-    value: &str,
-    vars: &BTreeMap<String, String>,
-    used: &mut bool,
-) -> anyhow::Result<String> {
-    let mut out = String::new();
-    let mut rest = value;
-    while let Some(start) = rest.find("${") {
-        out.push_str(&rest[..start]);
-        let after = &rest[start + 2..];
-        let Some(end) = after.find('}') else {
-            anyhow::bail!("{field}: unclosed ${{...}} in '{value}'");
-        };
-        let name = &after[..end];
-        *used = true;
-        let Some(v) = vars.get(name) else {
-            anyhow::bail!(
-                "{field}: unknown variable '{name}' (available: {})",
-                vars.keys().cloned().collect::<Vec<_>>().join(", ")
-            );
-        };
-        out.push_str(v);
-        rest = &after[end + 1..];
-    }
-    out.push_str(rest);
-    Ok(out)
-}
+/// Path of the one field resolved in phase 1. `env.slug` derives from it, so
+/// it cannot itself see the slug — that is the circular reference guarded
+/// below.
+const BRANCH_PATH: &str = "source.branch";
 
-/// Error when a forbidden field contains a ${...} reference.
-fn forbid(field: &str, value: Option<&str>) -> anyhow::Result<()> {
-    if value.is_some_and(|v| v.contains("${")) {
-        anyhow::bail!(
-            "{field}: ${{...}} interpolation is only allowed in source.branch and ingress.hostname"
-        );
-    }
-    Ok(())
-}
-
-fn command_strings(value: &CommandValue) -> Vec<&str> {
-    use crate::cli::rpitoml::CommandRun;
+/// Walks every string leaf of a TOML document, handing each one its dotted
+/// path (`ingress.hostname`, `commands.seed`, `secrets.files.0`) so errors
+/// and warnings can name the field the user actually wrote.
+fn walk_strings(
+    value: &mut toml::Value,
+    path: &mut Vec<String>,
+    f: &mut impl FnMut(&str, &mut String) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
     match value {
-        CommandValue::Line(line) => vec![line.as_str()],
-        CommandValue::Argv(items) => items.iter().map(String::as_str).collect(),
-        CommandValue::Table { run, service } => {
-            let mut out = match run {
-                CommandRun::Line(line) => vec![line.as_str()],
-                CommandRun::Argv(items) => items.iter().map(String::as_str).collect(),
-            };
-            if let Some(s) = service {
-                out.push(s.as_str());
+        toml::Value::String(s) => f(&path.join("."), s),
+        toml::Value::Table(table) => {
+            for (key, child) in table.iter_mut() {
+                path.push(key.clone());
+                walk_strings(child, path, f)?;
+                path.pop();
             }
-            out
+            Ok(())
         }
+        toml::Value::Array(items) => {
+            for (i, child) in items.iter_mut().enumerate() {
+                path.push(i.to_string());
+                walk_strings(child, path, f)?;
+                path.pop();
+            }
+            Ok(())
+        }
+        _ => Ok(()),
     }
 }
 
-pub fn interpolate(
-    overlay: &mut RpiTomlOverlay,
-    user_vars: &BTreeMap<String, String>,
-) -> anyhow::Result<bool> {
-    // Forbid ${...} everywhere except the two allowed fields.
-    if let Some(s) = &overlay.source {
-        forbid("source.repo", s.repo.as_deref())?;
-    }
-    if let Some(b) = &overlay.build {
-        forbid("build.compose", b.compose.as_deref())?;
-    }
-    if let Some(i) = &overlay.ingress {
-        forbid("ingress.service", i.service.as_deref())?;
-        forbid("ingress.expose", i.expose.as_deref())?;
-    }
-    if let Some(t) = &overlay.timeouts {
-        for (f, v) in [
-            ("timeouts.fetch", &t.fetch),
-            ("timeouts.build", &t.build),
-            ("timeouts.up", &t.up),
-            ("timeouts.command", &t.command),
-        ] {
-            forbid(f, v.as_deref())?;
+/// Every reference in the document, paired with the path it was found at.
+fn collect_refs(value: &mut toml::Value) -> anyhow::Result<Vec<(String, VarRef)>> {
+    let mut found = Vec::new();
+    walk_strings(value, &mut Vec::new(), &mut |path, s| {
+        for r in vars::refs(path, s)? {
+            found.push((path.to_string(), r));
         }
-    }
-    if let Some(h) = &overlay.healthcheck {
-        for (f, v) in [
-            ("healthcheck.path", &h.path),
-            ("healthcheck.expect", &h.expect),
-            ("healthcheck.timeout", &h.timeout),
-        ] {
-            forbid(f, v.as_deref())?;
-        }
-    }
-    if let Some(s) = &overlay.secrets {
-        forbid("secrets.env", s.env.as_deref())?;
-        for f in s.files.iter().flatten() {
-            forbid("secrets.files", Some(f))?;
-        }
-    }
-    for (name, value) in overlay.commands.iter().flatten() {
-        for s in command_strings(value) {
-            forbid(&format!("commands.{name}"), Some(s))?;
-        }
-    }
-    if let Some(e) = &overlay.environment {
-        forbid("environment.ttl", e.ttl.as_deref())?;
-        forbid("environment.on_create", e.on_create.as_deref())?;
-    }
+        Ok(())
+    })?;
+    Ok(found)
+}
 
-    // Check if RPI_ENV_SLUG is actually referenced before deriving it.
-    let needs_slug = [
-        overlay.source.as_ref().and_then(|s| s.branch.as_deref()),
-        overlay.ingress.as_ref().and_then(|i| i.hostname.as_deref()),
-    ]
-    .into_iter()
-    .flatten()
-    .any(|v| v.contains("${RPI_ENV_SLUG}"));
-    let mut vars = user_vars.clone();
-    if needs_slug {
-        let Some(branch) = user_vars.get("BRANCH_NAME") else {
-            anyhow::bail!(
-                "${{RPI_ENV_SLUG}} requires --vars BRANCH_NAME=<branch> (the slug is derived from it)"
-            );
+/// Substitutes into the fields selected by `want`, leaving the rest alone.
+fn substitute_where(
+    value: &mut toml::Value,
+    set: &VarSet,
+    want: impl Fn(&str) -> bool,
+) -> anyhow::Result<()> {
+    walk_strings(value, &mut Vec::new(), &mut |path, s| {
+        if want(path) {
+            *s = vars::substitute(path, s, set)?;
+        }
+        Ok(())
+    })
+}
+
+/// Reads a string at a dotted path without disturbing the tree.
+fn string_at(value: &toml::Value, path: &str) -> Option<String> {
+    let mut current = value;
+    for part in path.split('.') {
+        current = current.get(part)?;
+    }
+    current.as_str().map(str::to_string)
+}
+
+/// Computes the `${git.*}` inputs the documents actually reference. Lazy on
+/// purpose: `rpi config show` must keep working outside a git repository for
+/// a configuration that never asks for one.
+fn git_inputs(refs: &[(String, VarRef)]) -> anyhow::Result<BTreeMap<String, String>> {
+    let dir = std::path::Path::new(".");
+    let mut out = BTreeMap::new();
+    for (_, r) in refs {
+        let VarRef::Input(ns, field) = r else {
+            continue;
         };
-        vars.insert("RPI_ENV_SLUG".to_string(), derive_slug(branch)?);
-    }
-
-    let mut used = false;
-    if let Some(s) = &mut overlay.source {
-        if let Some(branch) = &s.branch {
-            s.branch = Some(substitute("source.branch", branch, &vars, &mut used)?);
+        if ns != "git" || out.contains_key(&r.name()) {
+            continue;
         }
+        let value = match field.as_str() {
+            "branch" => crate::cli::gitctx::branch(dir)?,
+            "sha" => crate::cli::gitctx::sha(dir)?,
+            "short_sha" => crate::cli::gitctx::short_sha(dir)?,
+            other => anyhow::bail!(
+                "unknown variable 'git.{other}' (available: git.branch, git.sha, git.short_sha)"
+            ),
+        };
+        out.insert(r.name(), value);
     }
-    if let Some(i) = &mut overlay.ingress {
-        if let Some(hostname) = &i.hostname {
-            i.hostname = Some(substitute("ingress.hostname", hostname, &vars, &mut used)?);
-        }
-    }
-    Ok(used)
+    Ok(out)
 }
 
 /// `""` resets an optional field to `None`; any other value replaces it.
@@ -464,40 +398,155 @@ fn available_overlays_hint() -> String {
     }
 }
 
-/// Same as `resolve`, but from explicit texts — unit-testable without
-/// touching the filesystem.
-pub fn resolve_from(
+/// Same as `resolve`, but from explicit texts and with a caller-supplied
+/// warning sink — unit-testable without touching the filesystem, and with
+/// warnings captured instead of printed.
+///
+/// Resolution runs in two phases over the raw `toml::Value` trees of both
+/// files, before either is deserialized: phase 1 resolves `source.branch`
+/// alone (because `env.slug` is derived from the merged branch), phase 2
+/// resolves everything else. Substituting before deserialization is what
+/// lets every string field carry a reference and still be validated by the
+/// normal typed checks afterwards.
+pub fn resolve_with(
     base_text: &str,
     overlay: Option<(&str, &str)>,
-    vars: &[String],
+    vars_arg: &[String],
+    warn: &mut dyn FnMut(&str),
 ) -> anyhow::Result<Resolved> {
-    let mut base = RpiToml::parse(base_text)?;
-    let Some((env_name, overlay_text)) = overlay else {
-        if !vars.is_empty() {
-            anyhow::bail!("--vars requires --env (variables are only used in overlays)");
+    let user = vars::parse_vars(vars_arg)?;
+    let mut base_v: toml::Value =
+        toml::from_str(base_text).map_err(|e| anyhow::anyhow!("rpi.toml: {e}"))?;
+
+    // The project key must stay static: it drives base--env[--slug]
+    // derivation and the production-key-hijack check, neither of which is
+    // verifiable against a computed name.
+    if let Some(name) = string_at(&base_v, "project.name") {
+        if !vars::refs("[project].name", &name)?.is_empty() {
+            anyhow::bail!(
+                "[project].name: ${{...}} is not allowed (the project key must be static)"
+            );
         }
+    }
+
+    let env_name = overlay.map(|(name, _)| name);
+    if let Some(name) = env_name {
+        validate_env_name(name)?;
+    }
+    let file = env_name
+        .map(|n| format!("rpi.{n}.toml"))
+        .unwrap_or_default();
+    let mut overlay_v = match overlay {
+        None => None,
+        Some((_, text)) => {
+            Some(toml::from_str::<toml::Value>(text).map_err(|e| anyhow::anyhow!("{file}: {e}"))?)
+        }
+    };
+
+    // One reference sweep over both documents feeds every decision below:
+    // which git inputs to compute, whether the slug is wanted, and which
+    // --vars keys went unused.
+    let mut all_refs = collect_refs(&mut base_v)?;
+    let has_branch_ref =
+        |refs: &[(String, VarRef)]| refs.iter().any(|(path, _)| path == BRANCH_PATH);
+    // Whether the document that *wins* `source.branch` computes it, which is
+    // what the no-slug key warning below turns on. An overlay branch replaces
+    // the base one outright, so a base `${git.branch}` pinned to a literal by
+    // the overlay is a static branch, not a computed one.
+    let mut branch_is_computed = has_branch_ref(&all_refs);
+    if let Some(o) = &mut overlay_v {
+        let refs = collect_refs(o)?;
+        if string_at(o, BRANCH_PATH).is_some() {
+            branch_is_computed = has_branch_ref(&refs);
+        }
+        all_refs.extend(refs);
+    }
+
+    for key in user.keys() {
+        if !all_refs
+            .iter()
+            .any(|(_, r)| r == &VarRef::User(key.clone()))
+        {
+            anyhow::bail!(
+                "--vars: variable '{key}' is never referenced in rpi.toml{}",
+                if file.is_empty() {
+                    String::new()
+                } else {
+                    format!(" or {file}")
+                }
+            );
+        }
+    }
+
+    // The whole `env.*` namespace describes a selected environment, so
+    // without one there is nothing to report but "unknown variable" — which
+    // the substitution pass below says on its own. Only when an environment
+    // exists is `${env.slug}` in the branch field a genuine cycle.
+    let slug_ref = VarRef::Input("env".into(), "slug".into());
+    let wants_slug = env_name.is_some() && all_refs.iter().any(|(_, r)| r == &slug_ref);
+    if env_name.is_some()
+        && all_refs
+            .iter()
+            .any(|(path, r)| path == BRANCH_PATH && r == &slug_ref)
+    {
+        anyhow::bail!("{BRANCH_PATH}: circular reference - env.slug is derived from {BRANCH_PATH}");
+    }
+
+    let mut set = VarSet {
+        user: user.clone(),
+        inputs: git_inputs(&all_refs)?,
+    };
+    if let Some(name) = env_name {
+        set.inputs.insert("env.name".into(), name.to_string());
+    }
+
+    // Phase 1: source.branch only.
+    substitute_where(&mut base_v, &set, |p| p == BRANCH_PATH)?;
+    if let Some(o) = &mut overlay_v {
+        substitute_where(o, &set, |p| p == BRANCH_PATH)?;
+    }
+
+    let effective_branch = overlay_v
+        .as_ref()
+        .and_then(|o| string_at(o, BRANCH_PATH))
+        .or_else(|| string_at(&base_v, BRANCH_PATH))
+        .unwrap_or_else(crate::cli::rpitoml::default_branch);
+
+    let slug = wants_slug
+        .then(|| derive_slug(&effective_branch))
+        .transpose()?;
+    if let Some(slug) = &slug {
+        set.inputs.insert("env.slug".into(), slug.clone());
+    }
+
+    // Phase 2: everything except the field already done.
+    substitute_where(&mut base_v, &set, |p| p != BRANCH_PATH)?;
+    if let Some(o) = &mut overlay_v {
+        substitute_where(o, &set, |p| p != BRANCH_PATH)?;
+    }
+
+    let mut base = RpiToml::from_value(base_v)?;
+    let Some(env_name) = env_name else {
         return Ok(Resolved {
             rpitoml: base,
             env: None,
         });
     };
+    let mut overlay =
+        RpiTomlOverlay::from_value(overlay_v.expect("env implies an overlay"), &file)?;
 
-    validate_env_name(env_name)?;
-    let file = format!("rpi.{env_name}.toml");
-    let mut overlay = RpiTomlOverlay::parse(overlay_text, &file)?;
-    let user_vars = parse_vars(vars)?;
-    let parameterized = interpolate(&mut overlay, &user_vars)?;
-    if !parameterized && !user_vars.is_empty() {
-        anyhow::bail!("{file} is not parameterized (no ${{...}} references) - remove --vars");
+    // The signal is "the branch is variable but the key is not": whatever
+    // computes `source.branch` — `${BRANCH_NAME}`, `${git.branch}`,
+    // `${git.short_sha}` — every branch it can produce would land on the
+    // same shared key. Keying this on `--vars` instead would both miss the
+    // `${git.*}` case (no --vars at all) and nag about a deliberately shared
+    // stand that merely parameterizes, say, `.env.${STAGE}`.
+    if branch_is_computed && slug.is_none() {
+        warn(&format!(
+            "{file}: {BRANCH_PATH} is computed but nothing references ${{env.slug}}, so the key stays '{}--{env_name}' - every branch deploying this environment shares it",
+            base.project.name
+        ));
     }
-    let slug = if parameterized {
-        let Some(branch) = user_vars.get("BRANCH_NAME") else {
-            anyhow::bail!("parameterized overlay requires --vars BRANCH_NAME=<branch>");
-        };
-        Some(derive_slug(branch)?)
-    } else {
-        None
-    };
 
     let environment = overlay.environment.take();
     let base_name = base.project.name.clone();
@@ -547,6 +596,17 @@ pub fn resolve_from(
             ttl_secs,
             on_create,
         }),
+    })
+}
+
+/// Same as `resolve_with`, sending warnings to the standard output helper.
+pub fn resolve_from(
+    base_text: &str,
+    overlay: Option<(&str, &str)>,
+    vars_arg: &[String],
+) -> anyhow::Result<Resolved> {
+    resolve_with(base_text, overlay, vars_arg, &mut |w| {
+        crate::output::warn(w)
     })
 }
 
@@ -735,26 +795,6 @@ seed = "node seed.js"
     }
 
     #[test]
-    fn parse_vars_accepts_branch_name_only() {
-        let vars = parse_vars(&["BRANCH_NAME=feature/login".into()]).unwrap();
-        assert_eq!(vars["BRANCH_NAME"], "feature/login");
-        assert!(parse_vars(&[]).unwrap().is_empty());
-        for (bad, needle) in [
-            ("BRANCH_NAME", "KEY=VALUE"),      // no '='
-            ("branch=x", "^[A-Z][A-Z0-9_]*$"), // lowercase name
-            ("RPI_ENV_SLUG=x", "reserved"),    // RPI_ namespace
-            ("FOO=x", "BRANCH_NAME"),          // unknown var in v1
-        ] {
-            let err = parse_vars(&[bad.to_string()]).unwrap_err().to_string();
-            assert!(err.contains(needle), "{bad}: {err}");
-        }
-        let err = parse_vars(&["BRANCH_NAME=a".into(), "BRANCH_NAME=b".into()])
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("duplicate"), "got: {err}");
-    }
-
-    #[test]
     fn slug_normalizes_truncates_and_rejects_empty() {
         assert_eq!(derive_slug("feature/login").unwrap(), "feature-login");
         assert_eq!(derive_slug("Feature//Big__X").unwrap(), "feature-big-x");
@@ -762,7 +802,12 @@ seed = "node seed.js"
         let long = derive_slug("abcdefghij-abcdefghij-abcdefghij-tail").unwrap();
         assert!(long.len() <= 30, "got len {}: {long}", long.len());
         assert!(!long.ends_with('-'));
-        assert!(derive_slug("///").is_err());
+        let err = derive_slug("///").unwrap_err().to_string();
+        assert!(err.contains("${env.slug}"), "got: {err}");
+        assert!(
+            !err.contains("BRANCH_NAME") && !err.contains("RPI_ENV_SLUG"),
+            "the message must name only things that still exist: {err}"
+        );
     }
 
     #[test]
@@ -778,110 +823,294 @@ seed = "node seed.js"
         RpiTomlOverlay::parse(text, "rpi.branch.toml").unwrap()
     }
 
-    fn branch_vars() -> BTreeMap<String, String> {
-        parse_vars(&["BRANCH_NAME=feature/login".into()]).unwrap()
+    #[test]
+    fn substitutes_in_every_field_kind_of_an_overlay() {
+        let r = resolve_from(
+            BASE,
+            Some((
+                "test",
+                concat!(
+                    "[source]\nbranch = \"${BRANCH_NAME}\"\n\n",
+                    "[build]\ncompose = \"compose.${STAGE}.yml\"\n\n",
+                    "[ingress]\nhostname = \"${STAGE}.example.com\"\nservice = \"${STAGE}\"\n\n",
+                    "[secrets]\nenv = \".env.${STAGE}\"\nfiles = [\"certs/${STAGE}.pem\"]\n\n",
+                    "[timeouts]\nbuild = \"${BUILD_BUDGET}\"\n\n",
+                    "[commands]\nseed = \"node seed.js --env ${STAGE}\"\n",
+                    "migrate = [\"npx\", \"migrate\", \"${STAGE}\"]\n",
+                ),
+            )),
+            &[
+                "BRANCH_NAME=develop".into(),
+                "STAGE=test".into(),
+                "BUILD_BUDGET=20m".into(),
+            ],
+        )
+        .unwrap();
+        let c = r.rpitoml;
+        assert_eq!(c.source.branch, "develop");
+        assert_eq!(c.build.compose, "compose.test.yml");
+        assert_eq!(c.ingress.hostname.as_deref(), Some("test.example.com"));
+        assert_eq!(c.ingress.service, "test");
+        assert_eq!(c.secrets.env.as_deref(), Some(".env.test"));
+        assert_eq!(c.secrets.files, vec!["certs/test.pem".to_string()]);
+        assert_eq!(c.timeouts.build.as_deref(), Some("20m"));
+        let commands = c.to_project_config().commands;
+        assert_eq!(
+            commands["seed"].argv,
+            vec!["node", "seed.js", "--env", "test"]
+        );
+        assert_eq!(commands["migrate"].argv, vec!["npx", "migrate", "test"]);
     }
 
     #[test]
-    fn interpolates_branch_and_hostname() {
-        let mut o = overlay(
-            "[source]\nbranch = \"${BRANCH_NAME}\"\n\n[ingress]\nhostname = \"${RPI_ENV_SLUG}.preview.example.com\"\n",
-        );
-        let parameterized = interpolate(&mut o, &branch_vars()).unwrap();
-        assert!(parameterized);
+    fn substitutes_in_the_base_file_without_any_env() {
+        let base = BASE.replace("branch = \"main\"", "branch = \"${BRANCH_NAME}\"");
+        let r = resolve_from(&base, None, &["BRANCH_NAME=develop".into()]).unwrap();
+        assert_eq!(r.rpitoml.source.branch, "develop");
+        assert_eq!(r.rpitoml.project.name, "myapp", "no env, no derived key");
+        assert!(r.env.is_none());
+    }
+
+    #[test]
+    fn env_slug_derives_from_the_merged_branch_and_drives_the_key() {
+        let r = resolve_from(
+            BASE,
+            Some((
+                "branch",
+                "[source]\nbranch = \"${BRANCH_NAME}\"\n\n[ingress]\nhostname = \"${env.slug}.preview.example.com\"\n",
+            )),
+            &["BRANCH_NAME=feature/login".into()],
+        )
+        .unwrap();
+        assert_eq!(r.rpitoml.project.name, "myapp--branch--feature-login");
+        assert_eq!(r.rpitoml.source.branch, "feature/login");
         assert_eq!(
-            o.source.as_ref().unwrap().branch.as_deref(),
-            Some("feature/login")
-        );
-        assert_eq!(
-            o.ingress.as_ref().unwrap().hostname.as_deref(),
+            r.rpitoml.ingress.hostname.as_deref(),
             Some("feature-login.preview.example.com")
         );
+        assert_eq!(r.env.unwrap().slug.as_deref(), Some("feature-login"));
     }
 
     #[test]
-    fn static_overlay_is_not_parameterized() {
-        let mut o = overlay("[source]\nbranch = \"develop\"\n");
-        assert!(!interpolate(&mut o, &BTreeMap::new()).unwrap());
+    fn a_variable_that_is_not_the_slug_does_not_add_a_slug_suffix() {
+        // The old rule granted the suffix for using ANY variable, which turned
+        // a shared stand into a per-branch environment demanding a branch name.
+        let r = resolve_from(
+            BASE,
+            Some((
+                "test",
+                "[ingress]\nhostname = \"test.example.com\"\n\n[secrets]\nenv = \".env.${STAGE}\"\n",
+            )),
+            &["STAGE=qa".into()],
+        )
+        .unwrap();
+        assert_eq!(r.rpitoml.project.name, "myapp--test");
+        assert_eq!(r.env.unwrap().slug, None);
     }
 
     #[test]
-    fn unknown_var_and_unclosed_brace_are_errors() {
-        let mut o = overlay("[source]\nbranch = \"${NOPE}\"\n");
-        let err = interpolate(&mut o, &branch_vars()).unwrap_err().to_string();
-        assert!(err.contains("NOPE"), "got: {err}");
-        let mut o = overlay("[source]\nbranch = \"${BRANCH_NAME\"\n");
-        assert!(interpolate(&mut o, &branch_vars()).is_err());
+    fn env_name_is_available_as_an_input() {
+        let r = resolve_from(
+            BASE,
+            Some((
+                "test",
+                "[ingress]\nhostname = \"${env.name}.example.com\"\n\n[secrets]\nenv = \".env.${env.name}\"\n",
+            )),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(
+            r.rpitoml.ingress.hostname.as_deref(),
+            Some("test.example.com")
+        );
+        assert_eq!(r.rpitoml.secrets.env.as_deref(), Some(".env.test"));
     }
 
     #[test]
-    fn interpolation_outside_allowed_fields_is_rejected() {
-        for text in [
-            "[secrets]\nenv = \".env.${BRANCH_NAME}\"\n",
-            "[build]\ncompose = \"${BRANCH_NAME}.yml\"\n",
-            "[ingress]\nservice = \"${BRANCH_NAME}\"\n",
-            "[commands]\nseed = \"run ${BRANCH_NAME}\"\n",
-            "[environment]\non_create = \"${BRANCH_NAME}\"\n",
-        ] {
-            let mut o = overlay(text);
-            let err = interpolate(&mut o, &branch_vars()).unwrap_err().to_string();
-            assert!(
-                err.contains("source.branch") && err.contains("ingress.hostname"),
-                "{text}: {err}"
-            );
+    fn env_inputs_are_unavailable_without_an_env() {
+        for text in ["${env.name}", "${env.slug}"] {
+            let base = BASE.replace("branch = \"main\"", &format!("branch = \"{text}\""));
+            let err = resolve_from(&base, None, &[]).unwrap_err().to_string();
+            assert!(err.contains("unknown variable"), "{text}: {err}");
         }
     }
 
     #[test]
-    fn missing_branch_name_for_parameterized_overlay_is_an_error() {
-        let mut o = overlay("[source]\nbranch = \"${BRANCH_NAME}\"\n");
-        let err = interpolate(&mut o, &BTreeMap::new())
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("BRANCH_NAME"), "got: {err}");
-    }
-
-    #[test]
-    fn static_overlay_ignores_underivable_branch_name_for_slug() {
-        // BRANCH_NAME that cannot produce a slug must not break an overlay
-        // that never references ${RPI_ENV_SLUG}; parse_vars accepts the value,
-        // interpolate must not call derive_slug.
-        let mut o = overlay("[source]\nbranch = \"${BRANCH_NAME}\"\n");
-        let vars = parse_vars(&["BRANCH_NAME=___".into()]).unwrap();
-        assert!(interpolate(&mut o, &vars).unwrap());
-        assert_eq!(o.source.as_ref().unwrap().branch.as_deref(), Some("___"));
-
-        let mut o = overlay("[ingress]\nhostname = \"${RPI_ENV_SLUG}.preview.example.com\"\n");
-        let vars = parse_vars(&["BRANCH_NAME=___".into()]).unwrap();
-        let err = interpolate(&mut o, &vars).unwrap_err().to_string();
-        assert!(err.contains("RPI_ENV_SLUG"), "got: {err}");
-    }
-
-    #[test]
-    fn multiple_references_in_one_string_are_substituted() {
-        let mut o =
-            overlay("[ingress]\nhostname = \"${RPI_ENV_SLUG}.${BRANCH_NAME}.example.com\"\n");
-        let vars = parse_vars(&["BRANCH_NAME=login".into()]).unwrap();
-        assert!(interpolate(&mut o, &vars).unwrap());
+    fn escaped_reference_survives_into_a_command() {
+        let base = BASE.replace(
+            "seed = \"node seed.js\"",
+            "seed = \"sh -c 'tar -C $${HOME} .'\"",
+        );
+        let r = resolve_from(&base, None, &[]).unwrap();
         assert_eq!(
-            o.ingress.as_ref().unwrap().hostname.as_deref(),
-            Some("login.login.example.com")
+            r.rpitoml.to_project_config().commands["seed"].argv,
+            vec!["sh", "-c", "tar -C ${HOME} ."]
         );
     }
 
     #[test]
-    fn interpolation_in_argv_and_table_commands_is_rejected() {
-        for text in [
-            "[commands]\nseed = [\"run\", \"${BRANCH_NAME}\"]\n",
-            "[commands.seed]\nrun = \"x\"\nservice = \"${BRANCH_NAME}\"\n",
-        ] {
-            let mut o = overlay(text);
-            let vars = parse_vars(&["BRANCH_NAME=x".into()]).unwrap();
-            assert!(
-                interpolate(&mut o, &vars).is_err(),
-                "{text} must be rejected"
-            );
-        }
+    fn unreferenced_vars_are_rejected_by_name() {
+        let err = resolve_from(
+            BASE,
+            Some(("test", "[ingress]\nhostname = \"test.example.com\"\n")),
+            &["TYPO=1".into()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("TYPO"), "got: {err}");
+        assert!(err.contains("never referenced"), "got: {err}");
+    }
+
+    #[test]
+    fn interpolation_in_the_project_name_is_rejected() {
+        let base = BASE.replace("name = \"myapp\"", "name = \"app-${STAGE}\"");
+        let err = resolve_from(&base, None, &["STAGE=qa".into()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("[project].name"), "got: {err}");
+    }
+
+    #[test]
+    fn env_slug_inside_source_branch_is_a_circular_reference() {
+        let err = resolve_from(
+            BASE,
+            Some(("branch", "[source]\nbranch = \"${env.slug}\"\n")),
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("circular"), "got: {err}");
+    }
+
+    #[test]
+    fn rpi_variables_are_rejected_with_the_runtime_hint() {
+        let err = resolve_from(
+            BASE,
+            Some((
+                "branch",
+                "[ingress]\nhostname = \"${RPI_ENV_SLUG}.preview.example.com\"\n",
+            )),
+            &[],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("runtime"), "got: {err}");
+        assert!(err.contains("${env.slug}"), "got: {err}");
+    }
+
+    #[test]
+    fn parameterized_env_without_a_slug_reference_warns_about_the_key() {
+        let mut warnings = Vec::new();
+        let r = resolve_with(
+            BASE,
+            Some((
+                "branch",
+                "[source]\nbranch = \"${BRANCH_NAME}\"\n\n[ingress]\nhostname = \"fixed.example.com\"\n",
+            )),
+            &["BRANCH_NAME=feature/login".into()],
+            &mut |w| warnings.push(w.to_string()),
+        )
+        .unwrap();
+        assert_eq!(r.rpitoml.project.name, "myapp--branch");
+        assert_eq!(warnings.len(), 1, "got: {warnings:?}");
+        assert!(warnings[0].contains("${env.slug}"), "got: {warnings:?}");
+    }
+
+    #[test]
+    fn a_git_derived_branch_without_a_slug_reference_also_warns() {
+        // No --vars at all, yet every branch resolves to a different
+        // source.branch and they would all share the key 'myapp--branch'.
+        // Reads ${git.short_sha} from the ambient repository, which is
+        // readable even on the detached HEAD a CI checkout leaves behind.
+        let mut warnings = Vec::new();
+        let r = resolve_with(
+            BASE,
+            Some((
+                "branch",
+                "[source]\nbranch = \"${git.short_sha}\"\n\n[ingress]\nhostname = \"fixed.example.com\"\n",
+            )),
+            &[],
+            &mut |w| warnings.push(w.to_string()),
+        )
+        .unwrap();
+        assert_eq!(r.rpitoml.project.name, "myapp--branch");
+        assert_eq!(warnings.len(), 1, "got: {warnings:?}");
+        assert!(warnings[0].contains("${env.slug}"), "got: {warnings:?}");
+    }
+
+    #[test]
+    fn a_static_env_with_no_vars_never_warns() {
+        let mut warnings = Vec::new();
+        resolve_with(
+            BASE,
+            Some(("test", "[ingress]\nhostname = \"test.example.com\"\n")),
+            &[],
+            &mut |w| warnings.push(w.to_string()),
+        )
+        .unwrap();
+        assert!(warnings.is_empty(), "got: {warnings:?}");
+    }
+
+    #[test]
+    fn an_overlay_pinning_a_static_branch_over_a_computed_base_never_warns() {
+        // The overlay's source.branch replaces the base's outright, so the
+        // branch this environment deploys is the literal "main" - shared on
+        // purpose, with nothing to warn about, even though the base file
+        // computes its own branch for the production deploy.
+        let base = BASE.replace("branch = \"main\"", "branch = \"${BRANCH_NAME}\"");
+        let mut warnings = Vec::new();
+        let r = resolve_with(
+            &base,
+            Some((
+                "test",
+                "[source]\nbranch = \"main\"\n\n[ingress]\nhostname = \"test.example.com\"\n",
+            )),
+            &["BRANCH_NAME=feature/login".into()],
+            &mut |w| warnings.push(w.to_string()),
+        )
+        .unwrap();
+        assert_eq!(r.rpitoml.source.branch, "main");
+        assert!(warnings.is_empty(), "got: {warnings:?}");
+    }
+
+    #[test]
+    fn a_shared_stand_parameterizing_something_else_never_warns() {
+        // A fixed hostname plus `.env.${STAGE}` is a deliberately shared
+        // stand (see a_variable_that_is_not_the_slug_does_not_add_a_slug_
+        // suffix). Its branch is static, so the key it gets is the key it
+        // wants and there is nothing to warn about.
+        let mut warnings = Vec::new();
+        let r = resolve_with(
+            BASE,
+            Some((
+                "test",
+                "[ingress]\nhostname = \"test.example.com\"\n\n[secrets]\nenv = \".env.${STAGE}\"\n",
+            )),
+            &["STAGE=qa".into()],
+            &mut |w| warnings.push(w.to_string()),
+        )
+        .unwrap();
+        assert_eq!(r.rpitoml.project.name, "myapp--test");
+        assert!(warnings.is_empty(), "got: {warnings:?}");
+    }
+
+    #[test]
+    fn substituted_values_are_revalidated() {
+        // A raw branch name substituted into a hostname is invalid DNS - the
+        // slash in "feature/login" makes an invalid label. The check runs
+        // post-substitution, which is why ${env.slug} (the sanitized form)
+        // exists.
+        let err = resolve_from(
+            BASE,
+            Some((
+                "branch",
+                "[ingress]\nhostname = \"${BRANCH_NAME}.preview.example.com\"\n",
+            )),
+            &["BRANCH_NAME=feature/login".into()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("hostname"), "got: {err}");
     }
 
     #[test]
@@ -901,67 +1130,6 @@ seed = "node seed.js"
         assert_eq!(env.slug, None);
         assert_eq!(env.ttl_secs, Some(7 * 24 * 3600));
         assert_eq!(env.on_create.as_deref(), Some("seed"));
-    }
-
-    #[test]
-    fn resolve_parameterized_env_uses_slug_in_key() {
-        let r = resolve_from(
-            BASE,
-            Some((
-                "branch",
-                "[source]\nbranch = \"${BRANCH_NAME}\"\n\n[ingress]\nhostname = \"${RPI_ENV_SLUG}.preview.example.com\"\n",
-            )),
-            &["BRANCH_NAME=feature/login".into()],
-        )
-        .unwrap();
-        assert_eq!(r.rpitoml.project.name, "myapp--branch--feature-login");
-        assert_eq!(
-            r.env.as_ref().unwrap().slug.as_deref(),
-            Some("feature-login")
-        );
-        assert_eq!(r.rpitoml.source.branch, "feature/login");
-    }
-
-    #[test]
-    fn resolve_without_env_keeps_base_and_rejects_vars() {
-        let r = resolve_from(BASE, None, &[]).unwrap();
-        assert_eq!(r.rpitoml.project.name, "myapp");
-        assert!(r.env.is_none());
-        let err = resolve_from(BASE, None, &["BRANCH_NAME=x".into()])
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("--env"), "got: {err}");
-    }
-
-    #[test]
-    fn vars_for_static_overlay_are_rejected() {
-        let err = resolve_from(
-            BASE,
-            Some(("test", "[source]\nbranch = \"develop\"\n")),
-            &["BRANCH_NAME=x".into()],
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("not parameterized"), "got: {err}");
-    }
-
-    #[test]
-    fn raw_branch_name_in_hostname_is_rejected_as_invalid_dns() {
-        // The slash in a raw BRANCH_NAME like "feature/login" makes an
-        // invalid DNS label once substituted directly into the hostname;
-        // ${RPI_ENV_SLUG} (not ${BRANCH_NAME}) is the sanitized variable
-        // meant for this field.
-        let err = resolve_from(
-            BASE,
-            Some((
-                "branch",
-                "[ingress]\nhostname = \"${BRANCH_NAME}.preview.example.com\"\n",
-            )),
-            &["BRANCH_NAME=feature/login".into()],
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("hostname"), "got: {err}");
     }
 
     #[test]

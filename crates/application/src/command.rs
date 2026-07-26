@@ -71,6 +71,9 @@ impl RunCommand {
             workdir,
             compose_file,
             override_file,
+            // No deploy is in flight, so RPI_COMMIT_SHA comes from the
+            // registry's record of the last successful one.
+            env: pi_domain::runtimevars::rpi_vars(&registered, None),
         };
         let secs = registered
             .config
@@ -161,6 +164,7 @@ mod tests {
             created_at: 1,
             on_create_done: false,
             last_success_at: None,
+            last_commit_sha: None,
         }
     }
 
@@ -235,6 +239,27 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn exec_carries_the_runtime_environment() {
+        let mut runtime = MockContainerRuntime::new();
+        runtime
+            .expect_exec()
+            .withf(|stack, _, _, _| {
+                stack.env["RPI_PROJECT"] == "rateme"
+                    && stack.env["RPI_BRANCH_NAME"] == "main"
+                    && stack.env["RPI_HOST_PORT"] == "8000"
+                    && stack.env["RPI_COMMIT_SHA"] == "stored-sha"
+            })
+            .returning(|_, _, _, _| Ok(0));
+
+        let mut proj = project("rateme");
+        proj.last_commit_sha = Some("stored-sha".into());
+        let run = deps_with(runtime, proj);
+        run.execute("rateme", "create-invite", &[], CollectSink::new())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn unknown_project_is_not_found() {
         let mut projects = MockProjectRepository::new();
         projects.expect_get().returning(|_| Ok(None));
@@ -290,6 +315,9 @@ mod tests {
                 _: &str,
             ) -> Result<Vec<pi_domain::entities::ServiceState>, DomainError> {
                 unimplemented!()
+            }
+            async fn services(&self, _: &ComposeStack) -> Result<Vec<String>, DomainError> {
+                Ok(vec![])
             }
             async fn prune_images(&self, _: Arc<dyn LogSink>) -> Result<(), DomainError> {
                 unimplemented!()

@@ -1,13 +1,13 @@
 ---
 name: rpi-toml
-description: Use when creating, editing, validating, reviewing, or troubleshooting rpi.toml files for rpi deployments, including schema 1 fields, project/source/build/ingress/healthcheck/env/timeouts sections, Docker Compose service and port mapping, public hostname ingress, worker services, per-project deploy settings, and rpi.<env>.toml environment overlays ([environment] ttl/on_create, merge rules, ${...} interpolation).
+description: Use when creating, editing, validating, reviewing, or troubleshooting rpi.toml files for rpi deployments, including schema 1 fields, project/source/build/ingress/healthcheck/env/timeouts sections, Docker Compose service and port mapping, public hostname ingress, worker services, per-project deploy settings, configuration variables (${NAME} user vars from --vars, ${git.*}/${env.*} resolver inputs, RPI_* runtime variables), and rpi.<env>.toml environment overlays ([environment] ttl/on_create, merge rules).
 ---
 
 # Rpi TOML
 
 ## Overview
 
-Use this skill for `rpi.toml`, the project-level deployment config read by `rpi deploy`, `rpi deploy --cancel`, `rpi secrets send`, and `rpi secrets ls`. Keep config advice aligned with `crates/bin/src/cli/rpitoml.rs` and `README.md`.
+Use this skill for `rpi.toml`, the project-level deployment config read by `rpi deploy`, `rpi deploy --cancel`, `rpi command`, `rpi secrets send`, `rpi secrets ls`, `rpi config show`, and `rpi env destroy`/`reset-data`. Keep config advice aligned with `crates/bin/src/cli/rpitoml.rs` and `README.md`.
 
 ## Minimal Shape
 
@@ -110,6 +110,93 @@ run     = "node dist/scripts/create-invite.cjs"   # string or array, same rules 
 service = "server"                                 # optional compose service to exec into; defaults to [ingress].service
 ```
 
+## Variables
+
+Any string field of `rpi.toml` (and of an `rpi.<env>.toml` overlay) can carry
+`${...}` references. There are three namespaces, told apart by syntax alone —
+so nothing has to be looked up to know where a value comes from.
+
+| Syntax | What it is | Where it comes from |
+| --- | --- | --- |
+| `${NAME}` | user variable | `--vars NAME=VALUE` on the command line |
+| `${ns.field}` | resolver input | computed by the CLI while resolving |
+| `RPI_*` | runtime variable | injected by the agent into containers — **never valid in a TOML file** |
+
+```toml
+# rpi.toml — variables work in the base file, with or without an overlay
+[source]
+branch = "${BRANCH_NAME}"                          # or "${git.branch}"
+
+[build]
+compose = "compose.${STAGE}.yml"
+
+[commands]
+tag = "sh -c 'echo built ${git.short_sha}'"
+backup = "sh -c 'tar -C $${HOME} -czf /b.tgz .'"   # $${ => literal ${
+```
+
+```bash
+rpi deploy --vars BRANCH_NAME=feature/login --vars STAGE=qa   # --env is not required
+```
+
+(`${env.name}`/`${env.slug}` are the exception: they describe a selected
+environment, so they only resolve with `--env` — see the overlay example
+below.)
+
+**User variables (`${NAME}`).** Names must match `^[A-Z][A-Z0-9_]*$`; the name
+is otherwise arbitrary (`BRANCH_NAME` is not special). `--vars` is repeatable,
+everything after the first `=` is the value, an empty value is fine, and a
+duplicate key is an error. Names starting with `RPI_` are refused. A `--vars`
+key that no field references is an error naming that key — a typo cannot pass
+silently. A reference with no matching value is likewise an error, listing
+what *is* available.
+
+**Resolver inputs (`${ns.field}`).** Exactly five, in exactly two namespaces:
+
+| Input | Value |
+| --- | --- |
+| `${git.branch}` | current branch of the repository rpi is run from |
+| `${git.sha}` | full 40-character sha of `HEAD` |
+| `${git.short_sha}` | git's own abbreviation of `HEAD` |
+| `${env.name}` | the `<env>` passed to `--env` (only with `--env`) |
+| `${env.slug}` | `source.branch`, sanitized for use in DNS/keys (only with `--env`) |
+
+`${git.*}` runs `git` lazily — only for the inputs a configuration actually
+references — so a config that uses none still resolves outside a repository.
+A detached `HEAD` makes `${git.branch}` a hard error naming `--vars` as the
+workaround (it does *not* silently become `HEAD`); `${git.sha}` and
+`${git.short_sha}` still work while detached. `${env.slug}` is the branch
+lower-cased, every run of non-`[a-z0-9]` characters collapsed to one `-`,
+truncated to 30 characters, trailing `-` trimmed; a branch that normalizes to
+nothing is an error.
+
+**Runtime variables (`RPI_*`).** These exist only inside containers and
+exec'd processes; the agent injects them at deploy time. Writing `${RPI_...}`
+in a TOML file is a dedicated error, and `${RPI_ENV_SLUG}` specifically
+suggests `${env.slug}` — that rename is the one hard break. `RPI_` is also
+rejected as a `--vars` name and as a secret key. `rpi config show` prints a
+`[runtime]` block previewing the set (`RPI_HOST_PORT` and `RPI_COMMIT_SHA`
+show as `<assigned by agent>`).
+
+Rules:
+
+- **Where it works**: every string field of `rpi.toml` and of an overlay,
+  including `[commands]` in string form, in argv-array form, and a command
+  table's `service`. Two exceptions: `[project].name` refuses any reference (the
+  project key must stay static — it drives key derivation), and `schema`
+  cannot carry one (it is a number in the base file and forbidden outright in
+  an overlay).
+- **Escaping**: `$${` renders a literal `${` and is inert as a reference —
+  that is how a command keeps a shell variable of its own. `$$` is special
+  only immediately before `{`; a lone `$`, `$$`, or `$5` is ordinary text.
+- **Order**: `source.branch` is resolved first, `${env.slug}` is derived from
+  the result, then everything else is resolved. `${env.slug}` inside
+  `source.branch` is therefore a circular-reference error.
+- **Validation runs after substitution**, so a substituted value still has to
+  be valid — a raw branch name interpolated into `ingress.hostname` fails the
+  DNS check (`feature/login` has a `/`), which is exactly why `${env.slug}`
+  exists.
+
 ## Environment Overlays
 
 An overlay file `rpi.<env>.toml` next to `rpi.toml` lets `rpi deploy --env <env>`
@@ -128,10 +215,10 @@ myapp/
 ```toml
 # rpi.branch.toml — parameterized preview overlay
 [source]
-branch = "${BRANCH_NAME}"
+branch = "${BRANCH_NAME}"                          # or "${git.branch}"
 
 [ingress]
-hostname = "${RPI_ENV_SLUG}.preview.example.com"
+hostname = "${env.slug}.preview.example.com"       # ${env.slug} => per-branch key
 
 [environment]
 ttl = "7d"          # optional; overlay's [environment] is the only place this is valid
@@ -160,19 +247,20 @@ Rules:
   explicit empty string (`""`) on an optional field (e.g. `ingress.hostname`,
   `secrets.env`, `secrets.file_mode`) resets it to unset rather than being
   ignored.
-- **Interpolation** (`${VAR}`) is allowed only in `source.branch` and
-  `ingress.hostname` — anywhere else is a parse error, including inside
-  `[commands]`, an argv array, or a command table's `service`. Supported
-  variables: `BRANCH_NAME` (from `--vars BRANCH_NAME=<branch>`) and
-  `RPI_ENV_SLUG`, derived from `BRANCH_NAME` on demand — only computed when
-  actually referenced — by lower-casing, collapsing runs of non-`[a-z0-9]`
-  characters to a single `-`, truncating to 30 characters, and trimming a
-  trailing `-`. An overlay with no `${...}` reference rejects `--vars`
-  ("not parameterized"); a parameterized overlay without
-  `--vars BRANCH_NAME=...` is an error.
+- **Variables** work the same in an overlay as in the base file (see the
+  Variables section above); `${env.name}` and `${env.slug}` are available
+  only when `--env` selected an environment. `--vars` is *not* tied to
+  `--env` — it works against the base `rpi.toml` alone.
 - **Key derivation**: the deployed `project.name` is always CLI-derived, never
-  read from the overlay — `<base>--<env>` for a static overlay, or
-  `<base>--<env>--<slug>` once `${RPI_ENV_SLUG}` was actually substituted.
+  read from the overlay — `<base>--<env>`, or `<base>--<env>--<slug>` when
+  either file references `${env.slug}`. The suffix hangs on that one
+  reference and nothing else: using some other variable (`.env.${STAGE}`,
+  say) leaves the key at `<base>--<env>`, so a shared stand does not turn
+  into a per-branch environment by accident. A **computed `source.branch`**
+  (any `${...}` in it) with no `${env.slug}` anywhere does print a warning
+  naming the key you actually get — that combination means every branch
+  deploying the environment lands on one shared key. A static branch never
+  warns, however many other variables the files use.
   `--` in a project name is reserved for this; a base `rpi.toml` whose
   `project.name` contains `--` is rejected agent-side.
 - If the base `rpi.toml` sets `[ingress].hostname`, the overlay must
@@ -181,9 +269,10 @@ Rules:
   error, and a 409 from the agent as a second line of defense), since it
   would otherwise hijack the production route on the environment's first
   successful deploy.
-- `rpi config show --env <env> [--vars ...]` prints the fully resolved
-  configuration (base + overlay merged, `[environment]` appended) without
-  contacting the agent — the fastest way to check what a deploy would send.
+- `rpi config show [--env <env>] [--vars ...]` prints the fully resolved
+  configuration (base + overlay merged, `[environment]` appended, then a
+  `[runtime]` preview of the `RPI_*` variables) without contacting the agent
+  — the fastest way to check what a deploy would send.
 
 See `docs/architecture/flows/environments.md` for the full resolution,
 deploy-time guard, `on_create`, and `rpi env`/TTL-reaper flow.
@@ -200,14 +289,24 @@ deploy-time guard, `on_create`, and `rpi env`/TTL-reaper flow.
 
 ## Compose Compatibility
 
-The agent writes an override mapping the allocated host port to `ingress.port`, roughly:
+The agent writes an override mapping the allocated host port to `ingress.port`, and gives every service of the stack the `RPI_*` runtime variables, roughly:
 
 ```yaml
 services:
-  web:
+  web:                                   # the [ingress].service
+    restart: unless-stopped
     ports:
       - "127.0.0.1:8000:3000"
+    environment:                         # a mapping, so compose merges key-wise
+      RPI_PROJECT: myapp--branch--feature-login
+      RPI_BRANCH_NAME: feature/login
+      RPI_HOST_PORT: "8000"
+  worker:                                # every other service: environment only
+    environment:
+      RPI_PROJECT: myapp--branch--feature-login
 ```
+
+Those names are readable from inside the container and interpolate in the project's own compose file (`${RPI_HOST_PORT}`), but they are never valid in `rpi.toml` itself. Injecting them needs an agent `>= 0.27.0` (the `runtime-vars` capability); an older agent still deploys, it just injects nothing.
 
 Recommended Compose pattern:
 
@@ -261,7 +360,9 @@ services:
 When editing the parser or adding fields, update:
 
 - `crates/bin/src/cli/rpitoml.rs`
-- `crates/bin/src/cli/overlay.rs` (overlay schema, merge, and interpolation live here, separate from the base parser)
+- `crates/bin/src/cli/overlay.rs` (overlay schema, the merge, and the two-phase resolver live here, separate from the base parser)
+- `crates/bin/src/cli/vars.rs` (namespaces, `--vars` parsing, `$${` escaping) and `crates/bin/src/cli/gitctx.rs` (the `${git.*}` inputs) if the variable surface changes
+- `crates/domain/src/runtimevars.rs` if the `RPI_*` set changes, plus `render_runtime_preview` in `crates/bin/src/cli/commands.rs`, which mirrors it for `rpi config show`
 - `README.md`
 - examples in this skill if the public config surface changes
-- `docs/architecture/flows/environments.md` if overlay resolution behavior changes (see the `architecture-diagrams` skill)
+- `docs/architecture/flows/environments.md` if overlay resolution behavior changes, and `docs/architecture/flows/deploy.md` if `RPI_*` delivery changes (see the `architecture-diagrams` skill)

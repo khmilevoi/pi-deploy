@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -59,6 +60,10 @@ pub trait ContainerRuntime: Send + Sync {
     async fn build(&self, stack: &ComposeStack, log: Arc<dyn LogSink>) -> Result<(), DomainError>;
     async fn up(&self, stack: &ComposeStack, log: Arc<dyn LogSink>) -> Result<(), DomainError>;
     async fn ps(&self, project_name: &str) -> Result<Vec<ServiceState>, DomainError>;
+    /// Service names of the stack, from the compose file plus the
+    /// repository's own override — deliberately excluding the generated
+    /// override, which is what the caller is about to write.
+    async fn services(&self, stack: &ComposeStack) -> Result<Vec<String>, DomainError>;
     /// `docker image prune -f` — dangling images only; build cache stays (§8.1).
     async fn prune_images(&self, log: Arc<dyn LogSink>) -> Result<(), DomainError>;
     /// `docker builder prune -f` with an age filter — frees build cache when
@@ -131,8 +136,14 @@ pub trait ProjectRepository: Send + Sync {
         &self,
         base: Option<&'a str>,
     ) -> Result<Vec<Project>, DomainError>;
-    /// Sets last_success_at (TTL sliding anchor).
-    async fn mark_deploy_success(&self, name: &str, at: i64) -> Result<(), DomainError>;
+    /// Sets last_success_at (TTL sliding anchor) and, when a sha is given,
+    /// last_commit_sha (source of RPI_COMMIT_SHA outside a deploy).
+    async fn mark_deploy_success<'a>(
+        &self,
+        name: &str,
+        at: i64,
+        commit_sha: Option<&'a str>,
+    ) -> Result<(), DomainError>;
     async fn set_on_create_done(&self, name: &str, done: bool) -> Result<(), DomainError>;
 }
 
@@ -170,6 +181,12 @@ pub trait DeploymentHistory: Send + Sync {
 pub trait OverrideStore: Send + Sync {
     /// Returns the expected path of the override file for the project.
     fn path(&self, project: &str) -> PathBuf;
+    /// `service` is the public service (ports plus restart policy);
+    /// `services` is every service that should receive `env`, and may or may
+    /// not contain `service`. Each parameter is an independent input the
+    /// emitter needs verbatim; grouping them into a struct would only move the
+    /// same list one indirection away, so the arity is accepted here.
+    #[allow(clippy::too_many_arguments)]
     async fn write(
         &self,
         project: &str,
@@ -177,6 +194,8 @@ pub trait OverrideStore: Send + Sync {
         bind: &str,
         host_port: u16,
         container_port: u16,
+        services: &[String],
+        env: &BTreeMap<String, String>,
     ) -> Result<PathBuf, DomainError>;
     async fn remove(&self, project: &str) -> Result<(), DomainError>;
 }

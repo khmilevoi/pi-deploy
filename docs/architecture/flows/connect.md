@@ -93,7 +93,17 @@ sequenceDiagram
    HTTP error with a plain instruction. Some capabilities are allowed to be
    missing quietly instead (the CLI just skips that step and falls back to
    older behavior), which is how a deploy-key preflight check degrades
-   gracefully against an agent that doesn't support it yet.
+   gracefully against an agent that doesn't support it yet. A third policy
+   sits between those two: missing support prints a warning of its own — a
+   different banner from the version-skew one, naming the feature, the
+   agent's version and the minimum it would need, and ending in "skipping" —
+   and then the command proceeds anyway with that capability simply unused.
+   It reuses the same print-at-most-once mechanism as the skew banner but
+   under its own dedup key (the capability string), so in a run where both
+   apply, both are printed, once each. Runtime variables are the first
+   feature on this policy: their configuration can no longer even be
+   expressed against an older agent, so refusing the whole deploy over it
+   would be worse than just not injecting them.
 
 7. **The actual request, and a race safety net.** Once gating clears, the
    CLI sends the real request over the same tunnel. Because the running

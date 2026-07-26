@@ -1,26 +1,47 @@
 use crate::cli::config::ConnectOpts;
 use crate::cli::connect::AgentConn;
-use crate::cli::overlay::{derive_key, derive_slug, parse_vars, validate_env_name};
+use crate::cli::overlay;
 use crate::output;
 
-/// Derive the target key for `rpi env destroy`/`rpi env reset-data` without
-/// reading the overlay file: both actions only need the key, and requiring
-/// `rpi.<env>.toml` to still exist (and still resolve cleanly) would make it
-/// impossible to destroy/reset an environment whose overlay was deleted or
-/// is currently broken — exactly the situation a cleanup command must
-/// survive. Only `./rpi.toml` is read (for the base project name).
-fn resolve_key(env: &str, vars: &[String]) -> anyhow::Result<String> {
-    validate_env_name(env)?;
-    let user_vars = parse_vars(vars)?;
-    let base = crate::cli::overlay::resolve(None, &[])?
-        .rpitoml
-        .project
-        .name;
-    let slug = user_vars
-        .get("BRANCH_NAME")
-        .map(|branch| derive_slug(branch))
-        .transpose()?;
-    Ok(derive_key(&base, env, slug.as_deref()))
+/// One part of a derived key (`base`, `env`, or `slug`): lowercase, no `--`,
+/// no leading or trailing `-`. Mirrors the agent's own `is_valid_env_part`.
+fn is_valid_key_part(s: &str) -> bool {
+    !s.is_empty()
+        && !s.starts_with('-')
+        && !s.ends_with('-')
+        && s.chars().all(|c| matches!(c, 'a'..='z' | '0'..='9' | '-'))
+}
+
+/// The environment key `destroy`/`reset-data` should act on.
+///
+/// `--full-key` names it outright and reads no configuration file at all —
+/// not the overlay, and not `rpi.toml` either. It is the escape hatch for a
+/// project directory that no longer resolves, so depending on any local file
+/// would defeat it. `rpi env ls` prints the exact string to pass.
+///
+/// The `<env>` form resolves the overlay the same way `rpi deploy` does,
+/// because the slug now derives from the merged `source.branch`.
+fn target_key(env: Option<String>, key: Option<String>, vars: &[String]) -> anyhow::Result<String> {
+    match (env, key) {
+        (Some(_), Some(_)) => {
+            anyhow::bail!("--full-key and <env> are mutually exclusive: pass one or the other")
+        }
+        (None, None) => anyhow::bail!("pass an environment name, or --full-key <key>"),
+        (None, Some(key)) => {
+            let parts: Vec<&str> = key.split("--").collect();
+            let shaped = matches!(parts.len(), 2 | 3) && parts.iter().all(|p| is_valid_key_part(p));
+            if !shaped {
+                anyhow::bail!(
+                    "--full-key '{key}' is not an environment key (expected base--env or base--env--slug); run `rpi env ls` to see the exact key"
+                );
+            }
+            Ok(key)
+        }
+        (Some(env), None) => {
+            let resolved = overlay::resolve(Some(&env), vars)?;
+            Ok(resolved.rpitoml.project.name)
+        }
+    }
 }
 
 fn confirm_key(action: &str, key: &str, yes: bool) -> anyhow::Result<()> {
@@ -39,22 +60,44 @@ fn confirm_key(action: &str, key: &str, yes: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn env_ls(all: bool, connect: ConnectOpts) -> anyhow::Result<()> {
-    // Distinguish "no rpi.toml here" (friendly hint to use --all) from any
-    // other resolution failure (e.g. a malformed rpi.toml), which must
-    // propagate instead of being swallowed into the same generic message.
-    let base = if all {
-        None
-    } else if !std::path::Path::new("rpi.toml").exists() {
-        anyhow::bail!("no rpi.toml in the current directory - use `rpi env ls --all`")
-    } else {
-        Some(
-            crate::cli::overlay::resolve(None, &[])?
-                .rpitoml
-                .project
-                .name,
-        )
+/// The `base` the agent filters the listing by: `None` for `--all` (every
+/// environment on the agent), otherwise this project's name resolved out of
+/// `./rpi.toml` — `base_text`, or `None` when there is no readable one here.
+///
+/// Two distinct failures, never folded into one message: "no rpi.toml here"
+/// keeps its friendly `--all` hint, and any other resolution failure keeps
+/// its own message (a malformed file, or — since variables reach the base
+/// file too — a `${NAME}` this invocation was not given a `--vars` for) with
+/// the escape hatches appended. `--all` reads no configuration file at all,
+/// so it is the way out of a base file that cannot be resolved here.
+fn base_filter(
+    all: bool,
+    base_text: Option<&str>,
+    vars: &[String],
+) -> anyhow::Result<Option<String>> {
+    if all {
+        return Ok(None);
+    }
+    let Some(text) = base_text else {
+        anyhow::bail!("no rpi.toml in the current directory - use `rpi env ls --all`");
     };
+    let resolved = overlay::resolve_from(text, None, vars).map_err(|e| {
+        anyhow::anyhow!(
+            "{e}\n  hint: pass it with `rpi env ls --vars KEY=VALUE`, or run `rpi env ls --all`, which reads no configuration file"
+        )
+    })?;
+    Ok(Some(resolved.rpitoml.project.name))
+}
+
+pub async fn env_ls(all: bool, vars: Vec<String>, connect: ConnectOpts) -> anyhow::Result<()> {
+    // Read here rather than inside `base_filter` so the resolution itself
+    // stays a pure function of (text, vars) and is unit-testable.
+    let base_text = if all {
+        None
+    } else {
+        std::fs::read_to_string("rpi.toml").ok()
+    };
+    let base = base_filter(all, base_text.as_deref(), &vars)?;
     let AgentConn {
         tunnel: _tunnel,
         api,
@@ -98,12 +141,13 @@ pub async fn env_ls(all: bool, connect: ConnectOpts) -> anyhow::Result<()> {
 }
 
 pub async fn env_destroy(
-    env: String,
+    env: Option<String>,
+    key: Option<String>,
     vars: Vec<String>,
     yes: bool,
     connect: ConnectOpts,
 ) -> anyhow::Result<()> {
-    let key = resolve_key(&env, &vars)?;
+    let key = target_key(env, key, &vars)?;
     confirm_key(
         "DESTROY (stack, volumes, ingress, DNS, secrets, registry) of",
         &key,
@@ -127,12 +171,13 @@ pub async fn env_destroy(
 }
 
 pub async fn env_reset_data(
-    env: String,
+    env: Option<String>,
+    key: Option<String>,
     vars: Vec<String>,
     yes: bool,
     connect: ConnectOpts,
 ) -> anyhow::Result<()> {
-    let key = resolve_key(&env, &vars)?;
+    let key = target_key(env, key, &vars)?;
     confirm_key("REMOVE ALL DATA (volumes) of", &key, yes)?;
     let AgentConn {
         tunnel: _tunnel,
@@ -142,7 +187,111 @@ pub async fn env_reset_data(
     compat.gate(crate::compat::Feature::Environments)?;
     api.reset_environment(&key).await?;
     output::success(format!(
-        "environment '{key}' data removed - the next `rpi deploy --env {env}` re-runs on_create"
+        "environment '{key}' data removed - the next deploy of it re-runs on_create"
     ));
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_key_is_accepted_as_is() {
+        assert_eq!(
+            target_key(None, Some("myapp--branch--feature-login".into()), &[]).unwrap(),
+            "myapp--branch--feature-login"
+        );
+        assert_eq!(
+            target_key(None, Some("myapp--test".into()), &[]).unwrap(),
+            "myapp--test"
+        );
+    }
+
+    #[test]
+    fn a_malformed_key_is_rejected_before_any_agent_call() {
+        for bad in [
+            "myapp",                    // no env part at all
+            "myapp--",                  // empty env part
+            "--test",                   // empty base
+            "myapp--Test",              // uppercase
+            "myapp--test--slug--extra", // too many parts
+            "myapp--test--",            // empty slug
+            "myapp---test",             // leading '-' in the env part
+        ] {
+            let err = target_key(None, Some(bad.into()), &[])
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("--full-key"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn key_and_env_are_mutually_exclusive_and_one_is_required() {
+        let err = target_key(Some("test".into()), Some("myapp--test".into()), &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--full-key"), "got: {err}");
+
+        let err = target_key(None, None, &[]).unwrap_err().to_string();
+        assert!(err.contains("--full-key"), "got: {err}");
+    }
+
+    /// A base file that needs a user variable — what README recommends and
+    /// what `rpi env ls` used to be unable to read at all.
+    const BASE_WITH_VAR: &str = r#"
+schema = 1
+
+[project]
+name = "myapp"
+
+[source]
+repo = "git@github.com:acme/myapp.git"
+branch = "${BRANCH_NAME}"
+
+[ingress]
+service = "web"
+port = 3000
+"#;
+
+    #[test]
+    fn all_needs_no_configuration_file_at_all() {
+        assert_eq!(base_filter(true, None, &[]).unwrap(), None);
+        let err = base_filter(false, None, &[]).unwrap_err().to_string();
+        assert!(err.contains("--all"), "got: {err}");
+    }
+
+    #[test]
+    fn the_base_name_resolves_once_the_variable_is_passed() {
+        assert_eq!(
+            base_filter(
+                false,
+                Some(BASE_WITH_VAR),
+                &["BRANCH_NAME=feature/login".into()]
+            )
+            .unwrap(),
+            Some("myapp".to_string()),
+            "`rpi env ls --vars` must reach the base file's own variables"
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_base_names_both_escape_hatches() {
+        let err = base_filter(false, Some(BASE_WITH_VAR), &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("BRANCH_NAME"), "got: {err}");
+        assert!(err.contains("--vars"), "got: {err}");
+        assert!(err.contains("rpi env ls --all"), "got: {err}");
+    }
+
+    #[test]
+    fn key_path_ignores_vars_entirely() {
+        // --full-key exists for a directory that no longer resolves, so it
+        // must not consult --vars, rpi.toml, or the overlay.
+        assert_eq!(
+            target_key(None, Some("myapp--test".into()), &["TYPO=1".into()]).unwrap(),
+            "myapp--test"
+        );
+    }
 }

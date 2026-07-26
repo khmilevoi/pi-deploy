@@ -126,6 +126,9 @@ impl ResetEnvironmentData {
                 workdir,
                 compose_file,
                 override_file: self.overrides.path(key),
+                // No deploy is in flight, so RPI_COMMIT_SHA comes from the
+                // registry's record of the last successful one.
+                env: pi_domain::runtimevars::rpi_vars(&existing, None),
             };
             self.runtime.down(&stack, true, Arc::clone(&log)).await?;
         }
@@ -285,6 +288,7 @@ mod tests {
             created_at: 1,
             on_create_done: false,
             last_success_at: None,
+            last_commit_sha: None,
         }
     }
 
@@ -607,6 +611,7 @@ mod tests {
             created_at,
             on_create_done: false,
             last_success_at,
+            last_commit_sha: None,
         }
     }
 

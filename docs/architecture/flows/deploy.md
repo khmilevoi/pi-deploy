@@ -30,7 +30,10 @@ sequenceDiagram
         Q->>P: run once the active deploy finishes
     end
     CLI->>API: open log stream (SSE)
-    P->>P: fetch — clone or update checkout, inject secrets, write override
+    P->>P: fetch — clone or update checkout, inject secrets
+    P->>D: list the stack's services
+    D-->>P: service names (or a config error, which fails the deploy here)
+    P->>P: write override — public port and bind, RPI_* variables on every service
     P->>D: build compose stack
     D-->>P: images built (or build error)
     P->>D: start containers
@@ -100,11 +103,45 @@ stateDiagram-v2
    (generating a dedicated SSH deploy key first if the repo needs one), then
    always fetches from the remote and hard-resets the checkout to the
    requested branch or commit. Secrets are then decrypted and written into
-   the checkout, and rpi's own compose override (fixed host port, bind
-   address, restart policy) is generated.
+   the checkout. The agent then derives the deploy's `RPI_*` runtime
+   variables — `RPI_PROJECT` and `RPI_PROJECT_BASE`, `RPI_ENV` and
+   `RPI_ENV_SLUG` for an environment deploy, `RPI_BRANCH_NAME`,
+   `RPI_HOSTNAME`, `RPI_HOST_PORT`, and `RPI_COMMIT_SHA` for the commit just
+   fetched — entirely from what it already knows about the project, so the
+   CLI never sends them and the two sides cannot disagree about them. One
+   that does not apply (no hostname configured, a plain project with no
+   environment, or a stored value that is the empty string — `--vars B=` is
+   legal and `branch = "${B}"` reaches the registry empty) is left out
+   rather than exported empty, so a container's own `${RPI_ENV:-prod}`
+   default still works. To learn which services should
+   receive those variables, it asks
+   Docker to list the services declared by the project's own compose file,
+   then generates rpi's compose override: the fixed host port, bind address
+   and restart policy for the public service, plus the `RPI_*` variables on
+   every service of the stack. The same variables are also exported into the
+   environment of every `docker compose` call that reads this project's
+   compose file — this deploy's own service listing, build and start, and
+   later `rpi command`, `rpi start`/`stop`/`restart`,
+   `rpi secrets send --apply`, `rpi rm` and `rpi env destroy`/`reset-data` —
+   so a `${RPI_*}` reference inside the project's own compose file resolves
+   there too. (The label-only calls behind `rpi logs`, `rpi status` and
+   `rpi stats` never read the compose file at all, so they need nothing.)
+   `rpi command` goes one step further and repeats the map as `-e` flags on
+   the exec itself, because the container it enters was started by an earlier
+   deploy and still carries that deploy's values; see `flows/commands.md`.
+   - *Old agent*: injecting `RPI_*` is a capability the agent advertises
+     (`runtime-vars`, agent `>= 0.27.0`). It is deliberately not required —
+     against an older agent the CLI prints one warning and deploys anyway,
+     just with no `RPI_*` reaching any container, because the alternative is
+     refusing a working deploy over something the configuration cannot even
+     express (`flows/connect.md`).
    - *Failure*: a git error, or the fetch stage exceeding its timeout, fails
-     the deploy right here. Nothing has been built or started, so whatever
-     was already running from a previous deploy is untouched.
+     the deploy right here. A compose file that cannot be parsed fails the
+     service listing and therefore the deploy, before anything is built —
+     silently dropping a variable would be worse than an explicit error, and
+     the same unparsable file would fail `build` moments later anyway.
+     Either way nothing has been built or started, so whatever was already
+     running from a previous deploy is untouched.
 6. **Build** — runs `docker compose build` against the fetched checkout.
    Builds across different projects share a limited, agent-wide pool of
    build slots, so the Pi never builds many projects' images at once.
@@ -192,9 +229,15 @@ stateDiagram-v2
 - `crates/application/src/deploy.rs` — the deploy use case: runs fetch →
   build → start → health → route → on_create (environment deploys only) →
   gc in order, emits the stage/log events the CLI renders, and records the
-  final status. The `on_create` stage itself, and the pre-queue
-  `environment`-block guards in `crates/bin/src/agent/http.rs`'s
-  `create_deployment`, are covered in full in `flows/environments.md`.
+  final status. It also assembles the `RPI_*` variables and the service list
+  for the override, between injecting secrets and building. The `on_create`
+  stage itself, and the pre-queue `environment`-block guards in
+  `crates/bin/src/agent/http.rs`'s `create_deployment`, are covered in full
+  in `flows/environments.md`.
+- `crates/domain/src/runtimevars.rs` — derives the `RPI_*` variables a
+  deploy exports from the project's registry row and the commit just
+  fetched; a value that does not apply is left out rather than exported
+  empty.
 - `crates/application/src/scheduler.rs` — the per-project deploy queue:
   starts a deploy immediately if the project is idle, otherwise queues it; a
   newer queued request supersedes the one waiting; drives cancel — checking the
@@ -208,8 +251,15 @@ stateDiagram-v2
   and allocates its host port on first deploy; the port stays stable across
   every later redeploy of that project.
 - `crates/infrastructure/src/docker.rs` — runs `docker compose build` and
-  `docker compose up -d` for the build and start stages (it also backs
-  other, non-deploy commands not covered by this document).
+  `docker compose up -d` for the build and start stages, and its `services`
+  method lists the stack's services beforehand (`compose config --services`)
+  — deliberately over a file chain without rpi's own override, so a service
+  left over in it from a previous deploy is not counted and then re-created
+  as a phantom. Every compose invocation for a stack is spawned with that
+  stack's `RPI_*` map in its process environment, which is what makes
+  `${RPI_*}` interpolate inside the project's own compose file; `exec`
+  additionally repeats the map as `-e` flags. (It also backs other,
+  non-deploy commands not covered by this document.)
 - `crates/infrastructure/src/health.rs` — the health stage: tries a
   Docker-declared healthcheck first, then an HTTP probe, then a plain TCP
   connect, polling until one passes or the timeout expires.
@@ -222,8 +272,16 @@ stateDiagram-v2
   LAN-exposed projects; it does not allocate or manage ports (that's
   `repo.rs`).
 - `crates/infrastructure/src/overrides.rs` — writes rpi's own compose
-  override (bind address, stable host port, restart policy) that the
+  override (bind address, stable host port and restart policy for the public
+  service, plus the `RPI_*` variables on every discovered service) that the
   build/start stages layer on top of the project's own compose file.
+  `environment` is emitted as a mapping, never a sequence, so compose merges
+  it key-wise and the generated override — last in the file chain — wins over
+  a same-named key in the project's own file. The public service is written
+  unconditionally, because its port mapping is the one thing a deploy cannot
+  work without even if discovery came back empty; a service with an empty
+  variable map is left out of the file entirely rather than emitted with a
+  bare `environment: {}`.
 - `crates/infrastructure/src/history.rs` (`sweep_interrupted` only) — marks
   any deployment left `queued` or `running` as `interrupted` when the agent
   restarts; its other role, deployment-history retention, is covered in
@@ -236,8 +294,11 @@ stateDiagram-v2
   deployment's log as its history record's tail, which is what a viewer
   gets instead once that deployment has finished.
 - `crates/bin/src/cli/commands.rs` — the CLI side of `rpi deploy` and `rpi
-  deploy --cancel`: submits the request, follows the SSE stream, renders
-  the staged pipeline, and prints the final result.
+  deploy --cancel`: resolves the local configuration, gates `runtime-vars`
+  degradably (the return value is deliberately discarded — the deploy runs
+  either way, the gate exists only to emit the one-shot warning), submits the
+  request, follows the SSE stream, renders the staged pipeline, and prints
+  the final result.
 - `crates/bin/src/cli/sourcekey.rs` — the deploy-key preflight run before
   submitting a deploy for an SSH-remote repo: asks the agent whether it can
   read the repo, and on denial either auto-registers a deploy key via the

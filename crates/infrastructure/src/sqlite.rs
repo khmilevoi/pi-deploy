@@ -59,6 +59,7 @@ fn migrations() -> Migrations<'static> {
         ALTER TABLE projects ADD COLUMN last_success_at INTEGER;
         "#,
         ),
+        M::up("ALTER TABLE projects ADD COLUMN last_commit_sha TEXT;"),
     ])
 }
 

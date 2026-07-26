@@ -44,7 +44,10 @@ pub struct SourceSection {
     pub branch: String,
 }
 
-fn default_branch() -> String {
+/// Also the resolver's fallback when neither the base file nor the overlay
+/// spells out `[source].branch` but `${env.slug}` still has to be derived
+/// from it.
+pub(crate) fn default_branch() -> String {
     "main".into()
 }
 
@@ -234,8 +237,21 @@ fn validate_expect(expect: &str) -> Result<(), String> {
 }
 
 impl RpiToml {
+    /// The text entry point, kept as the counterpart of `from_value` and as
+    /// the shape the rpi.toml tests exercise. The resolver deliberately does
+    /// not use it: it must substitute `${...}` into the raw value tree before
+    /// anything is deserialized, so it parses the text itself and hands the
+    /// substituted tree to `from_value`. Hence no production caller today —
+    /// the same reason `RpiTomlOverlay::load` carries this allow.
+    #[allow(dead_code)]
     pub fn parse(text: &str) -> anyhow::Result<RpiToml> {
-        let parsed: RpiToml = toml::from_str(text)?;
+        RpiToml::from_value(toml::from_str(text)?)
+    }
+
+    /// Same checks as `parse`, but starting from an already-parsed (and,
+    /// in the resolver's case, already-substituted) document.
+    pub fn from_value(value: toml::Value) -> anyhow::Result<RpiToml> {
+        let parsed: RpiToml = value.try_into()?;
         if parsed.schema != 1 {
             anyhow::bail!(
                 "unsupported rpi.toml schema {} (this rpi supports schema 1)",

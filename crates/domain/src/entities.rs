@@ -284,6 +284,10 @@ pub struct Project {
     pub on_create_done: bool,
     /// Timestamp (unix seconds) of the most recent successful deploy.
     pub last_success_at: Option<i64>,
+    /// Commit sha of the most recent successful deploy. Feeds
+    /// `RPI_COMMIT_SHA` outside a deploy (`rpi command`, `rpi restart`),
+    /// where no fetch has just happened to supply one.
+    pub last_commit_sha: Option<String>,
 }
 
 /// Branch or specific commit-sha (§4).
@@ -455,6 +459,11 @@ pub struct ComposeStack {
     pub workdir: PathBuf,
     pub compose_file: PathBuf,
     pub override_file: PathBuf,
+    /// `RPI_*` runtime variables. Exported into the environment of every
+    /// `docker compose` invocation for this stack, so `${RPI_*}` interpolates
+    /// inside the project's own compose file, and passed as `-e` flags on
+    /// `exec`. Empty for call paths that do not need them.
+    pub env: BTreeMap<String, String>,
 }
 
 /// Live container metrics of one compose service (`rpi stats`, v0.4 design §4).

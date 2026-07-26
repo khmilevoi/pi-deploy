@@ -80,7 +80,7 @@ enum Cmd {
         /// Deploy/operate an environment defined by rpi.<env>.toml
         #[arg(long)]
         env: Option<String>,
-        /// Overlay variables, e.g. --vars BRANCH_NAME=feature/login (repeatable)
+        /// Configuration variables, e.g. --vars BRANCH_NAME=feature/login (repeatable; --env not required)
         #[arg(long = "vars")]
         vars: Vec<String>,
         #[command(flatten)]
@@ -117,7 +117,7 @@ enum Cmd {
         /// Deploy/operate an environment defined by rpi.<env>.toml
         #[arg(long)]
         env: Option<String>,
-        /// Overlay variables, e.g. --vars BRANCH_NAME=feature/login (repeatable)
+        /// Configuration variables, e.g. --vars BRANCH_NAME=feature/login (repeatable; --env not required)
         #[arg(long = "vars")]
         vars: Vec<String>,
         #[command(flatten)]
@@ -221,12 +221,27 @@ enum EnvCmd {
         /// All environments on the agent, not only this project's
         #[arg(long)]
         all: bool,
+        // Deliberately NOT `conflicts_with = "all"`: the error the filtered
+        // form raises points at `--all`, and appending it to the failing
+        // command must work rather than trade one error for another.
+        /// Configuration variables, e.g. --vars BRANCH_NAME=feature/login (repeatable; only needed to resolve ./rpi.toml, so ignored with --all)
+        #[arg(long = "vars")]
+        vars: Vec<String>,
         #[command(flatten)]
         connect: cli::config::ConnectOpts,
     },
     /// Destroy an environment: stack, volumes, ingress, DNS, secrets, registry
     Destroy {
-        env: String,
+        /// Environment name from rpi.<env>.toml (resolves the overlay)
+        env: Option<String>,
+        /// Full environment key from `rpi env ls`; reads no config file
+        // Named `full_key`/`--full-key`, not `--key`: `ConnectOpts::key` (the
+        // flattened `connect` field below) already owns the literal `--key`
+        // flag (SSH private key path), and clap rejects two arguments with
+        // the same id/long name in one command outright.
+        #[arg(long = "full-key", conflicts_with_all = ["env", "vars"])]
+        full_key: Option<String>,
+        /// Configuration variables, e.g. --vars BRANCH_NAME=feature/login (repeatable; resolves <env> the way the deploy did)
         #[arg(long = "vars")]
         vars: Vec<String>,
         #[arg(long)]
@@ -236,7 +251,16 @@ enum EnvCmd {
     },
     /// Remove the environment's volumes and re-run on_create on next deploy
     ResetData {
-        env: String,
+        /// Environment name from rpi.<env>.toml (resolves the overlay)
+        env: Option<String>,
+        /// Full environment key from `rpi env ls`; reads no config file
+        // Named `full_key`/`--full-key`, not `--key`: `ConnectOpts::key` (the
+        // flattened `connect` field below) already owns the literal `--key`
+        // flag (SSH private key path), and clap rejects two arguments with
+        // the same id/long name in one command outright.
+        #[arg(long = "full-key", conflicts_with_all = ["env", "vars"])]
+        full_key: Option<String>,
+        /// Configuration variables, e.g. --vars BRANCH_NAME=feature/login (repeatable; resolves <env> the way the deploy did)
         #[arg(long = "vars")]
         vars: Vec<String>,
         #[arg(long)]
@@ -250,8 +274,10 @@ enum EnvCmd {
 enum ConfigCmd {
     /// Print the resolved rpi.toml (with --env: base + overlay merged).
     Show {
+        /// Resolve an environment defined by rpi.<env>.toml
         #[arg(long)]
         env: Option<String>,
+        /// Configuration variables, e.g. --vars BRANCH_NAME=feature/login (repeatable; --env not required)
         #[arg(long = "vars")]
         vars: Vec<String>,
     },
@@ -267,7 +293,7 @@ enum SecretsCmd {
         /// Deploy/operate an environment defined by rpi.<env>.toml
         #[arg(long)]
         env: Option<String>,
-        /// Overlay variables, e.g. --vars BRANCH_NAME=feature/login (repeatable)
+        /// Configuration variables, e.g. --vars BRANCH_NAME=feature/login (repeatable; --env not required)
         #[arg(long = "vars")]
         vars: Vec<String>,
         #[command(flatten)]
@@ -278,7 +304,7 @@ enum SecretsCmd {
         /// Deploy/operate an environment defined by rpi.<env>.toml
         #[arg(long)]
         env: Option<String>,
-        /// Overlay variables, e.g. --vars BRANCH_NAME=feature/login (repeatable)
+        /// Configuration variables, e.g. --vars BRANCH_NAME=feature/login (repeatable; --env not required)
         #[arg(long = "vars")]
         vars: Vec<String>,
         #[command(flatten)]
@@ -588,26 +614,28 @@ async fn run() -> anyhow::Result<()> {
             cmd: ConfigCmd::Show { env, vars },
         } => cli::commands::config_show(env, vars).await,
         Cmd::Env {
-            cmd: EnvCmd::Ls { all, connect },
-        } => cli::envcmds::env_ls(all, connect).await,
+            cmd: EnvCmd::Ls { all, vars, connect },
+        } => cli::envcmds::env_ls(all, vars, connect).await,
         Cmd::Env {
             cmd:
                 EnvCmd::Destroy {
                     env,
+                    full_key,
                     vars,
                     yes,
                     connect,
                 },
-        } => cli::envcmds::env_destroy(env, vars, yes, connect).await,
+        } => cli::envcmds::env_destroy(env, full_key, vars, yes, connect).await,
         Cmd::Env {
             cmd:
                 EnvCmd::ResetData {
                     env,
+                    full_key,
                     vars,
                     yes,
                     connect,
                 },
-        } => cli::envcmds::env_reset_data(env, vars, yes, connect).await,
+        } => cli::envcmds::env_reset_data(env, full_key, vars, yes, connect).await,
     }
 }
 
@@ -991,6 +1019,28 @@ mod tests {
             }
             _ => panic!("expected agent update"),
         }
+    }
+
+    #[test]
+    fn env_ls_takes_vars_and_still_composes_with_all() {
+        let cli = Cli::try_parse_from(["rpi", "env", "ls", "--vars", "BRANCH_NAME=feature/login"])
+            .unwrap();
+        match cli.cmd.unwrap() {
+            Cmd::Env {
+                cmd: EnvCmd::Ls { all, vars, .. },
+            } => {
+                assert!(!all);
+                assert_eq!(vars, vec!["BRANCH_NAME=feature/login".to_string()]);
+            }
+            _ => panic!("expected env ls"),
+        }
+        // The failure of the filtered form points at --all, so appending it
+        // to the failing command must parse rather than trade one error for
+        // another.
+        assert!(
+            Cli::try_parse_from(["rpi", "env", "ls", "--vars", "A=1", "--all"]).is_ok(),
+            "--all must stay composable with --vars"
+        );
     }
 
     #[test]

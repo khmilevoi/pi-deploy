@@ -4,7 +4,7 @@ set -euo pipefail
 # Environment-overlays spec, negative paths. Local overlay resolution must
 # fail before any agent contact for: a missing overlay file (with a hint
 # listing the overlays that do exist), an invalid or reserved --env name,
-# --vars misuse (without --env, or against a non-parameterized overlay), an
+# a --vars key nothing references (with and without --env), an
 # on_create command absent from the merged [commands], an overlay silently
 # inheriting the base [ingress].hostname (production-route hijack), and a
 # base rpi.toml whose project name contains the reserved '--'. Agent-side:
@@ -28,11 +28,13 @@ assert_log bad-env-name.log "environment name 'BAD_NAME' must match"
 expect_fail reserved-env-name.log rpi config show --env destroy
 assert_log reserved-env-name.log "environment name 'destroy' is reserved"
 
-expect_fail vars-without-env.log rpi config show --vars BRANCH_NAME=main
-assert_log vars-without-env.log '--vars requires --env'
+# --vars no longer requires --env; what is still an error either way is a
+# key no field references, named so a typo cannot pass silently.
+expect_fail vars-unreferenced.log rpi config show --vars BRANCH_NAME=main
+assert_log vars-unreferenced.log "variable 'BRANCH_NAME' is never referenced in rpi.toml"
 
-expect_fail vars-not-parameterized.log rpi config show --env fail --vars BRANCH_NAME=main
-assert_log vars-not-parameterized.log 'rpi.fail.toml is not parameterized'
+expect_fail vars-unreferenced-env.log rpi config show --env fail --vars BRANCH_NAME=main
+assert_log vars-unreferenced-env.log 'never referenced in rpi.toml or rpi.fail.toml'
 
 expect_fail on-create-undeclared.log rpi config show --env badcmd
 assert_log on-create-undeclared.log "on_create: command 'ghost' is not declared"

@@ -24,5 +24,5 @@ timeout = "30s"
 # prove the CLI streams everything untruncated; fail-lines proves output still
 # arrives when the run fails and that the in-container exit code propagates.
 [commands]
-echo-lines = ["sh", "-c", "i=1; while [ $i -le 30 ]; do echo line-$i; i=$((i+1)); done; long=; i=1; while [ $i -le 200 ]; do long=${long}x; i=$((i+1)); done; echo tail-$long"]
+echo-lines = ["sh", "-c", "i=1; while [ $i -le 30 ]; do echo line-$i; i=$((i+1)); done; long=; i=1; while [ $i -le 200 ]; do long=$${long}x; i=$((i+1)); done; echo tail-$long"]
 fail-lines = ["sh", "-c", "echo before-failure; exit 7"]

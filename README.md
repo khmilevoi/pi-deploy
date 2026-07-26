@@ -51,6 +51,7 @@
 - **Fast install** — `npm install -g rpi-deploy` downloads a checksum-verified prebuilt binary (Windows x64, Linux x64/aarch64) in seconds, falling back to a source build elsewhere. A no-npm `install.sh` one-liner bootstraps binary-only hosts.
 - **Client-triggered updates** — `rpi upgrade` brings the board's agent up to your CLI's version over the existing SSH + sudo path (download → SHA-256 verify → atomic swap → restart), no manual SSH session required.
 - **Environment overlays** — `rpi deploy --env <name>` deploys a project's shared `test` environment or an ephemeral per-branch preview from an `rpi.<env>.toml` overlay next to the base `rpi.toml`, with its own hostname, an optional TTL that self-destructs it, and a one-time `on_create` hook; `rpi env ls/destroy/reset-data` manage the deployed set.
+- **Configuration variables** — any string in `rpi.toml` can reference `${YOUR_VAR}` from `--vars`, or a resolver input like `${git.branch}`/`${env.slug}`; every container also gets the `RPI_*` runtime set (project, environment, branch, hostname, host port, commit sha) without configuring anything.
 
 ## Quick Start
 
@@ -100,9 +101,9 @@ That's it — `rpi ls` shows the project, its host port, and its public hostname
 | `rpi secrets send [--apply] [--env <name> --vars K=V]` | Send the env file and secret files (encrypted at rest) |
 | `rpi secrets ls [--env <name> --vars K=V]` | List stored env keys and file paths (values are never transmitted) |
 | `rpi config show [--env <name> --vars K=V]` | Print the resolved `rpi.toml`, overlay merged in, without contacting the agent |
-| `rpi env ls [--all]` | List deployed environments for this project, or every environment with `--all` |
-| `rpi env destroy <name> [--vars K=V] [--yes]` | Tear down an environment: stack, volumes, ingress route, DNS, secrets, registry row |
-| `rpi env reset-data <name> [--vars K=V] [--yes]` | Wipe an environment's containers and volumes; the next deploy re-runs `on_create` |
+| `rpi env ls [--all] [--vars K=V]` | List deployed environments for this project, or every environment with `--all` |
+| `rpi env destroy <name>\|--full-key <key> [--vars K=V] [--yes]` | Tear down an environment: stack, volumes, ingress route, DNS, secrets, registry row |
+| `rpi env reset-data <name>\|--full-key <key> [--vars K=V] [--yes]` | Wipe an environment's containers and volumes; the next deploy re-runs `on_create` |
 | `rpi setup` | Wizard: server profile + SSH key + client config |
 | `rpi init` | Wizard: generate `rpi.toml` in the current project |
 | `rpi agent setup` | Bootstrap the agent on the Pi (run with `sudo`; idempotent) |
@@ -321,14 +322,38 @@ service = "server"                    # optional; omitted => ingress service
 - `rpi command` (no name) lists the deployed commands; extra args after `--` are appended to the declared argv. The remote exit code becomes the `rpi` exit code. Ctrl+C detaches and best-effort kills the run.
 - Output streams to stdout line by line as the command runs — complete and untruncated, with no pane or tail window — so `rpi command migrate > migrate.log` captures exactly what ran. Only the closing verdict goes to stderr. (v0.25 removed `--full`, which existed for the old windowed pane — see [the migration note](docs/migration-command-full-flag.md).)
 
+## Configuration Variables
+
+Any string field of `rpi.toml` can carry a `${...}` reference. Three namespaces, told apart by syntax alone:
+
+```toml
+[source]
+branch = "${BRANCH_NAME}"                        # --vars BRANCH_NAME=feature/login
+
+[ingress]
+hostname = "${env.slug}.preview.example.com"     # resolver input; env.* needs --env
+
+[commands]
+backup = "sh -c 'tar -C $${HOME} -czf /b.tgz .'" # $${ is a literal ${, left for the shell
+```
+
+- `${NAME}` — a **user variable** from `--vars NAME=VALUE` (repeatable). Names match `^[A-Z][A-Z0-9_]*$`; nothing is special-cased. `--vars` works with or without `--env`, and a key nothing references is an error, so a typo can't pass silently.
+- `${ns.field}` — a **resolver input**: `${git.branch}`, `${git.sha}`, `${git.short_sha}`, and (with `--env`) `${env.name}`, `${env.slug}`. `${git.*}` is read lazily, only when referenced, so a config that uses none still works outside a repository; a detached `HEAD` is an error telling you to pass the branch via `--vars` rather than silently becoming `HEAD`.
+- `RPI_*` — **runtime variables**, injected by the agent into every container and into `rpi command`'s exec: `RPI_PROJECT`, `RPI_PROJECT_BASE`, `RPI_ENV`, `RPI_ENV_SLUG`, `RPI_BRANCH_NAME`, `RPI_HOSTNAME`, `RPI_HOST_PORT`, `RPI_COMMIT_SHA`. They exist only at runtime — writing `${RPI_...}` in `rpi.toml` is an error — but `${RPI_*}` interpolates in your own `docker-compose.yml`. `rpi config show` prints them as a `[runtime]` preview. Needs an agent `>= 0.27.0`; an older one still deploys, it just injects nothing.
+
+`${...}` is not allowed in `[project].name` (the project key must stay static). `source.branch` is resolved first, `${env.slug}` derives from the result, then every other field is resolved; substituted values are validated afterwards, which is why a raw branch name in `ingress.hostname` fails the DNS check and `${env.slug}` exists.
+
 ## Environments
 
 An overlay file `rpi.<env>.toml` next to `rpi.toml` deploys the same project under a distinct key — a shared `test` environment, or an ephemeral per-branch preview — without duplicating the whole config:
 
 ```toml
 # rpi.preview.toml
+[source]
+branch = "${BRANCH_NAME}"
+
 [ingress]
-hostname = "${RPI_ENV_SLUG}.preview.example.com"
+hostname = "${env.slug}.preview.example.com"
 
 [environment]
 ttl = "72h"                 # optional; the reaper destroys it once expired
@@ -339,9 +364,11 @@ on_create = "migrate"       # optional; runs once, after the first successful he
 rpi deploy --env preview --vars BRANCH_NAME=feature/login
 ```
 
-- Only `source.branch` and `ingress.hostname` may reference `${BRANCH_NAME}`/`${RPI_ENV_SLUG}` (the branch name lower-cased, sanitized to `[a-z0-9-]`, truncated to 30 chars); an overlay that doesn't reference either rejects `--vars`, and one that does requires it.
-- The overlay merges onto the base field by field — scalars replace, tables merge key by key, `[commands]` and array fields replace wholesale, and an explicit `""` resets a field to unset. The deployed project key becomes `<base>--<env>` (or `<base>--<env>--<slug>` when `${RPI_ENV_SLUG}` was substituted), and its hostname must differ from the base project's.
-- `rpi config show --env preview --vars BRANCH_NAME=feature/login` prints the fully resolved config without touching the agent — the way to check what a deploy would actually send.
+- The overlay merges onto the base field by field — scalars replace, tables merge key by key, `[commands]` and array fields replace wholesale, and an explicit `""` resets a field to unset. The deployed project key becomes `<base>--<env>`, or `<base>--<env>--<slug>` when the config references `${env.slug}`, and its hostname must differ from the base project's.
+- `rpi config show --env preview --vars BRANCH_NAME=feature/login` prints the fully resolved config, plus a `[runtime]` preview of the `RPI_*` variables, without touching the agent — the way to check what a deploy would actually send.
+- `rpi env destroy`/`reset-data` take the same `<env>` and `--vars` as the deploy; when the overlay is gone or no longer resolves, `--full-key <key>` (from `rpi env ls`) targets an environment without reading any config file.
+- `rpi env ls` without `--all` resolves the base `rpi.toml` just to learn the project name it filters by, so it takes `--vars` too; `rpi env ls --all` reads no config file at all and is the way out if that resolution fails.
+- When `source.branch` is computed from a variable but nothing references `${env.slug}`, the resolver warns that the key stays `<base>--<env>` — every branch deploying that environment would share it.
 - With no TTL, an environment lives until `rpi env destroy` removes it. With one, the agent's reaper tears it down on its own once it's past due (`agent.toml`'s `[environments] reap_interval`, default 1h) — as long as it isn't mid-deploy.
 - `on_create` runs exactly once per environment key, after the first successful health check; `rpi env reset-data` clears the flag so the next deploy re-runs it against a clean database.
 
@@ -699,6 +726,7 @@ The CLI warns when its version differs from the agent's. Update both sides to th
 - [Migration: `pi` → `rpi` (v0.5 → v0.6)](docs/migration-v0.5-to-v0.6.md)
 - [Migration: `[env]` → `[secrets]`](docs/migration-env-to-secrets.md)
 - [Migration: `rpi command --full` removed (v0.25)](docs/migration-command-full-flag.md)
+- [Migration: configuration variables reach every field (v0.27)](docs/migration-config-variables.md)
 - [Release notes](https://github.com/khmilevoi/rpi-deploy/releases) — full version history
 
 ## License

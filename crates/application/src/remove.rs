@@ -72,6 +72,9 @@ impl RemoveProject {
                 workdir,
                 compose_file,
                 override_file: self.overrides.path(project),
+                // No deploy is in flight, so RPI_COMMIT_SHA comes from the
+                // registry's record of the last successful one.
+                env: pi_domain::runtimevars::rpi_vars(&existing, None),
             };
             self.runtime
                 .down(&stack, remove_volumes, Arc::clone(&log))

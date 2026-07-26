@@ -44,9 +44,20 @@ pub(crate) fn logs_args(project_name: &str, tail: usize, follow: bool) -> Vec<St
     args
 }
 
-pub(crate) fn exec_tail<'a>(service: &'a str, argv: &'a [String]) -> Vec<&'a str> {
-    let mut tail = vec!["exec", "-T", service];
-    tail.extend(argv.iter().map(String::as_str));
+pub(crate) fn exec_tail<'a>(
+    service: &'a str,
+    argv: &'a [String],
+    env: &'a std::collections::BTreeMap<String, String>,
+) -> Vec<String> {
+    let mut tail = vec!["exec".to_string(), "-T".to_string()];
+    // A container started by an earlier deploy carries that deploy's
+    // environment; `-e` makes the exec'd process see current values.
+    for (key, value) in env {
+        tail.push("-e".to_string());
+        tail.push(format!("{key}={value}"));
+    }
+    tail.push(service.to_string());
+    tail.extend(argv.iter().cloned());
     tail
 }
 
@@ -58,6 +69,19 @@ pub(crate) fn file_chain(stack: &ComposeStack) -> Vec<PathBuf> {
     }
     if stack.override_file.exists() {
         files.push(stack.override_file.clone());
+    }
+    files
+}
+
+/// Files consulted when *listing* services, as opposed to acting on them.
+/// The generated override is excluded on purpose: it is the file about to be
+/// rewritten, and a service it still carries from a previous deploy would be
+/// re-created as a phantom with an `environment:` block and no image.
+pub(crate) fn discovery_chain(stack: &ComposeStack) -> Vec<PathBuf> {
+    let mut files = vec![stack.compose_file.clone()];
+    let repo_override = stack.workdir.join("docker-compose.override.yml");
+    if repo_override.exists() && repo_override != stack.compose_file {
+        files.push(repo_override);
     }
     files
 }
@@ -212,6 +236,10 @@ impl DockerComposeRuntime {
         // emits ordinary newline-terminated lines instead. Applies uniformly
         // to every subcommand; a no-op for ones that don't build anything.
         cmd.env("BUILDKIT_PROGRESS", "plain");
+        // Compose gives the shell environment precedence over `.env`, so this
+        // makes `${RPI_*}` interpolate inside the project's compose file
+        // without touching the secrets bundle that owns `.env`.
+        cmd.envs(&stack.env);
         cmd
     }
 }
@@ -237,6 +265,24 @@ impl ContainerRuntime for DockerComposeRuntime {
         cmd.args(["compose", "-p", project_name, "ps", "--format", "json"]);
         let out = run_capture(cmd).await.map_err(DomainError::Runtime)?;
         Ok(parse_ps_json(&out))
+    }
+
+    async fn services(&self, stack: &ComposeStack) -> Result<Vec<String>, DomainError> {
+        let mut cmd = Command::new("docker");
+        cmd.args(compose_args(
+            &stack.project_name,
+            &discovery_chain(stack),
+            &["config", "--services"],
+        ));
+        cmd.current_dir(&stack.workdir);
+        cmd.envs(&stack.env);
+        let out = run_capture(cmd).await.map_err(DomainError::Runtime)?;
+        Ok(out
+            .lines()
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .map(str::to_string)
+            .collect())
     }
 
     async fn prune_images(&self, log: Arc<dyn LogSink>) -> Result<(), DomainError> {
@@ -320,7 +366,9 @@ impl ContainerRuntime for DockerComposeRuntime {
         log: Arc<dyn LogSink>,
     ) -> Result<i32, DomainError> {
         log.line(&format!("docker compose exec -T {service} ..."));
-        run_streamed_code(self.compose(stack, &exec_tail(service, argv)), log)
+        let tail = exec_tail(service, argv, &stack.env);
+        let tail: Vec<&str> = tail.iter().map(String::as_str).collect();
+        run_streamed_code(self.compose(stack, &tail), log)
             .await
             .map_err(DomainError::Runtime)
     }
@@ -341,7 +389,19 @@ mod tests {
             workdir: workdir.to_path_buf(),
             compose_file: workdir.join("docker-compose.yml"),
             override_file: PathBuf::from("/var/lib/rpi/overrides/rateme.yml"),
+            env: Default::default(),
         }
+    }
+
+    fn stack_with_env(workdir: &std::path::Path) -> ComposeStack {
+        let mut s = stack(workdir);
+        s.env = [
+            ("RPI_PROJECT".to_string(), "rateme".to_string()),
+            ("RPI_BRANCH_NAME".to_string(), "main".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        s
     }
 
     #[test]
@@ -363,11 +423,37 @@ mod tests {
             workdir: dir.path().to_path_buf(),
             compose_file: dir.path().join("docker-compose.yml"),
             override_file: pi_override.clone(),
+            env: Default::default(),
         };
         assert_eq!(
             file_chain(&s),
             vec![s.compose_file.clone(), repo_override, pi_override,]
         );
+    }
+
+    #[test]
+    fn service_discovery_ignores_the_generated_override() {
+        // The generated override is what we are about to write; including it
+        // would let a service left over from a previous deploy reappear in
+        // the list and be re-created as a phantom with no image.
+        let dir = tempfile::tempdir().unwrap();
+        let repo_override = dir.path().join("docker-compose.override.yml");
+        std::fs::write(&repo_override, "services: {}").unwrap();
+        let pi_override = dir.path().join("pi-override.yml");
+        std::fs::write(&pi_override, "services: {}").unwrap();
+        let s = ComposeStack {
+            project_name: "rateme".into(),
+            workdir: dir.path().to_path_buf(),
+            compose_file: dir.path().join("docker-compose.yml"),
+            override_file: pi_override,
+            env: Default::default(),
+        };
+        assert_eq!(
+            discovery_chain(&s),
+            vec![s.compose_file.clone(), repo_override],
+            "the pi override must not take part in discovery"
+        );
+        assert!(file_chain(&s).len() > discovery_chain(&s).len());
     }
 
     #[test]
@@ -398,6 +484,23 @@ mod tests {
     }
 
     #[test]
+    fn compose_exports_the_runtime_environment_to_the_process() {
+        let dir = tempfile::tempdir().unwrap();
+        let cmd = DockerComposeRuntime.compose(&stack_with_env(dir.path()), &["up", "-d"]);
+        let envs: HashMap<String, String> = cmd
+            .as_std()
+            .get_envs()
+            .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v?.to_str()?.to_string())))
+            .collect();
+        assert_eq!(envs["RPI_PROJECT"], "rateme");
+        assert_eq!(envs["RPI_BRANCH_NAME"], "main");
+        assert_eq!(
+            envs["BUILDKIT_PROGRESS"], "plain",
+            "the existing export must survive"
+        );
+    }
+
+    #[test]
     fn prune_args_shapes() {
         assert_eq!(
             prune_images_args(),
@@ -419,7 +522,7 @@ mod tests {
     fn exec_tail_shape() {
         let argv = strings(&["node", "scripts/create-invite.js", "--email", "x@y.com"]);
         assert_eq!(
-            exec_tail("web", &argv),
+            exec_tail("web", &argv, &Default::default()),
             vec![
                 "exec",
                 "-T",
@@ -429,6 +532,37 @@ mod tests {
                 "--email",
                 "x@y.com"
             ]
+        );
+    }
+
+    #[test]
+    fn exec_passes_the_runtime_environment_as_e_flags() {
+        let env: std::collections::BTreeMap<String, String> = [
+            ("RPI_BRANCH_NAME".to_string(), "main".to_string()),
+            ("RPI_PROJECT".to_string(), "rateme".to_string()),
+        ]
+        .into_iter()
+        .collect();
+        let argv = strings(&["node", "seed.js"]);
+        assert_eq!(
+            exec_tail("web", &argv, &env),
+            vec![
+                "exec",
+                "-T",
+                "-e",
+                "RPI_BRANCH_NAME=main",
+                "-e",
+                "RPI_PROJECT=rateme",
+                "web",
+                "node",
+                "seed.js",
+            ],
+            "flags precede the service name, in BTreeMap order"
+        );
+        assert_eq!(
+            exec_tail("web", &argv, &Default::default()),
+            vec!["exec", "-T", "web", "node", "seed.js"],
+            "an empty map must produce the original argv shape"
         );
     }
 

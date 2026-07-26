@@ -13,6 +13,7 @@ sequenceDiagram
     participant API as Agent HTTP API
     participant Store as Secret store (age-encrypted)
     participant Runtime as Container runtime
+    participant Ovr as Compose override store
     participant Dep as Deploy use case
     participant Co as Repo checkout
 
@@ -23,6 +24,8 @@ sequenceDiagram
     alt --apply flag set
         API->>API: arm log masking with the bundle just received
         API->>Co: write .env + secret files into the existing checkout, .env 0600, files 0644 (or [secrets].file_mode)
+        API->>Runtime: list the stack's services
+        API->>Ovr: rewrite override (port, bind, RPI_* on every service)
         API->>Runtime: up -d (recreate affected containers)
     else no --apply (default)
         Note over API: bundle stored only, nothing injected yet
@@ -47,6 +50,10 @@ sequenceDiagram
    path with no `..`, no leading slash, no backslashes or drive letters, and
    it must not resolve (following any symlink) outside the project root. A
    path that fails this check is rejected on the client; nothing is sent.
+   One name rule applies to the variables themselves: a key beginning with
+   `RPI_` is refused, because that prefix belongs to the runtime variables
+   the agent injects on its own (`flows/deploy.md`) and a secret of the same
+   name would make it ambiguous which value a container ends up seeing.
 
 2. **Protected in transit.** The bundle travels to the agent over the same
    SSH tunnel used for every CLI-to-agent request, so it is never sent in
@@ -71,7 +78,15 @@ sequenceDiagram
      passed `--apply`, the agent writes `.env` and the secret files straight
      into the project's existing checkout and recreates the affected
      containers — using the bundle it already has in memory from the
-     request itself, with no decrypt step involved.
+     request itself, with no decrypt step involved. Because bringing the
+     stack back up regenerates rpi's compose override from scratch, this
+     path re-derives exactly what a deploy would put there — the public
+     service's host port, bind address and restart policy, plus the `RPI_*`
+     runtime variables on every service of the stack (see
+     `flows/deploy.md`) — so applying secrets never strips a container's
+     runtime environment. The commit sha in that environment is the one the
+     registry recorded for the project's last successful deploy; applying
+     secrets does not fetch anything.
    - **Later, on `rpi deploy`.** Every deploy loads whatever is currently
      stored for that project — decrypting it in the process — and writes it
      into the freshly fetched checkout before the stack starts. This is the
@@ -139,9 +154,19 @@ sequenceDiagram
    aborts that write instead of touching the filesystem outside the
    checkout.
 
+9. **Failure: an unparsable compose file blocks `--apply`.** Regenerating
+   the override starts by asking Docker to list the project's services, so a
+   compose file that cannot be parsed fails the apply before anything is
+   recreated, leaving the running containers untouched. The bundle has
+   already been saved and written into the checkout by then, so the next
+   deploy — or a re-run once the compose file parses — picks it up.
+
 ## Source anchors
 
-- `crates/application/src/secrets.rs` — send/list secrets use cases: validates the bundle isn't empty, saves it, and (with `--apply`) re-injects it and restarts the affected containers immediately.
+- `crates/application/src/secrets.rs` — send/list secrets use cases: validates the bundle isn't empty, saves it, and (with `--apply`) re-injects it, asks the container runtime for the stack's services, has the override store regenerate the compose override from those (ports plus the `RPI_*` variables on every discovered service), and restarts the affected containers immediately.
+- `crates/infrastructure/src/overrides.rs` — `FsOverrideStore`, the only writer of the generated compose override. `--apply` rewrites that file from scratch, which is why this path has to re-derive the full service list and `RPI_*` map rather than patch the ports alone; the file's contents are covered in `flows/deploy.md`.
+- `crates/domain/src/runtimevars.rs` — the `RPI_*` map `--apply` writes into the override, derived from the registry row. With no deploy in flight, `RPI_COMMIT_SHA` is the project's last successfully deployed sha.
+- `crates/bin/src/cli/commands.rs` (`collect_secrets` only) — reads the local env file and secret files, rejects any path escaping the project root, and refuses a secret key using the reserved `RPI_` prefix, so a stored secret can never contend with the agent-injected runtime variable of the same name.
 - `crates/bin/src/cli/rpitoml.rs` (`SecretsSection` only) — the `[secrets]` table in `rpi.toml`: names the local env file `rpi secrets send` reads (`[secrets].env`, default `.env`), the extra files it reads verbatim (`[secrets].files`), and the optional `[secrets].file_mode` override, parsed and validated by `pi_domain::secretmode`.
 - `crates/application/src/mask.rs` — `MaskingSink`: replaces armed secret values (6+ characters) with `***KEY***` in every line logged afterward.
 - `crates/infrastructure/src/secrets.rs` — `EncryptedFileStore`: age-encrypts and decrypts the bundle at rest, one file per project, using an agent identity key kept at file mode 0600.

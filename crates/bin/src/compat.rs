@@ -12,9 +12,6 @@ pub enum Policy {
     /// Error out with an update hint.
     Required,
     /// One-shot warning banner, then the caller takes its fallback path.
-    // Forward contract (spec 2026-07-12): no current feature declares
-    // Degradable yet; it exists so a registry line-change can adopt it.
-    #[allow(dead_code)]
     Degradable,
     /// Skip quietly (spec 2026-07-10 mandates this for source-check).
     Silent,
@@ -31,6 +28,7 @@ pub enum Feature {
     Stats,
     Environments,
     SecretModes,
+    RuntimeVars,
 }
 
 impl Feature {
@@ -41,6 +39,7 @@ impl Feature {
         Feature::Stats,
         Feature::Environments,
         Feature::SecretModes,
+        Feature::RuntimeVars,
     ];
 
     /// The string this feature advertises in the `/v1/version` handshake.
@@ -52,6 +51,7 @@ impl Feature {
             Feature::Stats => "stats",
             Feature::Environments => "environments",
             Feature::SecretModes => "secret-modes",
+            Feature::RuntimeVars => "runtime-vars",
         }
     }
 
@@ -64,6 +64,7 @@ impl Feature {
             Feature::Stats => "stats",
             Feature::Environments => "environments",
             Feature::SecretModes => "secret file modes",
+            Feature::RuntimeVars => "runtime variables",
         }
     }
 
@@ -75,6 +76,7 @@ impl Feature {
             Feature::Stats => Policy::Required,
             Feature::Environments => Policy::Required,
             Feature::SecretModes => Policy::Required,
+            Feature::RuntimeVars => Policy::Degradable,
         }
     }
 
@@ -88,6 +90,7 @@ impl Feature {
             Feature::Stats => "0.9.0",
             Feature::Environments => "0.24.0",
             Feature::SecretModes => "0.26.0",
+            Feature::RuntimeVars => "0.27.0",
         }
     }
 
@@ -545,5 +548,38 @@ mod tests {
         assert!(err.contains("container commands"), "{err}");
         assert!(err.contains(">= 0.9.0"), "{err}");
         assert!(err.contains("update the agent on the Pi"), "{err}");
+    }
+
+    #[test]
+    fn runtime_vars_warns_once_on_an_old_agent_without_failing() {
+        let messages = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let sink = {
+            let messages = std::sync::Arc::clone(&messages);
+            Box::new(move |m: &str| messages.lock().unwrap().push(m.to_string()))
+        };
+        let info = VersionInfo {
+            version: "0.26.1".into(),
+            api: "v1".into(),
+            features: Some(vec!["environments".into()]),
+        };
+        let session = CompatSession::with_sink("0.27.0", &info, sink);
+
+        assert!(!session.gate(Feature::RuntimeVars).unwrap());
+        assert!(!session.gate(Feature::RuntimeVars).unwrap());
+
+        let messages = messages.lock().unwrap();
+        assert_eq!(messages.len(), 1, "banner must print once: {messages:?}");
+        assert!(messages[0].contains("0.27.0"), "got: {messages:?}");
+    }
+
+    #[test]
+    fn runtime_vars_is_available_on_a_current_agent() {
+        let info = VersionInfo {
+            version: "0.27.0".into(),
+            api: "v1".into(),
+            features: Some(Feature::advertised()),
+        };
+        let session = CompatSession::with_sink("0.27.0", &info, Box::new(|_| {}));
+        assert!(session.gate(Feature::RuntimeVars).unwrap());
     }
 }
