@@ -179,6 +179,20 @@ pub struct SecretsListResponse {
     /// line rather than guessing a value that host never wrote.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_mode: Option<u32>,
+    /// Absent from agents older than 0.27.0 — the CLI then prints the flat
+    /// list it always printed rather than inventing provenance.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layers: Vec<SecretLayerDto>,
+}
+
+/// One layer of the effective view (secret-groups spec: Attachment and
+/// layering). Names only — a layer never carries values.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretLayerDto {
+    pub label: String,
+    pub revision: u64,
+    pub vars: Vec<String>,
+    pub files: Vec<String>,
 }
 
 /// `PUT /v1/projects/{base}/secret-groups/{group}` (secret-groups spec).

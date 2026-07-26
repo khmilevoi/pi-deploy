@@ -522,9 +522,6 @@ impl ApiClient {
             .await?)
     }
 
-    /// Forward contract (secret-groups spec, plan Task 9): `rpi secrets
-    /// group rm` is the only caller and is not wired until that task.
-    #[allow(dead_code)]
     pub async fn delete_secret_group(
         &self,
         base: &str,

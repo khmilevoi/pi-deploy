@@ -912,6 +912,18 @@ async fn list_secrets_handler(
         keys: stored.keys,
         files: stored.files,
         file_mode: Some(stored.file_mode),
+        layers: stored
+            .layers
+            .into_iter()
+            .map(
+                |(label, revision, vars, files)| crate::proto::SecretLayerDto {
+                    label,
+                    revision,
+                    vars,
+                    files,
+                },
+            )
+            .collect(),
     }))
 }
 
@@ -1377,13 +1389,13 @@ mod tests {
         let head_key_secrets = HeadKeySecrets::new(secrets.clone());
         let send_secrets = SendSecrets::new(
             secrets.clone(),
-            projects,
+            projects.clone(),
             source.clone(),
             FsSecretsWriter::new(),
             overrides,
             runtime,
         );
-        let list_secrets = ListSecrets::new(secrets);
+        let list_secrets = ListSecrets::new(secrets, projects);
         AppState {
             scheduler,
             list,
@@ -2515,6 +2527,76 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["keys"], serde_json::json!([]));
         assert_eq!(json["files"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn effective_secrets_list_reports_layers_without_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = state_with_secret_groups(dir.path());
+        let body = serde_json::json!({
+            "vars": { "SHARED": "group-value" },
+            "expected_revision": 0
+        });
+        let (status, _) = request(
+            app.clone(),
+            put_json("/v1/projects/myapp/secret-groups/common", &body),
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        let (status, json) = request(app, get_req("/v1/projects/myapp/secrets")).await;
+        assert_eq!(status, 200);
+        let labels: Vec<&str> = json["layers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["label"].as_str().unwrap())
+            .collect();
+        assert_eq!(labels, vec!["key"], "no groups declared yet -> key only");
+        assert!(!json.to_string().contains("group-value"));
+    }
+
+    /// The counterpart to `effective_secrets_list_reports_layers_without_values`:
+    /// once "common" is *declared* by a registered project, GET .../secrets
+    /// must report both layers, in deploy order, each with its own raw
+    /// membership (not just the merged winner).
+    #[tokio::test]
+    async fn effective_secrets_list_reports_a_declared_group_layer_in_deploy_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with(dir.path(), Arc::new(ok_source()), Arc::new(ok_runtime()));
+        let mut config = project_with_environment("myapp", None).config;
+        config.secret_groups = vec!["common".into()];
+        state.projects.upsert(&config).await.unwrap();
+        let app = router(state);
+
+        let group_body =
+            serde_json::json!({ "vars": { "SHARED": "shared-value" }, "expected_revision": 0 });
+        let (status, _) = request(
+            app.clone(),
+            put_json("/v1/projects/myapp/secret-groups/common", &group_body),
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        let key_body = serde_json::json!({ "vars": { "OWN": "own-value" } });
+        let (status, _) = request(
+            app.clone(),
+            put_json("/v1/projects/myapp/secrets", &key_body),
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        let (status, json) = request(app, get_req("/v1/projects/myapp/secrets")).await;
+        assert_eq!(status, 200, "{json:?}");
+        assert_eq!(json["keys"], serde_json::json!(["OWN", "SHARED"]));
+        let layers = json["layers"].as_array().unwrap();
+        assert_eq!(layers.len(), 2);
+        assert_eq!(layers[0]["label"], "common");
+        assert_eq!(layers[0]["vars"], serde_json::json!(["SHARED"]));
+        assert_eq!(layers[1]["label"], "key");
+        assert_eq!(layers[1]["vars"], serde_json::json!(["OWN"]));
+        assert!(!json.to_string().contains("shared-value"));
+        assert!(!json.to_string().contains("own-value"));
     }
 
     // The plan's brief text for this test asserts the OLD `/env` routes are

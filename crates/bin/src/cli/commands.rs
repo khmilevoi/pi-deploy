@@ -553,13 +553,115 @@ pub async fn gc(connect: ConnectOpts) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Rows of the effective `rpi secrets ls`: object name, the layer that
+/// supplied the winning value, and whether it shadows an earlier layer.
+/// Later layers win, so the last layer mentioning a name owns it.
+pub fn effective_rows(resp: &crate::proto::SecretsListResponse) -> Vec<(String, String, bool)> {
+    let mut winner: BTreeMap<String, (String, bool)> = BTreeMap::new();
+    for layer in &resp.layers {
+        for name in layer.vars.iter().chain(layer.files.iter()) {
+            let shadows = winner.contains_key(name);
+            winner.insert(name.clone(), (layer.label.clone(), shadows));
+        }
+    }
+    winner
+        .into_iter()
+        .map(|(name, (label, shadows))| (name, label, shadows))
+        .collect()
+}
+
+/// `rpi secrets ls --group`: a group's head — revision, names, digests,
+/// sizes. Never a value (secrets spec: metadata projection).
+pub(crate) fn render_group_head(
+    label: &str,
+    head: &crate::proto::SecretGroupHeadResponse,
+) -> String {
+    let mut out = format!("group '{label}' at revision {}:\n", head.revision);
+    if head.vars.is_empty() && head.files.is_empty() {
+        out.push_str("  (empty)\n");
+        return out;
+    }
+    if !head.vars.is_empty() {
+        out.push_str("env keys:\n");
+        for (name, digest) in &head.vars {
+            out.push_str(&format!("  {name}  {digest}\n"));
+        }
+    }
+    if !head.files.is_empty() {
+        out.push_str("files:\n");
+        for (path, meta) in &head.files {
+            out.push_str(&format!("  {path}  {} B  {}\n", meta.size, meta.digest));
+        }
+    }
+    out
+}
+
+pub async fn secrets_group_ls(
+    env: Option<String>,
+    vars: Vec<String>,
+    connect: ConnectOpts,
+) -> anyhow::Result<()> {
+    let resolved = crate::cli::overlay::resolve(env.as_deref(), &vars)?;
+    let base = resolve_base(&resolved);
+    let AgentConn {
+        tunnel: _tunnel,
+        api,
+        compat,
+    } = crate::cli::connect::connect_agent(connect).await?;
+    compat.gate(crate::compat::Feature::SecretGroups)?;
+
+    let listed = api.list_secret_groups(&base).await?;
+    if listed.groups.is_empty() {
+        output::info(format!("no secret groups for project '{base}'"));
+        return Ok(());
+    }
+    output::heading(format!("secret groups of '{base}':"));
+    for g in &listed.groups {
+        let attached = if g.attached_by.is_empty() {
+            "-".to_string()
+        } else {
+            g.attached_by.join(", ")
+        };
+        println!(
+            "  {}  r{}  {} key(s), {} file(s), {} B  attached: {attached}",
+            g.name, g.revision, g.keys, g.files, g.bytes
+        );
+    }
+    Ok(())
+}
+
+pub async fn secrets_group_rm(
+    name: String,
+    force: bool,
+    env: Option<String>,
+    vars: Vec<String>,
+    connect: ConnectOpts,
+) -> anyhow::Result<()> {
+    pi_domain::secretgroup::validate_group_name(&name)
+        .map_err(|e| anyhow::anyhow!("group name: {e}"))?;
+    let resolved = crate::cli::overlay::resolve(env.as_deref(), &vars)?;
+    let base = resolve_base(&resolved);
+    let AgentConn {
+        tunnel: _tunnel,
+        api,
+        compat,
+    } = crate::cli::connect::connect_agent(connect).await?;
+    compat.gate(crate::compat::Feature::SecretGroups)?;
+
+    api.delete_secret_group(&base, &name, force).await?;
+    output::success(format!("removed secret group '{base}/{name}'"));
+    Ok(())
+}
+
 pub async fn secrets_ls(
+    group: Option<String>,
     env: Option<String>,
     vars: Vec<String>,
     connect: ConnectOpts,
 ) -> anyhow::Result<()> {
     let resolved = crate::cli::overlay::resolve(env.as_deref(), &vars)?;
     let is_env = resolved.env.is_some();
+    let base = resolve_base(&resolved);
     let rpitoml = resolved.rpitoml;
     let project_name = rpitoml.project.name.clone();
 
@@ -573,6 +675,13 @@ pub async fn secrets_ls(
         compat.gate(crate::compat::Feature::Environments)?;
     }
 
+    if let Some(group) = group {
+        compat.gate(crate::compat::Feature::SecretGroups)?;
+        let head = api.head_secret_group(&base, &group).await?;
+        print!("{}", render_group_head(&format!("{base}/{group}"), &head));
+        return Ok(());
+    }
+
     let resp = api.list_secrets(&project_name).await?;
     if resp.keys.is_empty() && resp.files.is_empty() {
         output::info(format!("no secrets stored for project '{project_name}'"));
@@ -581,17 +690,32 @@ pub async fn secrets_ls(
     if let Some(mode) = file_mode_to_print(&resp) {
         output::info(format!("file mode: {mode:04o}"));
     }
-    if !resp.keys.is_empty() {
-        output::heading("env keys:");
-        for key in &resp.keys {
-            println!("  {key}");
+    if resp.layers.is_empty() {
+        // Pre-0.27.0 agent: no provenance to show, print the flat list this
+        // command has always printed.
+        if !resp.keys.is_empty() {
+            output::heading("env keys:");
+            for key in &resp.keys {
+                println!("  {key}");
+            }
         }
+        if !resp.files.is_empty() {
+            output::heading("files:");
+            for file in &resp.files {
+                println!("  {file}");
+            }
+        }
+        return Ok(());
     }
-    if !resp.files.is_empty() {
-        output::heading("files:");
-        for file in &resp.files {
-            println!("  {file}");
-        }
+
+    output::heading(format!("effective secrets for '{project_name}':"));
+    for (name, label, shadows) in effective_rows(&resp) {
+        let suffix = if shadows {
+            " (overrides earlier layer)"
+        } else {
+            ""
+        };
+        println!("  {name}  <- {label}{suffix}");
     }
     Ok(())
 }
@@ -1368,7 +1492,85 @@ seed = "node seed.js"
             keys: vec![],
             files: files.iter().map(|s| s.to_string()).collect(),
             file_mode,
+            layers: vec![],
         }
+    }
+
+    #[test]
+    fn effective_view_marks_shadowed_entries_and_names_the_winning_layer() {
+        let resp = crate::proto::SecretsListResponse {
+            keys: vec!["A".into(), "B".into()],
+            files: vec!["certs/server.pem".into()],
+            file_mode: Some(0o640),
+            layers: vec![
+                crate::proto::SecretLayerDto {
+                    label: "common".into(),
+                    revision: 3,
+                    vars: vec!["A".into(), "B".into()],
+                    files: vec![],
+                },
+                crate::proto::SecretLayerDto {
+                    label: "key".into(),
+                    revision: 2,
+                    vars: vec!["B".into()],
+                    files: vec!["certs/server.pem".into()],
+                },
+            ],
+        };
+
+        let rows = effective_rows(&resp);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], ("A".to_string(), "common".to_string(), false));
+        assert_eq!(
+            rows[1],
+            ("B".to_string(), "key".to_string(), true),
+            "B is supplied by key and shadows common"
+        );
+        assert_eq!(
+            rows[2],
+            ("certs/server.pem".to_string(), "key".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn render_group_head_lists_names_digests_and_sizes_never_values() {
+        let mut vars = BTreeMap::new();
+        vars.insert("DB_PASSWORD".to_string(), "deadbeefcafebabe".to_string());
+        let mut files = BTreeMap::new();
+        files.insert(
+            "certs/server.pem".to_string(),
+            crate::proto::SecretFileHeadDto {
+                size: 512,
+                digest: "0123456789abcdef".to_string(),
+            },
+        );
+        let head = crate::proto::SecretGroupHeadResponse {
+            revision: 4,
+            vars,
+            files,
+            file_mode: Some(0o640),
+        };
+
+        let rendered = render_group_head("myapp/preview", &head);
+        assert!(rendered.contains("myapp/preview"), "{rendered}");
+        assert!(rendered.contains("revision 4"), "{rendered}");
+        assert!(rendered.contains("DB_PASSWORD"), "{rendered}");
+        assert!(rendered.contains("deadbeefcafebabe"), "{rendered}");
+        assert!(rendered.contains("certs/server.pem"), "{rendered}");
+        assert!(rendered.contains("512 B"), "{rendered}");
+        assert!(rendered.contains("0123456789abcdef"), "{rendered}");
+    }
+
+    #[test]
+    fn render_group_head_marks_an_empty_group() {
+        let head = crate::proto::SecretGroupHeadResponse {
+            revision: 0,
+            vars: BTreeMap::new(),
+            files: BTreeMap::new(),
+            file_mode: None,
+        };
+        let rendered = render_group_head("myapp/preview", &head);
+        assert!(rendered.contains("(empty)"), "{rendered}");
     }
 
     #[test]

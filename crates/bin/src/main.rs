@@ -275,6 +275,9 @@ enum SecretsCmd {
     },
     /// List stored env keys and file paths (values are never transmitted)
     Ls {
+        /// Show one group's head instead of the project's effective view
+        #[arg(long)]
+        group: Option<String>,
         /// Deploy/operate an environment defined by rpi.<env>.toml
         #[arg(long)]
         env: Option<String>,
@@ -283,6 +286,11 @@ enum SecretsCmd {
         vars: Vec<String>,
         #[command(flatten)]
         connect: cli::config::ConnectOpts,
+    },
+    /// Manage this project's secret groups
+    Group {
+        #[command(subcommand)]
+        cmd: SecretsGroupCmd,
     },
     /// Push the env file and [secrets].files to a group, or to this project's own bundle
     Push {
@@ -312,6 +320,37 @@ enum SecretsCmd {
         /// Target group (omit to compare against this deploy key's own bundle)
         #[arg(long)]
         group: Option<String>,
+        /// Deploy/operate an environment defined by rpi.<env>.toml
+        #[arg(long)]
+        env: Option<String>,
+        /// Overlay variables, e.g. --vars BRANCH_NAME=feature/login (repeatable)
+        #[arg(long = "vars")]
+        vars: Vec<String>,
+        #[command(flatten)]
+        connect: cli::config::ConnectOpts,
+    },
+}
+
+#[derive(Subcommand)]
+enum SecretsGroupCmd {
+    /// List the base project's secret groups and who attaches them
+    Ls {
+        /// Deploy/operate an environment defined by rpi.<env>.toml
+        #[arg(long)]
+        env: Option<String>,
+        /// Overlay variables, e.g. --vars BRANCH_NAME=feature/login (repeatable)
+        #[arg(long = "vars")]
+        vars: Vec<String>,
+        #[command(flatten)]
+        connect: cli::config::ConnectOpts,
+    },
+    /// Delete a secret group
+    Rm {
+        /// Group name
+        name: String,
+        /// Delete even while a registered project declares it
+        #[arg(long)]
+        force: bool,
         /// Deploy/operate an environment defined by rpi.<env>.toml
         #[arg(long)]
         env: Option<String>,
@@ -560,8 +599,33 @@ async fn run() -> anyhow::Result<()> {
                 },
         } => cli::commands::secrets_send(apply, env, vars, connect).await,
         Cmd::Secrets {
-            cmd: SecretsCmd::Ls { env, vars, connect },
-        } => cli::commands::secrets_ls(env, vars, connect).await,
+            cmd:
+                SecretsCmd::Ls {
+                    group,
+                    env,
+                    vars,
+                    connect,
+                },
+        } => cli::commands::secrets_ls(group, env, vars, connect).await,
+        Cmd::Secrets {
+            cmd:
+                SecretsCmd::Group {
+                    cmd: SecretsGroupCmd::Ls { env, vars, connect },
+                },
+        } => cli::commands::secrets_group_ls(env, vars, connect).await,
+        Cmd::Secrets {
+            cmd:
+                SecretsCmd::Group {
+                    cmd:
+                        SecretsGroupCmd::Rm {
+                            name,
+                            force,
+                            env,
+                            vars,
+                            connect,
+                        },
+                },
+        } => cli::commands::secrets_group_rm(name, force, env, vars, connect).await,
         Cmd::Secrets {
             cmd:
                 SecretsCmd::Push {
@@ -941,6 +1005,37 @@ mod tests {
             Cli::try_parse_from(["pi", "secrets", "send"]).is_ok(),
             "alias kept"
         );
+    }
+
+    #[test]
+    fn secrets_ls_parses_the_group_flag() {
+        let cli = Cli::try_parse_from(["pi", "secrets", "ls", "--group", "preview"]).unwrap();
+        match cli.cmd.unwrap() {
+            Cmd::Secrets {
+                cmd: SecretsCmd::Ls { group, .. },
+            } => assert_eq!(group.as_deref(), Some("preview")),
+            _ => panic!("expected secrets ls"),
+        }
+        assert!(Cli::try_parse_from(["pi", "secrets", "ls"]).is_ok());
+    }
+
+    #[test]
+    fn secrets_group_subcommands_parse() {
+        assert!(Cli::try_parse_from(["pi", "secrets", "group", "ls"]).is_ok());
+        let cli =
+            Cli::try_parse_from(["pi", "secrets", "group", "rm", "preview", "--force"]).unwrap();
+        match cli.cmd.unwrap() {
+            Cmd::Secrets {
+                cmd:
+                    SecretsCmd::Group {
+                        cmd: SecretsGroupCmd::Rm { name, force, .. },
+                    },
+            } => {
+                assert_eq!(name, "preview");
+                assert!(force);
+            }
+            _ => panic!("expected secrets group rm"),
+        }
     }
 
     #[test]

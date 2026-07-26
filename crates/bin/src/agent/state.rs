@@ -254,13 +254,13 @@ pub fn build_state(
     let head_key_secrets = HeadKeySecrets::new(secrets.clone());
     let send_secrets = SendSecrets::new(
         secrets.clone(),
-        projects,
+        projects.clone(),
         source.clone(),
         secrets_writer,
         overrides,
         runtime,
     );
-    let list_secrets = ListSecrets::new(secrets);
+    let list_secrets = ListSecrets::new(secrets, projects);
 
     Ok((
         AppState {

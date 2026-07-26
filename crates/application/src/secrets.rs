@@ -5,7 +5,7 @@ use pi_domain::contracts::{
 };
 use pi_domain::entities::{ComposeStack, SecretsBundle};
 use pi_domain::error::DomainError;
-use pi_domain::secretgroup::{GroupHead, GroupRef};
+use pi_domain::secretgroup::{merge_layers, GroupHead, GroupRef, Layer};
 
 use crate::mask::MaskingSink;
 
@@ -203,29 +203,90 @@ impl ApplySecrets {
 }
 
 /// Key names and file paths only, never values or file contents (§10:
-/// `rpi secrets ls`).
+/// `rpi secrets ls`). `keys`/`files`/`file_mode` are the *effective* (merged)
+/// view — every declared group plus the deploy key's own bundle, later layers
+/// winning — matching what a deploy would inject.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct StoredSecrets {
     pub keys: Vec<String>,
     pub files: Vec<String>,
     pub file_mode: u32,
+    /// One entry per layer, in the order the deploy would apply them: label,
+    /// revision, and that layer's *own* var/file names (not just the ones
+    /// that survive the merge) — the raw membership `rpi secrets ls` needs to
+    /// show which layer shadowed which.
+    pub layers: Vec<(String, u64, Vec<String>, Vec<String>)>,
 }
 
 pub struct ListSecrets {
     secrets: Arc<dyn SecretStore>,
+    projects: Arc<dyn ProjectRepository>,
 }
 
 impl ListSecrets {
-    pub fn new(secrets: Arc<dyn SecretStore>) -> Arc<ListSecrets> {
-        Arc::new(ListSecrets { secrets })
+    pub fn new(
+        secrets: Arc<dyn SecretStore>,
+        projects: Arc<dyn ProjectRepository>,
+    ) -> Arc<ListSecrets> {
+        Arc::new(ListSecrets { secrets, projects })
     }
 
+    /// Resolves the same layers `rpi deploy` would (declared groups against
+    /// the base project, then the deploy key's own bundle last), but — unlike
+    /// `crate::effective_secrets` — never fails when a declared group is
+    /// empty: this is a read-only listing, not an injection, so an operator
+    /// checking why a group is missing must still see everything else.
+    ///
+    /// This does not call `crate::effective_secrets` directly: that helper
+    /// requires a full `ProjectConfig` (which does not exist for a project
+    /// that has never been deployed — `rpi secrets ls` before the first
+    /// deploy must still show the key's own bundle) and only returns the
+    /// *winning* name per layer, not each layer's own raw membership, which
+    /// is what the effective view's per-layer columns need.
     pub async fn execute(&self, project: &str) -> Result<StoredSecrets, DomainError> {
-        let bundle = self.secrets.load(&GroupRef::key(project)).await?.objects;
+        let registered = self.projects.get(project).await?;
+        let (base, declared_groups) = match &registered {
+            Some(p) => (
+                p.config
+                    .environment
+                    .as_ref()
+                    .map(|e| e.base.clone())
+                    .unwrap_or_else(|| p.config.name.clone()),
+                p.config.secret_groups.clone(),
+            ),
+            None => (project.to_string(), Vec::new()),
+        };
+
+        let mut loaded = Vec::with_capacity(declared_groups.len() + 1);
+        for name in &declared_groups {
+            let group = self.secrets.load(&GroupRef::named(&base, name)).await?;
+            loaded.push((name.clone(), group));
+        }
+        loaded.push((
+            "key".to_string(),
+            self.secrets.load(&GroupRef::key(project)).await?,
+        ));
+
+        let layers: Vec<Layer<'_>> = loaded
+            .iter()
+            .map(|(label, group)| Layer::new(label, group))
+            .collect();
+        let merged = merge_layers(&layers, crate::MAX_MERGED_SECRET_BYTES)?;
+
+        let layer_rows = loaded
+            .into_iter()
+            .map(|(label, group)| {
+                let vars = group.objects.keys();
+                let files = group.objects.file_paths();
+                (label, group.revision, vars, files)
+            })
+            .collect();
+
         Ok(StoredSecrets {
-            keys: bundle.keys(),
-            files: bundle.file_paths(),
-            file_mode: bundle.secret_file_mode(),
+            keys: merged.bundle.keys(),
+            files: merged.bundle.file_paths(),
+            file_mode: merged.bundle.secret_file_mode(),
+            layers: layer_rows,
         })
     }
 }
@@ -488,6 +549,16 @@ mod tests {
         assert!(matches!(err, DomainError::NotFound(_)), "got: {err}");
     }
 
+    /// `ListSecrets::new` needs a `ProjectRepository` to resolve declared
+    /// groups; a project that was never deployed simply has none, so a
+    /// not-found `get` must not change the pre-groups behavior of these two
+    /// tests (project's own bundle only).
+    fn mock_projects_returning_none() -> MockProjectRepository {
+        let mut projects = MockProjectRepository::new();
+        projects.expect_get().returning(|_| Ok(None));
+        projects
+    }
+
     #[tokio::test]
     async fn list_secrets_returns_key_names_and_file_paths_only() {
         let mut secrets = MockSecretStore::new();
@@ -500,7 +571,7 @@ mod tests {
                     revision: 1,
                 })
             });
-        let stored = ListSecrets::new(Arc::new(secrets))
+        let stored = ListSecrets::new(Arc::new(secrets), Arc::new(mock_projects_returning_none()))
             .execute("rateme")
             .await
             .unwrap();
@@ -509,6 +580,15 @@ mod tests {
             vec!["DB_PASSWORD".to_string(), "PORT".to_string()]
         );
         assert_eq!(stored.files, vec!["certs/server.pem".to_string()]);
+        assert_eq!(
+            stored.layers,
+            vec![(
+                "key".to_string(),
+                1,
+                vec!["DB_PASSWORD".to_string(), "PORT".to_string()],
+                vec!["certs/server.pem".to_string()]
+            )]
+        );
     }
 
     #[tokio::test]
@@ -520,11 +600,114 @@ mod tests {
                 revision: 1,
             })
         });
-        let stored = ListSecrets::new(Arc::new(secrets))
+        let stored = ListSecrets::new(Arc::new(secrets), Arc::new(mock_projects_returning_none()))
             .execute("rateme")
             .await
             .unwrap();
         assert_eq!(stored.file_mode, 0o644);
+    }
+
+    /// `rpi secrets ls` must show the same merged, layered view `rpi deploy`
+    /// injects — not just the deploy key's own bundle — with the declared
+    /// group ordered before the key so a later layer visibly wins.
+    #[tokio::test]
+    async fn list_secrets_merges_declared_groups_under_the_key_bundle_and_reports_layers() {
+        let mut projects = MockProjectRepository::new();
+        projects
+            .expect_get()
+            .withf(|n| n == "rateme")
+            .returning(|_| Ok(Some(registered_with_groups(&["common"]))));
+        let mut secrets = MockSecretStore::new();
+        secrets
+            .expect_load()
+            .withf(|r| *r == GroupRef::named("rateme", "common"))
+            .returning(|_| {
+                let mut objects = SecretsBundle::default();
+                objects.vars.insert("SHARED".into(), "shared-long".into());
+                Ok(SecretGroup {
+                    objects,
+                    revision: 3,
+                })
+            });
+        secrets
+            .expect_load()
+            .withf(|r| *r == GroupRef::key("rateme"))
+            .returning(|_| {
+                Ok(SecretGroup {
+                    objects: bundle(),
+                    revision: 5,
+                })
+            });
+
+        let stored = ListSecrets::new(Arc::new(secrets), Arc::new(projects))
+            .execute("rateme")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stored.keys,
+            vec![
+                "DB_PASSWORD".to_string(),
+                "PORT".to_string(),
+                "SHARED".to_string()
+            ]
+        );
+        assert_eq!(stored.files, vec!["certs/server.pem".to_string()]);
+        assert_eq!(
+            stored.layers,
+            vec![
+                ("common".to_string(), 3, vec!["SHARED".to_string()], vec![]),
+                (
+                    "key".to_string(),
+                    5,
+                    vec!["DB_PASSWORD".to_string(), "PORT".to_string()],
+                    vec!["certs/server.pem".to_string()]
+                ),
+            ]
+        );
+    }
+
+    /// Unlike `ApplySecrets`/`effective_secrets` (which must fail fast so a
+    /// deploy never starts with a partially-injected bundle), `rpi secrets
+    /// ls` is read-only: an operator debugging exactly this problem — "I
+    /// declared a group but never pushed it" — must still see the rest of
+    /// the effective view, not a 404.
+    #[tokio::test]
+    async fn list_secrets_does_not_fail_when_a_declared_group_is_empty() {
+        let mut projects = MockProjectRepository::new();
+        projects
+            .expect_get()
+            .returning(|_| Ok(Some(registered_with_groups(&["missing"]))));
+        let mut secrets = MockSecretStore::new();
+        secrets
+            .expect_load()
+            .withf(|r| *r == GroupRef::named("rateme", "missing"))
+            .returning(|_| {
+                Ok(SecretGroup {
+                    objects: SecretsBundle::default(),
+                    revision: 0,
+                })
+            });
+        secrets
+            .expect_load()
+            .withf(|r| *r == GroupRef::key("rateme"))
+            .returning(|_| {
+                Ok(SecretGroup {
+                    objects: bundle(),
+                    revision: 1,
+                })
+            });
+
+        let stored = ListSecrets::new(Arc::new(secrets), Arc::new(projects))
+            .execute("rateme")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stored.keys,
+            vec!["DB_PASSWORD".to_string(), "PORT".to_string()]
+        );
+        assert_eq!(stored.layers[0], ("missing".to_string(), 0, vec![], vec![]));
     }
 
     /// `ApplySecrets` must resolve the *same* effective view `rpi deploy`
