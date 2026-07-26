@@ -77,7 +77,17 @@ fn create_secret_dir(path: &Path) -> std::io::Result<()> {
         use std::os::unix::fs::DirBuilderExt;
         builder.mode(DIR_MODE);
     }
-    builder.create(path)
+    builder.create(path)?;
+    // `DirBuilder::mode` is masked by the process umask (same reason
+    // `fsutil::write_private_atomic` uses `set_permissions` instead of
+    // `OpenOptions::mode` for files) — set it explicitly afterward so the
+    // result does not depend on what the unit happens to set.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(DIR_MODE))?;
+    }
+    Ok(())
 }
 
 /// Widens a directory this writer created before 0.26.0 (owned by us and at
@@ -107,7 +117,14 @@ fn widen_legacy_secret_dir(path: &Path) {
     if meta.permissions().mode() & 0o777 != 0o700 {
         return;
     }
-    // Same idiom as `cloudflared.rs:104`.
+    // SAFETY: geteuid has no preconditions and cannot fail. The effective
+    // uid, not the real uid, is what the kernel checks when deciding whether
+    // this process is allowed to `chmod` a path it doesn't own outright, so
+    // it's the right identity to compare against `meta.uid()` here. Same
+    // libc-call idiom as `current_uid` in `cloudflared.rs`, which uses
+    // `getuid` instead — that call only needs "which uid am I" to label an
+    // environment variable, not a permission check, so real vs. effective
+    // doesn't matter there.
     if meta.uid() != unsafe { libc::geteuid() } {
         return;
     }
@@ -666,6 +683,30 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(env_mode & 0o777, 0o600, ".env stays private by default");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn created_dir_mode_does_not_depend_on_the_process_umask() {
+        // `DirBuilder::mode` is masked by the process umask; a strict umask
+        // (e.g. 0027, common for service accounts) would otherwise silently
+        // narrow a newly created secret directory below DIR_MODE. This test
+        // proves the explicit `set_permissions` call in `create_secret_dir`
+        // makes the result independent of whatever umask the unit runs
+        // under, matching `write_private_atomic`'s file-side guarantee.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("certs");
+        // SAFETY: umask has no preconditions and cannot fail; restored
+        // immediately after the single directory-creation call below.
+        let old = unsafe { libc::umask(0o027) };
+        let result = create_secret_dir(&target);
+        unsafe {
+            libc::umask(old);
+        }
+        result.unwrap();
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
     }
 
     #[cfg(unix)]
