@@ -1143,6 +1143,7 @@ mod tests {
             disk,
             projects.clone(),
             env!("CARGO_PKG_VERSION").to_string(),
+            dir.to_string_lossy().into_owned(),
             85,
             false,
             false,
