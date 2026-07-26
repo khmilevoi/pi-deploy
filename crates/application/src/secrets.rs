@@ -232,17 +232,18 @@ impl ListSecrets {
     }
 
     /// Resolves the same layers `rpi deploy` would (declared groups against
-    /// the base project, then the deploy key's own bundle last), but — unlike
-    /// `crate::effective_secrets` — never fails when a declared group is
-    /// empty: this is a read-only listing, not an injection, so an operator
+    /// the base project, then the deploy key's own bundle last) via
+    /// `crate::load_layer_stack` — the same primitive `crate::effective_secrets`
+    /// is built on, so the two can never resolve layers differently — but
+    /// with `require_non_empty: false`: unlike an injection, a read-only
+    /// listing must not fail when a declared group is empty, so an operator
     /// checking why a group is missing must still see everything else.
     ///
-    /// This does not call `crate::effective_secrets` directly: that helper
-    /// requires a full `ProjectConfig` (which does not exist for a project
-    /// that has never been deployed — `rpi secrets ls` before the first
-    /// deploy must still show the key's own bundle) and only returns the
-    /// *winning* name per layer, not each layer's own raw membership, which
-    /// is what the effective view's per-layer columns need.
+    /// This does not call `crate::effective_secrets` itself: that function
+    /// always fails fast on an empty declared group (correct for an
+    /// injection) and only returns the *winning* name per layer, not each
+    /// layer's own raw membership, which is what the effective view's
+    /// per-layer columns need.
     pub async fn execute(&self, project: &str) -> Result<StoredSecrets, DomainError> {
         let registered = self.projects.get(project).await?;
         let (base, declared_groups) = match &registered {
@@ -257,15 +258,14 @@ impl ListSecrets {
             None => (project.to_string(), Vec::new()),
         };
 
-        let mut loaded = Vec::with_capacity(declared_groups.len() + 1);
-        for name in &declared_groups {
-            let group = self.secrets.load(&GroupRef::named(&base, name)).await?;
-            loaded.push((name.clone(), group));
-        }
-        loaded.push((
-            "key".to_string(),
-            self.secrets.load(&GroupRef::key(project)).await?,
-        ));
+        let loaded = crate::load_layer_stack(
+            self.secrets.as_ref(),
+            &base,
+            project,
+            &declared_groups,
+            false,
+        )
+        .await?;
 
         let layers: Vec<Layer<'_>> = loaded
             .iter()
@@ -317,7 +317,8 @@ mod tests {
         MockSecretsWriter, MockSource,
     };
     use pi_domain::entities::{
-        ExposeMode, HealthcheckConfig, Project, ProjectConfig, StageTimeoutOverrides,
+        EnvironmentMeta, ExposeMode, HealthcheckConfig, Project, ProjectConfig,
+        StageTimeoutOverrides,
     };
     use pi_domain::secretgroup::SecretGroup;
     use std::path::{Path, PathBuf};
@@ -403,6 +404,28 @@ mod tests {
     fn registered_with_groups(groups: &[&str]) -> Project {
         let mut p = registered();
         p.config.secret_groups = groups.iter().map(|g| (*g).to_string()).collect();
+        p
+    }
+
+    /// An environment-overlay deploy key (`deploy_key`) whose `environment`
+    /// block names the base project (`base`) that owns its declared groups —
+    /// distinct from `registered_with_groups`, whose `config.name` and the
+    /// implicit base are the same string and so cannot catch a resolver that
+    /// mixes the two up.
+    fn registered_environment_with_groups(
+        deploy_key: &str,
+        base: &str,
+        groups: &[&str],
+    ) -> Project {
+        let mut p = registered_with_groups(groups);
+        p.config.name = deploy_key.to_string();
+        p.config.environment = Some(EnvironmentMeta {
+            env: "preview".into(),
+            base: base.to_string(),
+            slug: None,
+            ttl_secs: None,
+            on_create: None,
+        });
         p
     }
 
@@ -664,6 +687,62 @@ mod tests {
                     vec!["certs/server.pem".to_string()]
                 ),
             ]
+        );
+    }
+
+    /// `registered_with_groups`'s deploy key and base are the same string, so
+    /// it cannot catch a resolver that reads `config.name` where it should
+    /// read `config.environment.base` (or vice versa). An environment
+    /// overlay's declared groups belong to the *base* project, not the
+    /// derived deploy key `execute` is called with — the deploy key's own
+    /// bundle is still looked up by the deploy key itself.
+    #[tokio::test]
+    async fn list_secrets_loads_declared_groups_under_the_environment_base_not_the_deploy_key() {
+        let mut projects = MockProjectRepository::new();
+        projects
+            .expect_get()
+            .withf(|n| n == "rateme--preview")
+            .returning(|_| {
+                Ok(Some(registered_environment_with_groups(
+                    "rateme--preview",
+                    "rateme",
+                    &["common"],
+                )))
+            });
+        let mut secrets = MockSecretStore::new();
+        secrets
+            .expect_load()
+            .withf(|r| *r == GroupRef::named("rateme", "common"))
+            .returning(|_| {
+                let mut objects = SecretsBundle::default();
+                objects.vars.insert("SHARED".into(), "shared-long".into());
+                Ok(SecretGroup {
+                    objects,
+                    revision: 3,
+                })
+            });
+        secrets
+            .expect_load()
+            .withf(|r| *r == GroupRef::key("rateme--preview"))
+            .returning(|_| {
+                Ok(SecretGroup {
+                    objects: bundle(),
+                    revision: 5,
+                })
+            });
+
+        let stored = ListSecrets::new(Arc::new(secrets), Arc::new(projects))
+            .execute("rateme--preview")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            stored.layers[0],
+            ("common".to_string(), 3, vec!["SHARED".to_string()], vec![])
+        );
+        assert_eq!(
+            stored.layers[1].0, "key",
+            "the deploy key's own bundle is still keyed by the deploy key, not the base"
         );
     }
 
