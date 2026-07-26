@@ -11,13 +11,6 @@
 //!
 //! The syntactic split is the point: nobody who sees `${git.branch}` in a
 //! TOML file will go looking for `git.branch` in `printenv`.
-//!
-//! Only `parse_vars` has a caller today (`overlay.rs`'s `--vars` handling);
-//! `refs`/`substitute`/`VarRef`/`VarSet` are consumed starting with the
-//! overlay interpolation rewrite (a later task), hence the blanket
-//! `dead_code` allow below rather than one per item.
-
-#![allow(dead_code)]
 
 use std::collections::BTreeMap;
 

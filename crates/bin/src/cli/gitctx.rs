@@ -7,10 +7,6 @@
 //! These are computed lazily by the resolver — only when a configuration
 //! actually references one — so `rpi config show` keeps working outside a
 //! git repository for configurations that use no `${git.*}` variable.
-//!
-//! Nothing calls these yet; Task 3 wires them into the config resolver,
-//! which is when this allow becomes unnecessary.
-#![allow(dead_code)]
 
 use std::path::Path;
 use std::process::Command;
