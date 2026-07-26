@@ -6,6 +6,9 @@ import {
   bumpPackageJson,
   assertLockfileDiff,
   assertChangedFiles,
+  failureReport,
+  exitCodeFor,
+  RECOVERY_HINT,
   BumpError,
 } from "./bump-version.mjs";
 
@@ -206,4 +209,26 @@ test("assertChangedFiles rejects anything else in the tree", () => {
     },
   );
   assert.throws(() => assertChangedFiles(["Cargo.toml", "package.json"]), BumpError);
+});
+
+test("failureReport names the recovery command once the files are written", () => {
+  const out = failureReport("Cargo.lock carries changes beyond the workspace version bump", true);
+  assert.match(out, /^bump-version: Cargo\.lock carries changes/);
+  assert.match(out, /git checkout -- Cargo\.toml package\.json Cargo\.lock/);
+  assert.ok(out.includes(RECOVERY_HINT));
+});
+
+test("failureReport stays silent about recovery when nothing was written yet", () => {
+  const out = failureReport("working tree is dirty, refusing to bump", false);
+  assert.equal(out, "bump-version: working tree is dirty, refusing to bump");
+  assert.doesNotMatch(out, /git checkout/);
+});
+
+test("exitCodeFor separates a refusal from the script being unable to run", () => {
+  // 1: the script ran and refused — the operator has a decision to make.
+  assert.equal(exitCodeFor(new BumpError("this is not a version-only release commit")), 1);
+  // 2: cargo missing or a registry outage says nothing about the release.
+  const spawnFailure = Object.assign(new Error("spawnSync cargo ENOENT"), { code: "ENOENT" });
+  assert.equal(exitCodeFor(spawnFailure), 2);
+  assert.equal(exitCodeFor(new Error("error: failed to query registry")), 2);
 });

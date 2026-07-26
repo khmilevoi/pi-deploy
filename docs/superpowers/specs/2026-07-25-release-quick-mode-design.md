@@ -18,10 +18,14 @@ In a patch release the fix is already on master and already passed CI. The
 release commit itself touches only `Cargo.toml`, `package.json` and
 `Cargo.lock`. Those three files cannot break `clippy` or a test.
 
-So the local gate (`fmt`, `clippy`, `test`, `node --test`, `npm pack`) is
-not a check being risked — it is a re-run of checks that already passed on
-the same code tree. The quick mode's rule is therefore **do not re-run what
-is already green**, not "skip checks".
+So most of the local gate (`fmt`, `clippy`, `test`, `node --test`) is not a
+check being risked — it is a re-run of checks that already passed on the
+same code tree. The quick mode's rule is therefore **do not re-run what is
+already green**, not "skip checks".
+
+`npm pack --dry-run` is the exception and stays in quick mode (§2): it is
+the one gate item nothing in CI re-runs, so there is no green result to
+lean on.
 
 The same reasoning does not extend to a minor release, where the range
 contains commits whose behaviour is new. Quick mode is patch-only by
@@ -64,10 +68,12 @@ no green `ci` run.
 
 | Full-mode step | Quick mode | Why |
 | --- | --- | --- |
-| Local gate: `fmt`, `clippy`, `test`, `node --test`, `npm pack` | replaced by "CI green on HEAD", checked by preflight | The release commit touches only version files; the code tree is the one CI already passed |
+| Local gate: `fmt`, `clippy`, `test`, `node --test` | replaced by "CI green on HEAD", checked by preflight | The release commit touches only version files; the code tree is the one CI already passed |
+| `npm pack --dry-run` | **kept** | The only gate item CI does not cover: `ci.yml` runs `fmt`, `clippy`, `cargo test --locked`, `test:node` and e2e, and nothing reads `package.json`'s `files` whitelist or builds the tarball. A fix that moves a file `postinstall.js` requires is green everywhere and still ships a package that fails to install. Also the only failure that cannot be undone — a published npm version is immutable and `latest` has already moved. Two seconds |
 | `node scripts/check-version.js` | kept | Instant, and guards exactly what quick mode changes — a version drift is one of the two mistakes this repo has actually made (`492012d`) |
-| README `Status: vX.Y` line | not touched | `0.25.1 → 0.25.2` leaves `v0.25` unchanged. Other docs are still updated when the fix changes documented behaviour |
+| README `## Highlights` section | not touched | A patch usually changes nothing it describes. When it does, `bump-version.mjs` runs first (it refuses a dirty tree), then the edit, then one commit of four files. Other docs are still updated when the fix changes documented behaviour |
 | Wait for `ci` green on the release commit before tagging | **tag immediately** | See below |
+| Re-confirm `HEAD == origin/master` before tagging | **kept, and new in both modes** | Preflight checks this before the bump, so it says nothing about the release commit. A PR merging mid-release rejects the push, and the natural `git pull --rebase` recovery tags a commit that was never classified. Not in `release-preflight.mjs`: it runs before the bump, which is the wrong moment |
 | Post-release verification | kept, scripted (§3.4) | Cheap, and a script cannot answer from memory |
 | Release notes | kept, shorter | A patch whose notes do not say what was fixed is as useless as a minor's |
 | Four-auditor landing audit | replaced by scripted version sync (§3.3) | Numbers are the historical drift source and are now closed by construction |
@@ -109,6 +115,14 @@ Prints a verdict line, `quick: allowed (X.Y.Z)` or
 normal outcome, not a script error. Exit 2 is reserved for the script
 itself failing (no `gh`, not a repository).
 
+Every `git` and `gh` call runs with `cwd` set to the repository root
+resolved from `import.meta.url`, never the inherited working directory —
+same as `bump-version.mjs`. `release-verify.mjs` does the same. The quick
+checklist tells the operator to `cd` into the landing-page repo, and a
+shell's working directory persists, so reading `package.json` from one repo
+while classifying another repo's commits is a reachable state, not a
+hypothetical one.
+
 Testable core: `classifyRange(commits) -> {bump, quickAllowed, reason}` and
 `nextPatch(version)`.
 
@@ -125,13 +139,26 @@ Then two assertions, both fatal:
   `Cargo.lock`. Anything else means the release commit is not
   version-only, and quick mode must fall back to the full local gate.
 - every changed line in `Cargo.lock` is a `version = "…"` line moving from
-  the old version to the new one. Any other change means the lockfile
-  picked up an unrelated dependency bump, which belongs in its own commit.
+  the old version to the new one, **and** belongs to a workspace crate. The
+  diff is read at `git diff -U3`, not `-U0` as the plan first said: the
+  ownership check finds the owning crate through the nearest preceding
+  `name = "…"` line, and at `-U0` that context line is not in the hunk at
+  all. Any other change means the lockfile picked up an unrelated dependency
+  bump, which belongs in its own commit.
 
 Finishes by running the existing `check-version.js`.
 
+Exit codes follow the same convention as the other three scripts: 1 is a
+refusal the operator must act on (dirty tree, a non-version-only diff, a
+foreign lockfile change, a `check-version.js` mismatch); 2 is the script
+being unable to complete (no `cargo` or `node` on PATH, a registry outage).
+If it fails after writing `Cargo.toml` and `package.json`, it prints the
+`git checkout --` line that restores the tree — otherwise the dirty-tree
+guard blocks the retry with no stated way out.
+
 Testable core: `bumpCargoToml(text, v)`, `bumpPackageJson(text, v)`,
-`assertLockfileDiff(diffText, from, to)`.
+`assertLockfileDiff(diffText, from, to)`, `failureReport(msg, wrote)`,
+`exitCodeFor(err)`.
 
 ### 3.3 `scripts/sync-version.mjs <X.Y.Z>` (rpi-deploy-site) — mutating
 
@@ -144,8 +171,13 @@ The landing hardcodes the version in three places in `src/index.html`: the
 script does not encode those three locations. It works by an invariant
 instead:
 
-1. collect every `\d+\.\d+\.\d+` match under `src/` (html, txt, xml, js,
-   css);
+1. collect every `\d+\.\d+\.\d+` match under `src/`, in every file the
+   content sniffer does not judge binary (a NUL byte in the first 8 KiB).
+   Not an extension whitelist: a whitelist silently misses the next file
+   type someone adds — `site.webmanifest`, a `.json` — and a missed file is
+   exactly the stale version string this script exists to make impossible.
+   Sniffing content is what makes the guarantee below real rather than
+   conditional on somebody maintaining a list;
 2. if the matched values are **not all identical**, fail and list every
    `file:line` — a foreign semver has appeared on the page and a human
    decides what it is;
@@ -164,16 +196,35 @@ occurrence somebody adds later. That is what makes reducing the audit to a
 version sync honest rather than hopeful. It also updates the `og:image`
 `?v=` automatically, since that is one of the matches.
 
+Because the scan is not limited to `index.html`, the script also warns when
+any replacement lands elsewhere, naming the CDN purge that such a deploy
+requires (§4). Exit codes match the pi scripts: 1 for a refusal (mixed or
+missing semver), 2 for the script being unable to run — a wrong working
+directory, an unwritable file — never a raw Node stack trace.
+
 Testable core: `syncVersions(files, target)` over an in-memory
-`{path: content}` map — no filesystem.
+`{path: content}` map — no filesystem — and `purgeWarning(replacements)`.
 
 ### 3.4 `scripts/release-verify.mjs <X.Y.Z>` (pi) — read-only
 
 One pass/fail over what is currently four separate one-liners:
 
-- the `release` workflow run for `vX.Y.Z`: all four jobs green;
+- the `release` workflow run for `vX.Y.Z`: every job green. Job names are
+  **matrix-expanded** — a real run reports six entries (`check`, three
+  `build (<os>, <triple>)` instances, `release`, `npm-publish`), not four,
+  so the check matches a matrix parent by the `<name> (` prefix and verifies
+  every instance it finds. The " (" separator is required, so a job named
+  `builder` cannot satisfy `build`. The reported count is the number of
+  entries actually verified, not the number of required names — "all four
+  jobs green" is the myth that already caused one defect here, and a message
+  claiming four while GitHub shows six is exactly the mismatch this script
+  exists to prevent;
 - `gh release view vX.Y.Z`: three archives named
-  `rpi-vX.Y.Z-<triple>.*` plus `SHA256SUMS`;
+  `rpi-vX.Y.Z-<triple>.*` plus `SHA256SUMS`. The release does not exist for
+  the first 5-10 minutes after the tag, so `release not found` is reported
+  as a failing `assets` check with the other results still printed, never as
+  a crash. Genuine `gh` failures (missing binary, expired token, HTTP
+  401/403, network) stay fatal at exit 2;
 - `npm view rpi-deploy version` equals `X.Y.Z`;
 - `docker run --rm node:20-slim npx -y rpi-deploy@X.Y.Z --version` prints
   `rpi X.Y.Z`. The container is not optional: a local machine can have a
@@ -188,20 +239,33 @@ Exits non-zero on any failure.
 
 1. `node scripts/release-preflight.mjs` → `quick: allowed (X.Y.Z)`.
 2. `node scripts/bump-version.mjs X.Y.Z`.
-3. Commit `chore: release X.Y.Z`, push.
-4. `git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z`.
-5. `node scripts/release-verify.mjs X.Y.Z`.
-6. Rewrite the release notes: a **What changed** section with one bullet
+3. `npm pack --dry-run` — kept; see §2.
+4. Commit `chore: release X.Y.Z`, push.
+5. `git fetch origin master`, then `git rev-parse HEAD` ==
+   `git rev-parse origin/master` — re-confirmed here, after the release
+   commit exists; see §2.
+6. `git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z`.
+7. `gh run watch <run>`, then `node scripts/release-verify.mjs X.Y.Z`. The
+   wait is part of the step: the GitHub Release is created by the `release`
+   job minutes after the tag, so verifying immediately reports a release
+   that simply does not exist yet.
+8. Rewrite the release notes: a **What changed** section with one bullet
    per `fix:` commit in the range, each stating the old and the new
    behaviour. `gh release edit vX.Y.Z --notes-file notes.md`.
-7. Landing: `git pull` → `npm run sync-version -- X.Y.Z` → `npm run og` →
+9. Landing: `git pull` → `npm run sync-version -- X.Y.Z` → `npm run og` →
    commit → push → `rpi deploy` → confirm the live page and re-fetch
    `og:image`.
 
-No CDN purge: `index.html` is never cached, and `og.png` is reached through
-the versioned `?v=` query the sync script just updated. A purge is still
-required in full mode when a deploy touches `styles.css`, `copy.js` or
-other assets under `src/assets/`.
+No CDN purge — **conditional on `sync-version` reporting every replacement
+in `src/index.html`**, which is the case today and is what the claim rests
+on: `index.html` is never edge-cached, and `og.png` is reached only through
+the versioned `?v=` query the sync script just updated. But §3.3's scan is
+deliberately not limited to `index.html`, so a version string added later to
+`copy.js`, `styles.css` or `assets/` would be synced and would need a purge.
+The script prints each replacement with its file, and warns explicitly when
+one lands outside `index.html` — read that output rather than assuming. A
+purge is likewise required in full mode when a deploy touches `styles.css`,
+`copy.js` or other assets under `src/assets/`.
 
 ## 5. Changes to the full mode
 
@@ -231,7 +295,18 @@ not block anything, it informs the bump decision.
   diff carrying a third-party bump fails.
 - `syncVersions`: mixed semvers → error naming every location; already at
   target → no writes; replacement covers all matches; running twice is a
-  no-op.
+  no-op. `purgeWarning`: silent while every replacement is in
+  `index.html`, and names the purge, deduplicated and sorted, as soon as one
+  is not.
+- `classifyReleaseViewFailure`: gh's "release not found" wording is the
+  not-yet-published state; a missing binary, an expired token, HTTP 401/403,
+  a network failure and an empty message are all genuine errors. Tested as
+  pure classification — the point is the decision, not the subprocess.
+- `failureReport` / `exitCodeFor`: the recovery line appears only after the
+  files were written, and a `BumpError` is exit 1 while a spawn failure is
+  exit 2.
+- `sync-version`'s entrypoint, spawned in a temp directory: a mixed-semver
+  tree exits 1, a missing `src/` exits 2, and neither prints a stack trace.
 
 The site repo has no tests today, so `sync-version.test.mjs` is its first —
 `node --test` needs no new dependency.

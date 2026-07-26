@@ -79,8 +79,33 @@ export function checkSmokeOutput(stdout, version, elapsedMs) {
   };
 }
 
-function sh(cmd, args) {
-  return execFileSync(cmd, args, { encoding: "utf8", maxBuffer: 32 * 1024 * 1024 }).trim();
+// `cwd` is always passed explicitly by the `gh` call sites, pinned to the
+// repository root resolved from this file rather than the inherited working
+// directory: `gh` picks the repository from the current directory, and the
+// quick-mode checklist tells the operator to `cd` into the landing-page
+// repo, whose shell working directory persists into later commands.
+function sh(cmd, args, opts = {}) {
+  return execFileSync(cmd, args, { encoding: "utf8", maxBuffer: 32 * 1024 * 1024, ...opts }).trim();
+}
+
+// `gh release view <tag>` fails with "release not found" for the whole
+// window between pushing the tag and the `release` job publishing it —
+// roughly 5-10 minutes, and the normal state for anyone following the
+// checklist in order. That is a check that has not passed yet, not the
+// script breaking, so it must be reported alongside the other results
+// rather than aborting the run. Everything else — no `gh` on PATH, an
+// expired token, HTTP 401/403, a network failure — is the script being
+// unable to complete and still exits 2. The match is deliberately narrow:
+// only gh's own not-found wording counts, so an auth or transport failure
+// can never be mistaken for "not published yet".
+const RELEASE_NOT_FOUND = /\brelease not found\b/i;
+
+export function classifyReleaseViewFailure(text) {
+  return RELEASE_NOT_FOUND.test(String(text ?? "")) ? "not-published" : "error";
+}
+
+export function releaseViewFailureText(err) {
+  return [err?.stderr, err?.message].filter(Boolean).join("\n");
 }
 
 // Package names reaching npmView must match this narrow, conservative set
@@ -121,17 +146,18 @@ function main() {
     process.exit(2);
   }
   const tag = `v${version}`;
+  const root = path.resolve(fileURLToPath(import.meta.url), "..", "..");
   const results = [];
 
   const runs = JSON.parse(
-    sh("gh", ["run", "list", "--workflow", "release", "--limit", "20", "--json", "databaseId,headBranch"]),
+    sh("gh", ["run", "list", "--workflow", "release", "--limit", "20", "--json", "databaseId,headBranch"], { cwd: root }),
   );
   const runId = runs.find((r) => r.headBranch === tag)?.databaseId;
 
   if (runId === undefined) {
     results.push({ ok: false, label: "workflow", reason: `no release run found for ${tag}` });
   } else {
-    const jobs = JSON.parse(sh("gh", ["run", "view", String(runId), "--json", "jobs"])).jobs.map((j) => ({
+    const jobs = JSON.parse(sh("gh", ["run", "view", String(runId), "--json", "jobs"], { cwd: root })).jobs.map((j) => ({
       name: j.name,
       status: j.status,
       conclusion: j.conclusion,
@@ -139,15 +165,28 @@ function main() {
     results.push({ label: "workflow", ...checkJobs(jobs) });
   }
 
-  const assets = JSON.parse(sh("gh", ["release", "view", tag, "--json", "assets"])).assets.map((a) => a.name);
-  const assetCheck = checkAssets(assets, version);
-  results.push({
-    label: "assets",
-    ok: assetCheck.ok,
-    reason: assetCheck.ok
-      ? `${assets.length} assets as expected`
-      : `missing: ${assetCheck.missing.join(", ") || "none"}; unexpected: ${assetCheck.extra.join(", ") || "none"}`,
-  });
+  let assets = null;
+  try {
+    assets = JSON.parse(sh("gh", ["release", "view", tag, "--json", "assets"], { cwd: root })).assets.map((a) => a.name);
+  } catch (err) {
+    if (classifyReleaseViewFailure(releaseViewFailureText(err)) !== "not-published") throw err;
+    results.push({
+      label: "assets",
+      ok: false,
+      reason: `GitHub Release ${tag} is not published yet — the release job creates it minutes after the tag; wait with \`gh run watch\` and re-run`,
+    });
+  }
+
+  if (assets !== null) {
+    const assetCheck = checkAssets(assets, version);
+    results.push({
+      label: "assets",
+      ok: assetCheck.ok,
+      reason: assetCheck.ok
+        ? `${assets.length} assets as expected`
+        : `missing: ${assetCheck.missing.join(", ") || "none"}; unexpected: ${assetCheck.extra.join(", ") || "none"}`,
+    });
+  }
 
   results.push({ label: "npm", ...checkNpmVersion(npmView("rpi-deploy"), version) });
 

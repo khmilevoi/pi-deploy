@@ -8,6 +8,8 @@ import {
   checkNpmVersion,
   checkSmokeOutput,
   assertSafePackageName,
+  classifyReleaseViewFailure,
+  releaseViewFailureText,
 } from "./release-verify.mjs";
 
 test("expectedAssets names the three archives and the checksum file", () => {
@@ -140,6 +142,45 @@ test("checkSmokeOutput accepts the expected banner", () => {
 
 test("checkSmokeOutput rejects a mismatched version", () => {
   assert.equal(checkSmokeOutput("rpi 0.25.1\n", "0.25.2", 20_000).ok, false);
+});
+
+test("classifyReleaseViewFailure reads gh's not-found wording as 'not published yet'", () => {
+  // The literal shape of the failure a releaser hits when running step 5
+  // immediately after step 4, before the release job has created the release.
+  const err = Object.assign(new Error("Command failed: gh release view v0.25.2 --json assets\nrelease not found\n"), {
+    status: 1,
+    stderr: "release not found\n",
+  });
+  assert.equal(classifyReleaseViewFailure(releaseViewFailureText(err)), "not-published");
+  assert.equal(classifyReleaseViewFailure("release not found"), "not-published");
+  assert.equal(classifyReleaseViewFailure("RELEASE NOT FOUND"), "not-published");
+});
+
+test("classifyReleaseViewFailure keeps a broken or unauthenticated gh as a genuine error", () => {
+  const cases = [
+    "gh: command not found",
+    "spawnSync gh ENOENT",
+    "To get started with GitHub CLI, please run:  gh auth login",
+    "HTTP 401: Bad credentials (https://api.github.com/repos/khmilevoi/pi/releases/tags/v0.25.2)",
+    "HTTP 403: Resource not accessible by personal access token",
+    "error connecting to api.github.com",
+  ];
+  for (const text of cases) {
+    assert.equal(classifyReleaseViewFailure(text), "error", `expected an error for: ${text}`);
+  }
+});
+
+test("classifyReleaseViewFailure treats an absent message as an error, never as 'not published'", () => {
+  assert.equal(classifyReleaseViewFailure(undefined), "error");
+  assert.equal(classifyReleaseViewFailure(null), "error");
+  assert.equal(classifyReleaseViewFailure(""), "error");
+});
+
+test("releaseViewFailureText reads both stderr and message, and survives either being absent", () => {
+  assert.match(releaseViewFailureText({ stderr: "release not found\n", message: "Command failed" }), /release not found/);
+  assert.equal(releaseViewFailureText({ message: "Command failed" }), "Command failed");
+  assert.equal(releaseViewFailureText({ stderr: "release not found" }), "release not found");
+  assert.equal(releaseViewFailureText({}), "");
 });
 
 test("checkSmokeOutput flags a slow install as a source build", () => {

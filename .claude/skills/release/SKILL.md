@@ -45,32 +45,88 @@ survive a `feat:` commit, which is why preflight refuses one.
 1. `node scripts/release-preflight.mjs` → `quick: allowed (X.Y.Z)`.
 2. `node scripts/bump-version.mjs X.Y.Z` — writes the three files, runs
    `cargo update --workspace`, and refuses if the lockfile picked up an
-   unrelated dependency bump or if anything else is in the tree.
-3. `rtk git commit -m "chore: release X.Y.Z"` with those three files, push.
-4. `rtk git tag -a vX.Y.Z -m "vX.Y.Z" && rtk git push origin vX.Y.Z` —
+   unrelated dependency bump or if anything else is in the tree. If it fails
+   *after* writing, it prints the `git checkout -- Cargo.toml package.json
+   Cargo.lock` line that puts the tree back — run that before re-running it,
+   or the dirty-tree guard blocks the retry. Exit 1 is a refusal you must
+   act on; exit 2 means the script could not run (no `cargo`, a registry
+   outage) and says nothing about the release.
+3. `npm pack --dry-run` — **kept, not skipped**. It takes about two seconds,
+   and it is the one local-gate item with no CI equivalent: `ci.yml` runs
+   `fmt`, `clippy`, `cargo test --locked`, `npm run test:node` and e2e, and
+   none of them builds the tarball or reads `package.json`'s `files`
+   whitelist. So a fix like "move the binary resolver into
+   `scripts/lib/resolve.js`" is green on CI (tests run against the repo
+   tree) and green in the release workflow's `check` job, and still publishes
+   a package whose `postinstall` dies with MODULE_NOT_FOUND for every
+   installer — because `files` lists only `scripts/postinstall.js` and
+   `scripts/check-version.js`. It is also the only gate item whose failure
+   cannot be undone: a published npm version is immutable, and `latest` has
+   already moved by the time the first install fails. The tarball must
+   include `bin/`, the whitelisted `scripts/`, `crates/`, `Cargo.toml`,
+   `Cargo.lock`.
+4. `rtk git commit -m "chore: release X.Y.Z"` with those three files, push.
+5. **Re-confirm the release commit is on `origin/master` before tagging**:
+   `git fetch origin master` first (a rejected push can leave the
+   remote-tracking ref stale, and a stale ref makes this check pass for the
+   wrong reason), then `git rev-parse HEAD` must equal
+   `git rev-parse origin/master`. Preflight
+   established this, but that was before the release commit existed. If a PR
+   merges to `master` mid-release, the step-4 push is rejected as
+   non-fast-forward, and the obvious reaction — `git pull --rebase`, push
+   again — puts the release commit on top of a commit preflight never
+   classified, which may well be a `feat:`. Tagging then ships unverified,
+   possibly minor-level code as a patch with the local gate skipped. The
+   same happens more quietly if the rejected push goes unnoticed:
+   `git push origin vX.Y.Z` carries the missing objects along with the tag,
+   and the workflow's `check` job only compares `package.json` against the
+   tag name — it never checks that the commit is on `master`. Not equal
+   means stop and start over from step 1, never `--force`.
+6. `rtk git tag -a vX.Y.Z -m "vX.Y.Z" && rtk git push origin vX.Y.Z` —
    immediately, without waiting for `ci` on the release commit. The release
    workflow's own `check` job re-runs versions and tests before `build` and
    `publish`, so a failure leaves a dead tag, never a partial publish, and
    the recovery in "If the release workflow fails after the tag" applies.
-5. `node scripts/release-verify.mjs X.Y.Z`.
-6. Release notes — required, same as any release, but short: one bullet per
+7. **Wait for the release workflow, then verify.** The GitHub Release does
+   not exist until the `release` job creates it, roughly 5-10 minutes after
+   the tag — verifying before that reports the release as missing, which is
+   noise, not a finding:
+   ```
+   gh run watch "$(gh run list --workflow release --limit 1 --json databaseId --jq '.[0].databaseId')"
+   node scripts/release-verify.mjs X.Y.Z
+   ```
+8. Release notes — required, same as any release, but short: one bullet per
    `fix:` commit stating the old and the new behaviour. See "Release notes"
    below.
-7. Landing: `cd` to the site repo, `rtk git pull`,
+9. Landing: `cd` to the site repo, `rtk git pull`,
    `npm run sync-version -- X.Y.Z`, `npm run og`, commit, push,
    `rpi deploy`, then confirm the live page and re-fetch `og:image`.
+   No CDN purge is needed **as long as `sync-version` reports every
+   replacement in `src/index.html`** — that file is never edge-cached, and
+   `og.png` is reached only through the versioned `?v=` query the sync just
+   bumped. The script scans every non-binary file under `src/` by design, so
+   read its per-file output rather than assuming: a replacement in
+   `copy.js`, `styles.css` or `assets/` does require a purge, and the script
+   prints an explicit warning naming it when that happens. See the
+   "Post-deploy: purge the CDN cache" section of `docs/landing-audit.md` in
+   the site repo.
 
 What quick mode does **not** do, and why it is safe:
 
-- **The local gate** (`fmt`, `clippy`, `test`, `node --test`, `npm pack`) —
-  replaced by preflight's "ci green on HEAD". Note this is a move between
-  two check surfaces, not a narrowing: the local gate runs on Windows and
-  catches things a Linux CI never will, and vice versa. It is acceptable
-  only because the release commit is version-only.
+- **The local gate** (`fmt`, `clippy`, `test`, `node --test`) — replaced by
+  preflight's "ci green on HEAD". Note this is a move between two check
+  surfaces, not a narrowing: the local gate runs on Windows and catches
+  things a Linux CI never will, and vice versa. It is acceptable only
+  because the release commit is version-only. `npm pack --dry-run` is
+  deliberately absent from this list — it is not replaced by anything, which
+  is why it stays as step 3.
 - **A README edit** — a patch release usually needs none at all. `README.md`
   `## Highlights` is updated only when the fix changes behaviour described
   there; other documentation is still updated when the fix changes
-  documented behaviour it describes.
+  documented behaviour it describes. When it *is* needed, the order is
+  forced: run `bump-version.mjs` first (it refuses a dirty tree), then edit
+  the README, then commit all four files — the script's own refusal message
+  does not say this.
 - **The four-auditor landing audit** — replaced by `sync-version`, which
   guarantees versions by construction. Feature text, CLI transcripts and
   `llms.txt` are still audited on every minor and major release.
@@ -106,7 +162,18 @@ What quick mode does **not** do, and why it is safe:
    ```
 5. **Commit and push**: `chore: release X.Y.Z` with `Cargo.toml package.json Cargo.lock README.md` (+ any docs). Wait for the `ci` workflow to go green: `rtk gh run list --workflow ci --limit 1`.
 6. **Optional dry run** (recommended after toolchain/dependency changes): `gh workflow run release.yml --ref master` builds all 3 targets (Windows MSVC, x86_64/aarch64 musl) but skips release + publish.
-7. **Tag and push**: `rtk git tag -a vX.Y.Z -m "vX.Y.Z" && rtk git push origin vX.Y.Z`. Lowercase `v`, full three-part version — the check job rejects anything else.
+7. **Tag and push**: first re-confirm what you are tagging — `git fetch origin master`,
+   then `git rev-parse HEAD` must equal `git rev-parse origin/master`
+   (fetch first: a rejected push can leave the remote-tracking ref stale, and a
+   stale ref makes the comparison pass for the wrong reason).
+   A PR merging to `master` while the
+   release is in progress rejects the step-5 push, and recovering with
+   `git pull --rebase` silently moves the release commit on top of a commit
+   this checklist never reviewed; the workflow's `check` job compares
+   `package.json` against the tag name and never checks that the commit is on
+   `master`, so nothing downstream catches it. Then
+   `rtk git tag -a vX.Y.Z -m "vX.Y.Z" && rtk git push origin vX.Y.Z`. Lowercase `v`,
+   full three-part version — the check job rejects anything else.
 
 ## After the tag (automatic — do not do these by hand)
 
@@ -114,11 +181,17 @@ check (versions+tests) → build (3 archives named `rpi-vX.Y.Z-<triple>.*`) → 
 
 ## Post-release verification
 
+Wait for the workflow first. The GitHub Release, the assets and the npm
+version do not exist until the `release` and `npm-publish` jobs run, roughly
+5-10 minutes after the tag — verifying before that reports the release as
+not yet published, which is noise rather than a finding:
+
 ```
+gh run watch "$(gh run list --workflow release --limit 1 --json databaseId --jq '.[0].databaseId')"
 node scripts/release-verify.mjs X.Y.Z
 ```
 
-It checks the release workflow's jobs, the release assets, the published npm version, and an `npx` smoke test, and exits non-zero if any of them is wrong — the workflow's jobs must all be green; let the script's own output say which.
+It checks the release workflow's jobs, the release assets, the published npm version, and an `npx` smoke test, and exits non-zero if any of them is wrong — the workflow's jobs must all be green; let the script's own output say which. The job list is matrix-expanded: a real run reports six rows, three of them `build (…)` instances, for four required job names.
 
 The npx check runs inside a throwaway Docker container, never directly on the dev machine — a local machine can have a global `rpi-deploy` install or npx cache that shadows the version resolution and silently passes/fails against stale state instead of the real published package. The script also times the install and flags anything slower than ~90s, since that means npx fell back to a source build instead of the prebuilt binary.
 

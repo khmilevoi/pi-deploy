@@ -86,8 +86,13 @@ export function ciStatusForSha(runs, sha) {
   return { ok: true, reason: `ci green for ${short}` };
 }
 
-function git(...args) {
-  return execFileSync("git", args, { encoding: "utf8" }).trim();
+// Every git and `gh` call is pinned to the repository root resolved from
+// this file, never to the inherited working directory: the quick-mode
+// checklist tells the operator to `cd` into the landing-page repo, and a
+// shell's working directory persists. Reading package.json from one repo
+// while classifying another repo's commits is the failure this prevents.
+function git(root, ...args) {
+  return execFileSync("git", args, { encoding: "utf8", cwd: root }).trim();
 }
 
 function main() {
@@ -96,20 +101,20 @@ function main() {
   let quick = { quickAllowed: false, reason: "preflight did not complete" };
 
   try {
-    git("fetch", "origin", "master", "--tags", "--quiet");
+    git(root, "fetch", "origin", "master", "--tags", "--quiet");
   } catch {
     checks.push("!  could not fetch origin/master — results may be stale");
   }
 
-  const dirty = git("status", "--porcelain");
+  const dirty = git(root, "status", "--porcelain");
   checks.push(dirty ? `x  working tree is dirty:\n${dirty}` : "ok working tree clean");
 
-  const head = git("rev-parse", "HEAD");
-  const upstream = git("rev-parse", "origin/master");
+  const head = git(root, "rev-parse", "HEAD");
+  const upstream = git(root, "rev-parse", "origin/master");
   checks.push(head === upstream ? "ok HEAD == origin/master" : `x  HEAD ${head.slice(0, 7)} != origin/master ${upstream.slice(0, 7)}`);
 
-  const lastTag = git("describe", "--tags", "--abbrev=0");
-  const raw = git("log", "--no-merges", "--format=%H%x00%B%x01", `${lastTag}..HEAD`);
+  const lastTag = git(root, "describe", "--tags", "--abbrev=0");
+  const raw = git(root, "log", "--no-merges", "--format=%H%x00%B%x01", `${lastTag}..HEAD`);
   const commits = parseCommits(raw);
   const verdict = classifyRange(commits);
   checks.push(`   range ${lastTag}..HEAD: ${commits.length} non-merge commit(s), bump = ${verdict.bump}`);
@@ -125,7 +130,7 @@ function main() {
       execFileSync(
         "gh",
         ["run", "list", "--workflow", "ci", "--branch", "master", "--limit", "100", "--json", "headSha,status,conclusion"],
-        { encoding: "utf8" },
+        { encoding: "utf8", cwd: root },
       ),
     );
     ci = ciStatusForSha(runs, head);

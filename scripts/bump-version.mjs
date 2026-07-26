@@ -183,6 +183,30 @@ function git(root, ...args) {
   return execFileSync("git", args, { encoding: "utf8", cwd: root }).trim();
 }
 
+// Everything after the two writes can still fail — `cargo update`, either
+// assertion, `check-version.js` — and every one of those leaves Cargo.toml,
+// package.json and a rewritten Cargo.lock modified. The next run is then
+// blocked by the dirty-tree guard with no hint of how to get out, so the
+// failure path has to name the way back itself.
+export const RECOVERY_HINT =
+  "the tree still holds the partial bump — restore it before re-running:\n" +
+  "  git checkout -- Cargo.toml package.json Cargo.lock";
+
+export function failureReport(message, wroteFiles) {
+  return wroteFiles ? `bump-version: ${message}\nbump-version: ${RECOVERY_HINT}` : `bump-version: ${message}`;
+}
+
+// Exit-code convention, shared with the other three release scripts: 1 is a
+// refusal — the script ran, and the operator has something to fix or a
+// fallback to take. 2 is the script itself being unable to complete (no
+// cargo or node on PATH, a registry outage), which says nothing about
+// whether the release is sound.
+export function exitCodeFor(err) {
+  return err instanceof BumpError ? 1 : 2;
+}
+
+let wroteFiles = false;
+
 function main() {
   const version = process.argv[2];
   if (!version || !/^\d+\.\d+\.\d+$/.test(version)) {
@@ -207,6 +231,7 @@ function main() {
   const nextCargoText = bumpCargoToml(cargoText, version);
   const nextPkgText = bumpPackageJson(pkgText, version);
 
+  wroteFiles = true;
   fs.writeFileSync(cargoPath, nextCargoText);
   fs.writeFileSync(pkgPath, nextPkgText);
   console.log(`bump-version: ${from} -> ${version} in Cargo.toml, package.json`);
@@ -221,7 +246,17 @@ function main() {
   assertChangedFiles(git(root, "diff", "--name-only").split("\n").filter(Boolean));
   console.log("bump-version: tree contains only the three version files");
 
-  execFileSync("node", [path.join(root, "scripts", "check-version.js")], { cwd: root, stdio: "inherit" });
+  // A non-zero exit from check-version.js is a real mismatch the operator
+  // must fix (exit 1), not the script failing to run (exit 2) — so it is
+  // re-thrown as a BumpError, while a spawn failure keeps its own identity.
+  try {
+    execFileSync("node", [path.join(root, "scripts", "check-version.js")], { cwd: root, stdio: "inherit" });
+  } catch (err) {
+    if (typeof err.status === "number") {
+      throw new BumpError("check-version.js reported a mismatch — the three version files do not agree");
+    }
+    throw err;
+  }
   console.log(`bump-version: ready to commit \`chore: release ${version}\``);
 }
 
@@ -229,7 +264,7 @@ if (process.argv[1] && path.resolve(process.argv[1]) === path.resolve(fileURLToP
   try {
     main();
   } catch (err) {
-    console.error(`bump-version: ${err.message}`);
-    process.exit(1);
+    console.error(failureReport(err.message, wroteFiles));
+    process.exit(exitCodeFor(err));
   }
 }
