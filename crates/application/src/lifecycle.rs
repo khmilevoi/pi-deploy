@@ -45,8 +45,81 @@ impl ControlLifecycle {
             workdir,
             compose_file,
             override_file,
-            env: Default::default(),
+            // No deploy is in flight, so RPI_COMMIT_SHA comes from the
+            // registry's record of the last successful one.
+            env: pi_domain::runtimevars::rpi_vars(&registered, None),
         };
         self.runtime.lifecycle(&stack, action, log).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::CollectSink;
+    use pi_domain::contracts::{
+        MockContainerRuntime, MockOverrideStore, MockProjectRepository, MockSource,
+    };
+    use pi_domain::entities::{Project, ProjectConfig};
+    use std::path::PathBuf;
+
+    fn project(name: &str) -> Project {
+        Project {
+            config: ProjectConfig {
+                name: name.into(),
+                repo: "r".into(),
+                branch: "main".into(),
+                compose_path: "docker-compose.yml".into(),
+                service: "web".into(),
+                container_port: 3000,
+                hostname: None,
+                expose: Default::default(),
+                healthcheck: Default::default(),
+                timeouts: Default::default(),
+                commands: Default::default(),
+                command_timeout_secs: None,
+                environment: None,
+            },
+            host_port: 8000,
+            created_at: 1,
+            on_create_done: false,
+            last_success_at: None,
+            last_commit_sha: None,
+        }
+    }
+
+    fn deps_with(runtime: MockContainerRuntime, proj: Project) -> Arc<ControlLifecycle> {
+        let mut projects = MockProjectRepository::new();
+        projects
+            .expect_get()
+            .returning(move |_| Ok(Some(proj.clone())));
+        let mut source = MockSource::new();
+        source
+            .expect_workdir()
+            .returning(|name| PathBuf::from("/data").join(name));
+        let mut overrides = MockOverrideStore::new();
+        overrides
+            .expect_path()
+            .returning(|name| PathBuf::from("/overrides").join(name));
+        ControlLifecycle::new(
+            Arc::new(projects),
+            Arc::new(runtime),
+            Arc::new(source),
+            Arc::new(overrides),
+        )
+    }
+
+    #[tokio::test]
+    async fn lifecycle_carries_the_runtime_environment() {
+        let mut runtime = MockContainerRuntime::new();
+        runtime
+            .expect_lifecycle()
+            .withf(|stack, _, _| stack.env["RPI_PROJECT"] == "rateme")
+            .times(1)
+            .returning(|_, _, _| Ok(()));
+        let uc = deps_with(runtime, project("rateme"));
+        uc.execute("rateme", LifecycleAction::Restart, CollectSink::new())
+            .await
+            .unwrap();
     }
 }

@@ -112,8 +112,13 @@ stateDiagram-v2
    then generates rpi's compose override: the fixed host port, bind address
    and restart policy for the public service, plus the `RPI_*` variables on
    every service of the stack. The same variables are also exported into the
-   environment of every `docker compose` call for this project, so a
-   `${RPI_*}` reference inside the project's own compose file resolves too.
+   environment of every `docker compose` call that reads this project's
+   compose file — this deploy's own service listing, build and start, and
+   later `rpi command`, `rpi start`/`stop`/`restart`,
+   `rpi secrets send --apply`, `rpi rm` and `rpi env destroy`/`reset-data` —
+   so a `${RPI_*}` reference inside the project's own compose file resolves
+   there too. (The label-only calls behind `rpi logs`, `rpi status` and
+   `rpi stats` never read the compose file at all, so they need nothing.)
    - *Failure*: a git error, or the fetch stage exceeding its timeout, fails
      the deploy right here. A compose file that cannot be parsed fails the
      service listing and therefore the deploy, before anything is built —

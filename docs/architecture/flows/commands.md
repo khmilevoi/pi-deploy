@@ -76,7 +76,10 @@ sequenceDiagram
    command line) and runs it with `docker compose exec`, inside the pinned
    service if the command specifies one, otherwise the project's main
    service — using the same Compose file, working directory, and deployed
-   override file the project's regular deploy uses. The run is bounded by a
+   override file the project's regular deploy uses, and exporting the same
+   `RPI_*` runtime variables to the `docker compose` call, so a `${RPI_*}`
+   reference in the compose file resolves here just as it did at deploy time
+   (see `flows/deploy.md`). The run is bounded by a
    time budget (ten minutes, unless the project sets its own override); a
    run that hangs past that budget is killed and reported as a timeout, the
    same way a stuck deploy stage would be.
@@ -123,8 +126,8 @@ sequenceDiagram
 - `crates/application/src/command.rs` — the `RunCommand` use case: resolves
   the project and its deployed command (allowlist only, never an arbitrary
   argv), builds the exec target (service, Compose file, override file,
-  workdir), enforces the run's time budget, and returns the in-container
-  exit code.
+  workdir, `RPI_*` runtime variables), enforces the run's time budget, and
+  returns the in-container exit code.
 - `crates/bin/src/cli/commands.rs` — the CLI side of `rpi command`: the
   no-name listing (deployed commands plus the "declared but never deployed"
   hint), and the run path that streams every output line straight to stdout

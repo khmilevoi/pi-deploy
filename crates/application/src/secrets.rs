@@ -88,6 +88,22 @@ impl SendSecrets {
             files,
             bundle.secret_file_mode()
         ));
+        // The override is rewritten from scratch here, so it must carry the
+        // same services and RPI_* map the last deploy put there — otherwise
+        // `secrets send --apply` would silently strip the runtime environment
+        // from every container until the next deploy. No deploy is in flight,
+        // so RPI_COMMIT_SHA comes from the registry's stored sha.
+        let stack_env = pi_domain::runtimevars::rpi_vars(&registered, None);
+        let services = self
+            .runtime
+            .services(&ComposeStack {
+                project_name: config.name.clone(),
+                workdir: workdir.clone(),
+                compose_file: workdir.join(&config.compose_path),
+                override_file: self.overrides.path(project),
+                env: stack_env.clone(),
+            })
+            .await?;
         let override_file = self
             .overrides
             .write(
@@ -96,8 +112,8 @@ impl SendSecrets {
                 registered.config.expose.bind_addr(),
                 registered.host_port,
                 config.container_port,
-                &[],
-                &Default::default(),
+                &services,
+                &stack_env,
             )
             .await?;
         let stack = ComposeStack {
@@ -105,7 +121,7 @@ impl SendSecrets {
             workdir: workdir.clone(),
             compose_file: workdir.join(&config.compose_path),
             override_file,
-            env: Default::default(),
+            env: stack_env,
         };
         self.runtime.up(&stack, log).await?;
         Ok(SecretsSaved {
@@ -298,10 +314,24 @@ mod tests {
             .withf(|wd, b| wd == Path::new("/wd/rateme") && b.vars.len() == 2 && b.files.len() == 1)
             .times(1)
             .returning(|_, _| Ok(()));
+        m.runtime
+            .expect_services()
+            .returning(|_| Ok(vec!["web".into()]));
+        // The discovery stack is built before `write` returns a path, so the
+        // apply asks the store where the override lives.
+        m.overrides
+            .expect_path()
+            .returning(|p| PathBuf::from("/ov").join(p));
         m.overrides
             .expect_write()
-            .withf(|p, s, bind, hp, cp, _, _| {
-                p == "rateme" && s == "web" && bind == "127.0.0.1" && *hp == 8000 && *cp == 3000
+            .withf(|p, s, bind, hp, cp, services, env| {
+                p == "rateme"
+                    && s == "web"
+                    && bind == "127.0.0.1"
+                    && *hp == 8000
+                    && *cp == 3000
+                    && services == ["web".to_string()]
+                    && env["RPI_PROJECT"] == "rateme"
             })
             .times(1)
             .returning(|_, _, _, _, _, _, _| Ok(PathBuf::from("/ov/rateme.yml")));

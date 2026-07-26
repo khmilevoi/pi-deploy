@@ -23,6 +23,7 @@ sequenceDiagram
     alt --apply flag set
         API->>API: arm log masking with the bundle just received
         API->>Co: write .env + secret files into the existing checkout, .env 0600, files 0644 (or [secrets].file_mode)
+        API->>Runtime: list services, rewrite override (port, bind, RPI_* on every service)
         API->>Runtime: up -d (recreate affected containers)
     else no --apply (default)
         Note over API: bundle stored only, nothing injected yet
@@ -71,7 +72,15 @@ sequenceDiagram
      passed `--apply`, the agent writes `.env` and the secret files straight
      into the project's existing checkout and recreates the affected
      containers — using the bundle it already has in memory from the
-     request itself, with no decrypt step involved.
+     request itself, with no decrypt step involved. Because bringing the
+     stack back up regenerates rpi's compose override from scratch, this
+     path re-derives exactly what a deploy would put there — the public
+     service's host port, bind address and restart policy, plus the `RPI_*`
+     runtime variables on every service of the stack (see
+     `flows/deploy.md`) — so applying secrets never strips a container's
+     runtime environment. The commit sha in that environment is the one the
+     registry recorded for the project's last successful deploy; applying
+     secrets does not fetch anything.
    - **Later, on `rpi deploy`.** Every deploy loads whatever is currently
      stored for that project — decrypting it in the process — and writes it
      into the freshly fetched checkout before the stack starts. This is the
@@ -139,9 +148,16 @@ sequenceDiagram
    aborts that write instead of touching the filesystem outside the
    checkout.
 
+9. **Failure: an unparsable compose file blocks `--apply`.** Regenerating
+   the override starts by asking Docker to list the project's services, so a
+   compose file that cannot be parsed fails the apply before anything is
+   recreated, leaving the running containers untouched. The bundle has
+   already been saved and written into the checkout by then, so the next
+   deploy — or a re-run once the compose file parses — picks it up.
+
 ## Source anchors
 
-- `crates/application/src/secrets.rs` — send/list secrets use cases: validates the bundle isn't empty, saves it, and (with `--apply`) re-injects it and restarts the affected containers immediately.
+- `crates/application/src/secrets.rs` — send/list secrets use cases: validates the bundle isn't empty, saves it, and (with `--apply`) re-injects it, regenerates the compose override (ports plus the `RPI_*` variables on every discovered service), and restarts the affected containers immediately.
 - `crates/bin/src/cli/rpitoml.rs` (`SecretsSection` only) — the `[secrets]` table in `rpi.toml`: names the local env file `rpi secrets send` reads (`[secrets].env`, default `.env`), the extra files it reads verbatim (`[secrets].files`), and the optional `[secrets].file_mode` override, parsed and validated by `pi_domain::secretmode`.
 - `crates/application/src/mask.rs` — `MaskingSink`: replaces armed secret values (6+ characters) with `***KEY***` in every line logged afterward.
 - `crates/infrastructure/src/secrets.rs` — `EncryptedFileStore`: age-encrypts and decrypts the bundle at rest, one file per project, using an agent identity key kept at file mode 0600.
