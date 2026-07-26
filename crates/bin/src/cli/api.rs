@@ -844,6 +844,55 @@ mod tests {
         assert!(err.contains("update the agent on the Pi"), "{err}");
     }
 
+    /// Task 11 review: the CLI's old-agent decision (`commands.rs`'s
+    /// `secrets_push` no-group branch) sends `expected_revision: None` when
+    /// the agent predates secret groups. Pin what that actually puts on the
+    /// wire — the field must be *absent* (not `null`), matching
+    /// `SecretsSendRequest`'s `skip_serializing_if` — and that a response
+    /// shaped like a genuinely old agent's (no `revision` field at all)
+    /// still decodes, with `revision` falling back to the serde default `0`.
+    #[tokio::test]
+    async fn send_secrets_with_no_expected_revision_omits_it_from_the_wire() {
+        let captured: Arc<Mutex<Option<serde_json::Value>>> = Arc::new(Mutex::new(None));
+        let captured2 = captured.clone();
+        let app = Router::new().route(
+            "/v1/projects/{name}/secrets",
+            put(move |axum::Json(body): axum::Json<serde_json::Value>| {
+                let captured2 = captured2.clone();
+                async move {
+                    *captured2.lock().unwrap() = Some(body);
+                    // Shaped like a pre-0.27.0 agent's response: no
+                    // `revision` field, because that field is new in this
+                    // task and such an agent never sends it.
+                    axum::Json(serde_json::json!({
+                        "saved_keys": 1,
+                        "saved_files": 0,
+                        "applied": false
+                    }))
+                }
+            }),
+        );
+        let client = ApiClient::new(spawn_app(app).await);
+
+        let mut vars = BTreeMap::new();
+        vars.insert("KEY".to_string(), "value".to_string());
+        let resp = client
+            .send_secrets("demo", vars, BTreeMap::new(), None, None, false)
+            .await
+            .unwrap();
+
+        let body = captured.lock().unwrap().take().unwrap();
+        assert!(
+            body.as_object().unwrap().get("expected_revision").is_none(),
+            "expected_revision must be omitted, not sent as null: {body}"
+        );
+        assert_eq!(
+            resp.revision, 0,
+            "an old agent's response has no revision; the serde default must not be mistaken for a real one by the caller"
+        );
+        assert_eq!(resp.saved_keys, 1);
+    }
+
     #[tokio::test]
     async fn push_secret_group_round_trips_request_and_response() {
         // Captures what the server actually received, so assertions run in

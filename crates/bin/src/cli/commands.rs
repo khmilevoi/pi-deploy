@@ -362,24 +362,32 @@ pub async fn secrets_push(
             // "the lookup itself failed" (a transient network/server error,
             // which must surface via `?` rather than silently downgrading to
             // an unconditional write).
-            let expected = if !compat.supports(crate::compat::Feature::SecretGroups) {
+            let supports_revisions = compat.supports(crate::compat::Feature::SecretGroups);
+            if !supports_revisions {
                 output::warn(
                     "this agent predates secret groups: the overwrite guard is unavailable, \
                      so a concurrent change on the agent will be replaced silently",
                 );
-                None
-            } else if force {
-                None
-            } else {
+            }
+            let expected = if should_look_up_key_revision(supports_revisions, force) {
                 Some(api.head_key_secrets(&project_name).await?.revision)
+            } else {
+                None
             };
             let (n, m) = (vars_map.len(), files.len());
             let resp = api
                 .send_secrets(&project_name, vars_map, files, file_mode, expected, apply)
                 .await?;
-            output::success(format!(
-                "saved {n} key(s) and {m} file(s) for project '{project_name}' (revision {})",
-                resp.revision
+            // An agent that predates secret groups never populates
+            // `SecretsSendResponse.revision` — it deserializes as the serde
+            // default `0`, which is not the agent's real state and must
+            // never be printed as if it were (that agent has no revision
+            // concept at all, `--force` or not).
+            output::success(render_key_secrets_saved(
+                &project_name,
+                n,
+                m,
+                supports_revisions.then_some(resp.revision),
             ));
             if resp.applied {
                 output::success("secrets applied to running containers");
@@ -387,6 +395,38 @@ pub async fn secrets_push(
         }
     }
     Ok(())
+}
+
+/// Whether `rpi secrets push` (no `--group`) should look up the deploy key's
+/// current revision before writing. Skipped both when the agent predates
+/// secret groups (the lookup route doesn't exist there) and when `--force`
+/// asks for an unconditional write regardless of what is currently
+/// stored — in either case there is nothing to compare against, so the
+/// write goes out with `expected_revision: None`.
+fn should_look_up_key_revision(supports_revisions: bool, force: bool) -> bool {
+    supports_revisions && !force
+}
+
+/// `rpi secrets push` (no `--group`) success line. `revision` is `None`
+/// exactly when the agent predates secret groups (Task 11): that agent's
+/// `SecretsSendResponse` never carries a real revision, so
+/// `SecretsSendResponse.revision` decodes as the serde default `0` — a
+/// number that must never be printed as if it reflected the agent's actual
+/// state. When the agent does support secret groups, `revision` is shown
+/// whether or not `--force` was used, because the store always returns the
+/// write's real new revision regardless of whether it was guarded.
+pub(crate) fn render_key_secrets_saved(
+    project: &str,
+    keys: usize,
+    files: usize,
+    revision: Option<u64>,
+) -> String {
+    match revision {
+        Some(r) => format!(
+            "saved {keys} key(s) and {files} file(s) for project '{project}' (revision {r})"
+        ),
+        None => format!("saved {keys} key(s) and {files} file(s) for project '{project}'"),
+    }
 }
 
 /// `--apply` after a group push: apply to the project the current config
@@ -1311,6 +1351,50 @@ pub async fn config_show(env: Option<String>, vars: Vec<String>) -> anyhow::Resu
 mod tests {
     use super::*;
     use crate::cli::rpitoml::SecretsSection;
+
+    /// The old-agent decision from Task 11's review: skip the lookup (and so
+    /// send `expected_revision: None`) exactly when the agent predates
+    /// secret groups or `--force` was passed; look it up otherwise.
+    #[test]
+    fn key_revision_lookup_is_skipped_for_old_agents_and_force() {
+        assert!(
+            !should_look_up_key_revision(false, false),
+            "old agent, no --force: no lookup route exists"
+        );
+        assert!(
+            !should_look_up_key_revision(false, true),
+            "old agent with --force: still no lookup route"
+        );
+        assert!(
+            !should_look_up_key_revision(true, true),
+            "--force: unconditional write, nothing to compare against"
+        );
+        assert!(
+            should_look_up_key_revision(true, false),
+            "normal case: must guard against a concurrent change"
+        );
+    }
+
+    /// The bug the Task 11 review caught: printing `(revision 0)` against an
+    /// agent that predates secret groups, because
+    /// `SecretsSendResponse.revision` decodes as the serde default `0` for a
+    /// response that never carried the field. `render_key_secrets_saved`
+    /// must omit the suffix entirely rather than print that fabricated `0`.
+    #[test]
+    fn key_secrets_saved_hides_the_revision_for_an_agent_that_never_sent_one() {
+        let text = render_key_secrets_saved("myapp", 2, 1, None);
+        assert_eq!(text, "saved 2 key(s) and 1 file(s) for project 'myapp'");
+        assert!(!text.contains("revision"), "got: {text}");
+    }
+
+    #[test]
+    fn key_secrets_saved_shows_the_revision_when_the_agent_reports_one() {
+        let text = render_key_secrets_saved("myapp", 2, 1, Some(5));
+        assert_eq!(
+            text,
+            "saved 2 key(s) and 1 file(s) for project 'myapp' (revision 5)"
+        );
+    }
 
     #[test]
     fn rm_confirmation_names_groups_and_affected_environments() {
