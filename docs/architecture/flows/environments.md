@@ -120,8 +120,12 @@ sequenceDiagram
    value.
 4. The merged, revalidated configuration's `project.name` is overwritten
    with the derived key: `<base>--<env>` for a static overlay, or
-   `<base>--<env>--<slug>` once `${RPI_ENV_SLUG}` was actually substituted
-   somewhere. The overlay's own `[environment]` section (`ttl`, `on_create`)
+   `<base>--<env>--<slug>` once the overlay actually turned out to be
+   parameterized — any `${...}` substitution in `source.branch` or
+   `ingress.hostname`, not only a literal `${RPI_ENV_SLUG}` reference, since
+   `${BRANCH_NAME}` alone in `source.branch` (as a per-branch preview's
+   `source.branch = "${BRANCH_NAME}"` typically is) is enough to derive the
+   slug from. The overlay's own `[environment]` section (`ttl`, `on_create`)
    is pulled out separately rather than merged into the deployed config; if
    `on_create` is set, it must name a command that survives in the merged
    `[commands]` table (which the overlay may itself have replaced wholesale),

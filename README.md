@@ -76,7 +76,7 @@ rpi setup                        # wizard: SSH profile for your Pi
 
 ```bash
 rpi init                         # wizard: generates rpi.toml
-rpi secrets send                 # only if the project needs secrets
+rpi secrets push                 # only if the project needs secrets
 rpi deploy
 ```
 
@@ -97,8 +97,11 @@ That's it — `rpi ls` shows the project, its host port, and its public hostname
 | `rpi doctor` | Environment self-diagnosis |
 | `rpi gc` | Prune Docker images and build cache on the Pi |
 | `rpi command [name] [-- <args>] [--env <name> --vars K=V]` | Run a `[commands]` entry in the service container; no name lists them |
-| `rpi secrets send [--apply] [--env <name> --vars K=V]` | Send the env file and secret files (encrypted at rest) |
-| `rpi secrets ls [--env <name> --vars K=V]` | List stored env keys and file paths (values are never transmitted) |
+| `rpi secrets push [--group <name>] [--merge] [--force] [--apply] [--env <name> --vars K=V]` | Push the env file and secret files to a group, or to this project's own bundle (encrypted at rest); `rpi secrets send` is a deprecated alias with no `--group` |
+| `rpi secrets ls [--group <name>] [--env <name> --vars K=V]` | List the effective merged secrets, or one group's head with `--group` (names, paths, sizes, revisions — values are never transmitted) |
+| `rpi secrets diff [--group <name>] [--env <name> --vars K=V]` | Compare local secret sources against the agent by digest, without pushing |
+| `rpi secrets group ls [--env <name> --vars K=V]` | List this project's secret groups and who attaches each one |
+| `rpi secrets group rm <name> [--force] [--env <name> --vars K=V]` | Delete a secret group |
 | `rpi config show [--env <name> --vars K=V]` | Print the resolved `rpi.toml`, overlay merged in, without contacting the agent |
 | `rpi env ls [--all]` | List deployed environments for this project, or every environment with `--all` |
 | `rpi env destroy <name> [--vars K=V] [--yes]` | Tear down an environment: stack, volumes, ingress route, DNS, secrets, registry row |
@@ -380,17 +383,29 @@ services:
 
 ## Secrets
 
-If `rpi.toml` has a `[secrets]` section, send the bundle from the project root before the first deploy:
+If `rpi.toml` has a `[secrets]` section, push the bundle from the project root before the first deploy:
 
 ```bash
-rpi secrets send          # save on the agent; applied by the next deploy
-rpi secrets send --apply  # save and restart the running stack with the new values
-rpi secrets ls            # list stored env keys and file paths (never values)
+rpi secrets push          # save to this project's own bundle; applied by the next deploy
+rpi secrets push --apply  # save and restart the running stack with the new values
+rpi secrets ls            # list the effective merged secrets (never values)
 ```
 
-The CLI reads the local env file and `[secrets].files`, sends them encrypted, and the agent stores an age-encrypted bundle in `/var/lib/rpi/secrets`. During `rpi deploy` the agent writes them into the project workdir before running Docker Compose.
+`rpi secrets send` still works as a deprecated alias for `rpi secrets push` with no `--group`.
 
-By default `.env` is written `0600` and every file from `[secrets].files` is written `0644` — deliberately wider, because a container that consumes a bind-mounted secret usually runs as its own image's uid, not the agent's, and Docker has no way to `chown`/`chmod` a `file:`-sourced Compose secret on its own. Set `[secrets].file_mode` (see the sample above) to use one mode for both instead; it requires an agent `>= 0.26.0`. **The mode travels with the bundle**, so changing `file_mode` only takes effect the next time you actually send it — `rpi secrets send` (or `--apply`) — not on a plain `rpi deploy`, which just reuses whatever bundle (and mode) is already stored.
+The CLI reads the local env file and `[secrets].files`, sends them encrypted, and the agent stores an age-encrypted bundle in `/var/lib/rpi/secrets`. During `rpi deploy` the agent writes them into the project workdir before running Docker Compose. No command or endpoint ever returns a secret value — only names, paths, sizes, revisions and digests, whether pushing, listing, or diffing.
+
+**Secret groups** are a named, reusable set of secrets owned by a base project and attached from `[secrets].groups = ["shared"]` in `rpi.toml`, so a new branch preview picks them up on its first deploy instead of needing its own upload:
+
+```bash
+rpi secrets push --group shared  # push (or rotate) the named group once
+rpi secrets group ls             # this project's groups and who attaches each one
+rpi secrets group rm shared      # delete a group (--force if a project still declares it)
+```
+
+Declared groups apply in the order listed, then this deploy key's own bundle on top; a declared group that is missing or empty fails the deploy naming the group. Every push is a conditional write guarded by a revision — a stale push is refused with an HTTP 409 unless `--force` is passed. Groups require an agent `>= 0.27.0` (the `secret-groups` capability); `rpi rm <project>` on a base project drops its groups, but `rpi env destroy` never does.
+
+By default `.env` is written `0600` and every file from `[secrets].files` is written `0644` — deliberately wider, because a container that consumes a bind-mounted secret usually runs as its own image's uid, not the agent's, and Docker has no way to `chown`/`chmod` a `file:`-sourced Compose secret on its own. Set `[secrets].file_mode` (see the sample above) to use one mode for both instead; it requires an agent `>= 0.26.0`. **The mode travels with the bundle**, so changing `file_mode` only takes effect the next time you actually push it — `rpi secrets push` (or `--apply`) — not on a plain `rpi deploy`, which just reuses whatever bundle (and mode) is already stored.
 
 ## Private Git Repositories
 

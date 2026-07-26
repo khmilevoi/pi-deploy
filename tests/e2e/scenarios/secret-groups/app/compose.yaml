@@ -1,0 +1,10 @@
+services:
+  web:
+    build: .
+    expose:
+      - "8080"
+    # SHARED_TOKEN comes from the group; the agent writes the merged bundle
+    # into .env in this same directory before every `docker compose up`, so
+    # env_file always sees the current value -- rotated or not.
+    env_file:
+      - .env

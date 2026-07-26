@@ -233,17 +233,43 @@ sequenceDiagram
     deploy — both lookups simply drop their clause on a pre-0.27.0 agent that
     doesn't support secret groups, rather than failing the command.
 
+12. **Conditional writes: revision, `expected_revision`, and the `--force`
+    bypass.** Both write paths above — the per-key push in the diagram and
+    the group push item 10 describes — go through the same conditional-write
+    guard in the store, reached through `GroupRef` rather than two separate
+    mechanisms. Every stored bundle, named group or deploy key's own, carries
+    a revision counter that increments by one on each successful write.
+    Unless `--force` is passed, the CLI first reads the target's current
+    head to learn that revision, then sends the push with it as
+    `expected_revision`; the agent commits the write only if the store's
+    live revision still equals `expected_revision` at that moment — checked
+    and updated under the same per-store lock, so two concurrent pushes can
+    never both pass the check against the same starting revision. A stale
+    expectation (someone else pushed in between the CLI's read and its
+    write) is rejected as `DomainError::Conflict`, which the agent surfaces
+    as HTTP 409 with a message naming both revisions and pointing at the
+    fix: re-run to see what changed, or pass `--force` to overwrite anyway.
+    `--force` skips the head read entirely and sends no `expected_revision`,
+    which always writes unconditionally regardless of what is currently
+    stored. Either way a successful write returns the new revision, which is
+    what lets `rpi secrets push`'s success line report "now at revision N".
+    An agent that predates secret groups (< 0.27.0) never had this guard on
+    the per-key path either — a CLI new enough to ask for it there prints a
+    one-time warning that the overwrite guard is unavailable and a
+    concurrent change on that agent will be replaced silently, then sends
+    the same unconditional write every pre-0.27.0 CLI always has.
+
 ## Source anchors
 
 - `crates/application/src/secrets.rs` — `SendSecrets` (save a deploy key's own bundle), `HeadKeySecrets` (metadata-only projection of that bundle, never a value), `ApplySecrets` (resolves the key's full layer stack via `effective_secrets` and re-injects + `up -d` — the one implementation `--apply` and `POST .../secrets/apply` both call), and `ListSecrets` (resolves that same layer stack read-only, via its own `ProjectRepository` lookup rather than calling `effective_secrets`, because a declared-but-empty group must not fail a listing the way it fails a deploy — `rpi secrets ls`'s `StoredSecrets.layers` carries each layer's own, unmerged names alongside the merged view).
 - `crates/application/src/secretgroups.rs` — group CRUD use cases (`PushSecretGroup`, `ShowSecretGroup`, `ListSecretGroups`, `RemoveSecretGroup`): the only place that joins the vault (`SecretStore`) with the project registry, e.g. to report which projects declare a group or to refuse deleting one still declared.
 - `crates/application/src/remove.rs` — `RemoveProject`: always removes the target's own key bundle, and additionally calls `SecretStore::remove_base` when (and only when) `existing.config.environment.is_none()` — the base-vs-environment check item 11 describes. `rpi rm` and `rpi env destroy`/the TTL reaper (`flows/environments.md`) both tear down through this one use case, so the base/environment split lives in exactly one place.
-- `crates/bin/src/agent/http.rs` (secrets + secret-group routes) — validates and decodes an incoming bundle once (`decode_secret_payload`, shared by the per-key and group write paths), validates a group name with the same rule the `rpi.toml` parser uses (`pi_domain::secretgroup::validate_group_name`), and serves both route families; no handler ever serializes a secret value.
+- `crates/bin/src/agent/http.rs` (secrets + secret-group routes) — validates and decodes an incoming bundle once (`decode_secret_payload`, shared by the per-key and group write paths), validates a group name with the same rule the `rpi.toml` parser uses (`pi_domain::secretgroup::validate_group_name`), and serves both route families; no handler ever serializes a secret value. `ApiError`'s `IntoResponse` maps `DomainError::Conflict` (item 12's stale-revision case) to HTTP 409 for every route in this file, not only the secret ones.
 - `crates/bin/src/proto.rs` (secrets + secret-group DTOs) — wire shapes for both route families; group and head responses carry names, digests, sizes and revisions only. `SecretsListResponse.layers` (`Vec<SecretLayerDto>`) carries the per-layer provenance `rpi secrets ls` renders; absent (not merely empty) from an agent older than 0.27.0, which is how the CLI tells "nothing to show" apart from "this agent doesn't know about layers."
-- `crates/bin/src/cli/commands.rs` (`secrets_push`, `secrets_diff`, `secrets_ls`, `secrets_group_ls`, `secrets_group_rm`) — the CLI side of every route above; `effective_rows` turns a `SecretsListResponse` into (name, winning layer, shadowed?) rows for `secrets_ls`'s effective view, and `render_group_head` renders one group's head (revision, names, digests, sizes) for `secrets_ls --group`. `rm_confirmation_text` (used by `rm`) is the pure function behind item 11's confirmation wording; `rm` feeds it best-effort `list_secret_groups`/`list_environments` results before prompting.
+- `crates/bin/src/cli/commands.rs` (`secrets_push`, `secrets_diff`, `secrets_ls`, `secrets_group_ls`, `secrets_group_rm`) — the CLI side of every route above; `effective_rows` turns a `SecretsListResponse` into (name, winning layer, shadowed?) rows for `secrets_ls`'s effective view, and `render_group_head` renders one group's head (revision, names, digests, sizes) for `secrets_ls --group`. `rm_confirmation_text` (used by `rm`) is the pure function behind item 11's confirmation wording; `rm` feeds it best-effort `list_secret_groups`/`list_environments` results before prompting. `secrets_push` is also where item 12's client half lives: it reads the target's head to compute `expected_revision` unless `--force`, and `should_look_up_key_revision` decides whether that read happens at all on the per-key path (never against an agent that predates secret groups, since the lookup route itself wouldn't exist there).
 - `crates/bin/src/cli/rpitoml.rs` (`SecretsSection` only) — the `[secrets]` table in `rpi.toml`: names the local env file `rpi secrets send` reads (`[secrets].env`, default `.env`), the extra files it reads verbatim (`[secrets].files`), the declared group list (`[secrets].groups`, carried into `ProjectConfig.secret_groups` in declared order by `to_project_config`), and the optional `[secrets].file_mode` override, parsed and validated by `pi_domain::secretmode`.
 - `crates/application/src/mask.rs` — `MaskingSink`: replaces armed secret values (6+ characters) with `***KEY***` in every line logged afterward.
-- `crates/infrastructure/src/secrets.rs` — `EncryptedFileStore`: age-encrypts and decrypts the bundle at rest, one file per project or named group, using an agent identity key kept at file mode 0600.
+- `crates/infrastructure/src/secrets.rs` — `EncryptedFileStore`: age-encrypts and decrypts the bundle at rest, one file per project or named group, using an agent identity key kept at file mode 0600; `save` also owns the conditional-write guard (item 12) — the revision compare-and-set against `expected`, `DomainError::Conflict` on a mismatch — under a per-store lock that makes the whole read-compare-write atomic.
 - `crates/infrastructure/src/secretsfile.rs` — `FsSecretsWriter`: writes `.env` (0600 by default) and secret files (0644 by default; both overridable by `bundle.file_mode`/`[secrets].file_mode`) into a checkout, creates directories at 0755 and widens a directory it created earlier at exactly 0700, replaces the previous bundle's files via a small manifest (always 0600), and guards every write and cleanup against symlink escapes.
 - `crates/infrastructure/src/secretpath.rs` — shared relative-path validation and symlink-safe path resolution, used by both the CLI (before sending) and the agent (before writing).
 - `crates/infrastructure/src/dotenv.rs` — `.env` parsing and serialization shared by the CLI (reading the local file to send) and the agent (writing the injected file).

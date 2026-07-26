@@ -1,0 +1,12 @@
+[source]
+branch = "${BRANCH_NAME}"
+
+[ingress]
+hostname = ""
+
+# Every environment derived from this overlay declares the same group as the
+# base project -- that's the whole point: the group is pushed once, against
+# the base, and every branch preview picks it up without a second upload.
+[secrets]
+env = ".env.shared"
+groups = ["shared"]

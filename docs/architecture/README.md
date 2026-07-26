@@ -22,7 +22,7 @@ Start with the three system documents, then dip into flows as needed.
 |---|---|
 | [deploy](flows/deploy.md) — the deploy pipeline's stages and its one-slot "latest wins" queue | what happens on `rpi deploy` |
 | [connect](flows/connect.md) — picking a target, tunneling over SSH, and checking protocol compatibility | how the CLI reaches the Pi |
-| [secrets](flows/secrets.md) — how a project's secrets travel from a developer's machine into a running container | `rpi secrets send` and injection |
+| [secrets](flows/secrets.md) — how a project's secrets travel from a developer's machine into a running container, including secret groups shared across environments | `rpi secrets push`/groups and injection |
 | [ingress](flows/ingress.md) — routing a public hostname to a container through a Cloudflare Tunnel | publishing to the internet |
 | [agent-setup](flows/agent-setup.md) — getting the `rpi` binary onto a board and turning it into a systemd service | bootstrapping a board |
 | [agent-update](flows/agent-update.md) — bringing a board's agent up to a chosen version | `rpi upgrade` |

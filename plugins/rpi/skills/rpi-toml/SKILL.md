@@ -42,6 +42,7 @@ files = [                        # optional; recreated at the same paths on the 
   "certs/server.pem",
 ]
 # file_mode = "0640"             # optional; default 0644 for files, 0600 for .env
+# groups = ["shared"]            # optional; named secret sets attached from the base project
 ```
 
 Worker, bot, or internal service without public HTTP ingress:
@@ -79,6 +80,7 @@ port = 3000
 | `secrets.env` | no | `".env"` | Local env file read by `rpi secrets send`. |
 | `secrets.files` | no | none | Optional list of local secret file paths (certs, keys), forward-slash relative, `..` rejected; recreated verbatim on the Pi on every deploy. |
 | `secrets.file_mode` | no | none | `^0?[0-7]{3}$` (e.g. `"0640"`/`"640"`); owner read required, owner write optional, group/other read optional, nothing else. Overrides both the `0644` default for `secrets.files` and the `0600` default for `.env` at once — a container consuming a bind-mounted secret usually isn't the agent's uid, so the file mode is what decides whether it can read it. Requires an agent `>= 0.26.0` (`secret-modes` capability); the mode travels with the bundle, so it takes effect on the next `rpi secrets send`, not a `rpi deploy` that reuses an already-stored bundle. |
+| `secrets.groups` | no | none | Ordered array of secret-group names attached from this project's base namespace, e.g. `["common", "preview"]`. Each name must match `^[a-z][a-z0-9-]*$`, max 40 characters. Applied in declared order at deploy time, then this deploy key's own bundle on top — a later layer replaces an earlier one per variable/file, and `file_mode` comes from the last layer that set one. An overlay's `groups` field replaces the base's list wholesale, same as `secrets.files`; `groups = []` in an overlay detaches every group. A declared group that is missing or empty fails the deploy naming the group and the `rpi secrets push --group <name>` command to fix it. Requires an agent `>= 0.27.0` (`secret-groups` capability). See `rpi-cli`'s secrets section for the `rpi secrets push --group`/`group ls`/`group rm` commands that manage groups, and `docs/architecture/flows/secrets.md` for the full layering and conditional-write rules. |
 | `commands.<name>` | no | none | String (shell-word split, quotes only) or argv array. Name: `[a-z0-9][a-z0-9_-]*`. Registered at deploy, run via `rpi command`. |
 | `timeouts.command` | no | `"600s"` | Budget for one `rpi command` run. |
 
@@ -155,11 +157,12 @@ Rules:
   field-wise (an overlay field present overwrites the base value; absent
   leaves the base value untouched); nested tables (`[ingress]`,
   `[healthcheck]`, `[timeouts]`, `[secrets]`) merge field-wise the same way;
-  `[commands]` and array fields (`secrets.files`) replace **wholesale** — an
-  overlay `[commands]` table drops every base command not repeated in it; an
-  explicit empty string (`""`) on an optional field (e.g. `ingress.hostname`,
-  `secrets.env`, `secrets.file_mode`) resets it to unset rather than being
-  ignored.
+  `[commands]` and array fields (`secrets.files`, `secrets.groups`) replace
+  **wholesale** — an overlay `[commands]` table drops every base command not
+  repeated in it, and an overlay `groups = []` detaches every group the base
+  declared; an explicit empty string (`""`) on an optional field (e.g.
+  `ingress.hostname`, `secrets.env`, `secrets.file_mode`) resets it to unset
+  rather than being ignored.
 - **Interpolation** (`${VAR}`) is allowed only in `source.branch` and
   `ingress.hostname` — anywhere else is a parse error, including inside
   `[commands]`, an argv array, or a command table's `service`. Supported
@@ -172,7 +175,10 @@ Rules:
   `--vars BRANCH_NAME=...` is an error.
 - **Key derivation**: the deployed `project.name` is always CLI-derived, never
   read from the overlay — `<base>--<env>` for a static overlay, or
-  `<base>--<env>--<slug>` once `${RPI_ENV_SLUG}` was actually substituted.
+  `<base>--<env>--<slug>` once the overlay actually turned out to be
+  parameterized (any `${...}` substitution in `source.branch` or
+  `ingress.hostname` — `${BRANCH_NAME}` alone in `source.branch` is enough,
+  not only a literal `${RPI_ENV_SLUG}` reference).
   `--` in a project name is reserved for this; a base `rpi.toml` whose
   `project.name` contains `--` is rejected agent-side.
 - If the base `rpi.toml` sets `[ingress].hostname`, the overlay must
