@@ -947,16 +947,65 @@ pub async fn command(
     Ok(())
 }
 
+/// Confirmation text for `rpi rm`. Groups and still-registered environments
+/// are named because deleting a base project takes its groups with it, and
+/// any environment left behind will fail its next deploy on the missing
+/// group — loud beats silent.
+pub fn rm_confirmation_text(
+    project: &str,
+    groups: usize,
+    environments: &[String],
+    with_volumes: bool,
+) -> String {
+    let mut text = format!(
+        "this removes containers{}, the ingress route, workdir, secrets, deploy key and history of '{project}'",
+        if with_volumes { " and volumes" } else { "" }
+    );
+    if groups > 0 {
+        text.push_str(&format!(", plus {groups} secret group(s)"));
+    }
+    if !environments.is_empty() {
+        text.push_str(&format!(
+            "\nenvironments that would lose those groups and fail their next deploy: {}",
+            environments.join(", ")
+        ));
+    }
+    text
+}
+
 pub async fn rm(
     project: String,
     volumes: bool,
     yes: bool,
     connect: ConnectOpts,
 ) -> anyhow::Result<()> {
+    let AgentConn {
+        tunnel: _tunnel,
+        api,
+        compat: _compat,
+    } = crate::cli::connect::connect_agent(connect).await?;
+
     if !yes {
-        output::warn(format!(
-            "this removes containers{}, the ingress route, workdir, secrets, deploy key and history of '{project}'",
-            if volumes { ", VOLUMES (project data!)" } else { "" }
+        // Both lookups are best-effort: a pre-0.27.0 agent has no secret-groups
+        // endpoint, and the confirmation must not fail the command over it —
+        // it simply omits the group/environment clauses.
+        let groups = api
+            .list_secret_groups(&project)
+            .await
+            .ok()
+            .map(|resp| resp.groups.len())
+            .unwrap_or(0);
+        let environments: Vec<String> = api
+            .list_environments(Some(&project))
+            .await
+            .ok()
+            .map(|envs| envs.into_iter().map(|e| e.key).collect())
+            .unwrap_or_default();
+        output::warn(rm_confirmation_text(
+            &project,
+            groups,
+            &environments,
+            volumes,
         ));
         eprint!("type the project name to confirm: ");
         use std::io::Write;
@@ -968,11 +1017,6 @@ pub async fn rm(
         }
     }
 
-    let AgentConn {
-        tunnel: _tunnel,
-        api,
-        compat: _compat,
-    } = crate::cli::connect::connect_agent(connect).await?;
     let resp = api.remove_project(&project, volumes).await?;
     output::success(format!(
         "project '{}' removed{}",
@@ -1255,6 +1299,17 @@ pub async fn config_show(env: Option<String>, vars: Vec<String>) -> anyhow::Resu
 mod tests {
     use super::*;
     use crate::cli::rpitoml::SecretsSection;
+
+    #[test]
+    fn rm_confirmation_names_groups_and_affected_environments() {
+        let text = rm_confirmation_text("myapp", 2, &["myapp--test".into()], true);
+        assert!(text.contains("2 secret group(s)"), "got: {text}");
+        assert!(text.contains("myapp--test"), "got: {text}");
+
+        let plain = rm_confirmation_text("myapp", 0, &[], false);
+        assert!(!plain.contains("secret group"), "got: {plain}");
+        assert!(!plain.contains("environment"), "got: {plain}");
+    }
 
     /// Minimal `rpi.toml` text, mirroring `cli::overlay::tests::BASE`.
     const SAMPLE_BASE: &str = r#"

@@ -232,6 +232,14 @@ sequenceDiagram
       leaves the registry row in place, so the reaper or a repeated
       `env destroy` can finish the remainder later instead of orphaning
       state with no registry trace at all.
+      **The "secrets bundle" removed here is only this environment's own key
+      bundle — never the groups its base project declared.** `RemoveProject`
+      drops a base's declared groups too (`SecretStore::remove_base`), but
+      only when it is tearing down the base itself
+      (`config.environment.is_none()`); an environment key always fails that
+      check, so `env destroy` can never take the shared groups a sibling
+      environment still attaches (`flows/secrets.md` item 11 has the full
+      rule).
     - `reset-data` (`POST /v1/environments/{key}/reset-data`) is narrower:
       it only tears down the stack's containers and named volumes
       (`compose down -v`) and clears `on_create_done` back to `false` — the
@@ -248,7 +256,12 @@ sequenceDiagram
     creation time if it never deployed successfully — as a first, cheap
     filter for "possibly expired, not active". An environment with no `ttl`
     is never touched by the reaper, regardless of age; one with an active
-    deployment is skipped for this tick and retried on the next one.
+    deployment is skipped for this tick and retried on the next one. Each
+    environment it does destroy goes through the exact same
+    `DestroyEnvironment`/`RemoveProject` path as an operator-initiated
+    `env destroy` (step 14), so the same group non-removal guarantee applies
+    unattended: a TTL expiry never drops the base project's declared groups,
+    only ever the expiring environment's own key bundle.
     - *TOCTOU guard*: right before actually destroying a candidate that
       passed both of those checks, the reaper re-fetches that one row fresh
       and recomputes the same expiry test against it. A redeploy that
@@ -305,6 +318,11 @@ sequenceDiagram
   `ResetEnvironmentData` (its own active-deploy guard, `compose down -v`
   plus `set_on_create_done(false)`), and `ReapEnvironments` (the TTL sweep,
   including its pre-destroy fresh re-check of each candidate).
+- `crates/application/src/remove.rs` — `RemoveProject`, the single teardown
+  `rpi rm`, `env destroy`, and the TTL reaper all delegate to; only calls
+  `SecretStore::remove_base` when `existing.config.environment.is_none()`,
+  which is why an environment's teardown (steps 14–15) never removes its
+  base's declared groups — full rule in `flows/secrets.md` item 11.
 - `crates/application/src/deploy.rs` — `run_stages`'s `on_create` block:
   runs once after health (and the optional route stage) when `on_create` is
   set and not yet done, fails the deploy on a nonzero exit or an undeclared

@@ -213,13 +213,34 @@ sequenceDiagram
     `secret-groups` capability (>= 0.27.0); an older agent gets a "update the
     agent on the Pi" error instead of a route-not-found.
 
+11. **Group ownership on teardown.** Declared groups belong to the base
+    project that declared them, not to any one registry row, so only tearing
+    down the *base* takes them with it: `rpi rm <base>` removes that
+    project's own key bundle as usual, then also drops every group it
+    declared (`SecretStore::remove_base`), right alongside its containers,
+    ingress route, workdir and history. Tearing down an *environment* built
+    from that base — `rpi env destroy`, or the TTL reaper's automatic sweep
+    (`flows/environments.md` items 14–15), both of which route through the
+    same `RemoveProject` teardown — removes only that environment's own key
+    bundle and never calls `remove_base`: an environment borrows its base's
+    groups, it does not own them, so destroying one preview must not take the
+    shared secrets every sibling environment still attaches. `RemoveProject`
+    tells the two cases apart the same way every other layering rule in this
+    document does — by `ProjectConfig.environment`: `None` is a base project,
+    `Some(..)` is an environment. Unless `--yes` is passed, `rpi rm`'s
+    confirmation prompt names the group count and, best-effort, every
+    still-registered environment that would lose them and fail its next
+    deploy — both lookups simply drop their clause on a pre-0.27.0 agent that
+    doesn't support secret groups, rather than failing the command.
+
 ## Source anchors
 
 - `crates/application/src/secrets.rs` — `SendSecrets` (save a deploy key's own bundle), `HeadKeySecrets` (metadata-only projection of that bundle, never a value), `ApplySecrets` (resolves the key's full layer stack via `effective_secrets` and re-injects + `up -d` — the one implementation `--apply` and `POST .../secrets/apply` both call), and `ListSecrets` (resolves that same layer stack read-only, via its own `ProjectRepository` lookup rather than calling `effective_secrets`, because a declared-but-empty group must not fail a listing the way it fails a deploy — `rpi secrets ls`'s `StoredSecrets.layers` carries each layer's own, unmerged names alongside the merged view).
 - `crates/application/src/secretgroups.rs` — group CRUD use cases (`PushSecretGroup`, `ShowSecretGroup`, `ListSecretGroups`, `RemoveSecretGroup`): the only place that joins the vault (`SecretStore`) with the project registry, e.g. to report which projects declare a group or to refuse deleting one still declared.
+- `crates/application/src/remove.rs` — `RemoveProject`: always removes the target's own key bundle, and additionally calls `SecretStore::remove_base` when (and only when) `existing.config.environment.is_none()` — the base-vs-environment check item 11 describes. `rpi rm` and `rpi env destroy`/the TTL reaper (`flows/environments.md`) both tear down through this one use case, so the base/environment split lives in exactly one place.
 - `crates/bin/src/agent/http.rs` (secrets + secret-group routes) — validates and decodes an incoming bundle once (`decode_secret_payload`, shared by the per-key and group write paths), validates a group name with the same rule the `rpi.toml` parser uses (`pi_domain::secretgroup::validate_group_name`), and serves both route families; no handler ever serializes a secret value.
 - `crates/bin/src/proto.rs` (secrets + secret-group DTOs) — wire shapes for both route families; group and head responses carry names, digests, sizes and revisions only. `SecretsListResponse.layers` (`Vec<SecretLayerDto>`) carries the per-layer provenance `rpi secrets ls` renders; absent (not merely empty) from an agent older than 0.27.0, which is how the CLI tells "nothing to show" apart from "this agent doesn't know about layers."
-- `crates/bin/src/cli/commands.rs` (`secrets_push`, `secrets_diff`, `secrets_ls`, `secrets_group_ls`, `secrets_group_rm`) — the CLI side of every route above; `effective_rows` turns a `SecretsListResponse` into (name, winning layer, shadowed?) rows for `secrets_ls`'s effective view, and `render_group_head` renders one group's head (revision, names, digests, sizes) for `secrets_ls --group`.
+- `crates/bin/src/cli/commands.rs` (`secrets_push`, `secrets_diff`, `secrets_ls`, `secrets_group_ls`, `secrets_group_rm`) — the CLI side of every route above; `effective_rows` turns a `SecretsListResponse` into (name, winning layer, shadowed?) rows for `secrets_ls`'s effective view, and `render_group_head` renders one group's head (revision, names, digests, sizes) for `secrets_ls --group`. `rm_confirmation_text` (used by `rm`) is the pure function behind item 11's confirmation wording; `rm` feeds it best-effort `list_secret_groups`/`list_environments` results before prompting.
 - `crates/bin/src/cli/rpitoml.rs` (`SecretsSection` only) — the `[secrets]` table in `rpi.toml`: names the local env file `rpi secrets send` reads (`[secrets].env`, default `.env`), the extra files it reads verbatim (`[secrets].files`), the declared group list (`[secrets].groups`, carried into `ProjectConfig.secret_groups` in declared order by `to_project_config`), and the optional `[secrets].file_mode` override, parsed and validated by `pi_domain::secretmode`.
 - `crates/application/src/mask.rs` — `MaskingSink`: replaces armed secret values (6+ characters) with `***KEY***` in every line logged afterward.
 - `crates/infrastructure/src/secrets.rs` — `EncryptedFileStore`: age-encrypts and decrypts the bundle at rest, one file per project or named group, using an agent identity key kept at file mode 0600.
