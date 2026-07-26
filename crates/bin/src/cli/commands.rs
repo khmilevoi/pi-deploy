@@ -913,8 +913,14 @@ pub async fn config_show(env: Option<String>, vars: Vec<String>) -> anyhow::Resu
 /// missing variable needs to see that they exist.
 pub fn render_runtime_preview(r: &crate::cli::overlay::Resolved) -> String {
     let mut out = String::from("\n[runtime]\n");
+    // Values here (e.g. RPI_BRANCH_NAME, sourced from source.branch) are not
+    // character-validated and can carry `--vars`-supplied quotes, backslashes
+    // or control characters. Serializing through toml::Value guarantees the
+    // same valid-TOML-output guarantee render_resolved gets from serde,
+    // instead of hand-formatting a string literal that could break parsing.
     let mut put = |key: &str, value: &str| {
-        out.push_str(&format!("{key} = \"{value}\"\n"));
+        let escaped = toml::Value::String(value.to_string());
+        out.push_str(&format!("{key} = {escaped}\n"));
     };
     put("RPI_PROJECT", &r.rpitoml.project.name);
     match &r.env {
@@ -1166,6 +1172,31 @@ port = 3000
         assert!(!text.contains("RPI_ENV "), "no env selected: {text}");
         assert!(!text.contains("RPI_ENV_SLUG"), "no slug: {text}");
         assert!(!text.contains("RPI_HOSTNAME"), "no hostname: {text}");
+    }
+
+    #[test]
+    fn runtime_preview_escapes_quotes_and_backslashes_as_valid_toml() {
+        // source.branch is never character-validated, and since Task 3 it can
+        // be set from an arbitrary --vars value (parse_vars only checks the
+        // key shape). A value containing a quote and a backslash must still
+        // come out as a parseable [runtime] block, not broken TOML.
+        let resolved = crate::cli::overlay::resolve_from(
+            OVERLAY_BASE,
+            Some((
+                "branch",
+                "[source]\nbranch = \"${BRANCH_NAME}\"\n\n[ingress]\nhostname = \"\"\n",
+            )),
+            &[r#"BRANCH_NAME=x"y\z"#.into()],
+        )
+        .unwrap();
+        let text = render_runtime_preview(&resolved);
+
+        let parsed: toml::Value = text.trim_start_matches('\n').parse().unwrap();
+        assert_eq!(
+            parsed["runtime"]["RPI_BRANCH_NAME"].as_str().unwrap(),
+            "x\"y\\z",
+            "got:\n{text}"
+        );
     }
 
     #[test]
