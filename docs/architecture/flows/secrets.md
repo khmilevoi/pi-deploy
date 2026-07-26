@@ -21,7 +21,8 @@ sequenceDiagram
     API->>Store: save bundle
     Store->>Store: encrypt with agent's age key, write 0600
     alt --apply flag set
-        API->>API: arm log masking with the bundle just received
+        API->>Store: reload and merge this key's layers (declared groups, then this bundle) - same resolution rpi deploy uses
+        API->>API: arm log masking with the merged bundle
         API->>Co: write .env + secret files into the existing checkout, .env 0600, files 0644 (or [secrets].file_mode)
         API->>Runtime: up -d (recreate affected containers)
     else no --apply (default)
@@ -74,17 +75,24 @@ sequenceDiagram
    written into a checkout only during one of these two operations, never
    in between:
    - **Immediately, with `--apply`.** Right after saving, if the caller
-     passed `--apply`, the agent writes `.env` and the secret files straight
-     into the project's existing checkout and recreates the affected
-     containers — using the bundle it already has in memory from the
-     request itself, with no decrypt step involved.
+     passed `--apply`, the agent resolves this deploy key's full layer
+     stack — every group named in `rpi.toml`'s `[secrets].groups`, in
+     declared order, then the bundle just saved on top — the identical
+     resolution `rpi deploy` uses (item 5), decrypting it fresh from the
+     store rather than reusing the upload in memory. It then writes the
+     merged `.env` and secret files straight into the project's existing
+     checkout and recreates the affected containers. A separate
+     `POST .../secrets/apply` route re-runs exactly this resolve-and-inject
+     step without a new upload, for a caller that only wants to re-apply
+     what is already stored.
    - **Later, on `rpi deploy`.** Every deploy resolves the project's full set
      of layers — every group named in `rpi.toml`'s `[secrets].groups`, in the
      order declared, then this deploy key's own bundle on top — and writes
      the merged result into the freshly fetched checkout before the stack
      starts. This is the only place a previously-stored bundle's values are
-     decrypted and written back out onto disk as plaintext. See item 5 for
-     how the layers combine.
+     decrypted and written back out onto disk as plaintext, other than the
+     `--apply`/`secrets/apply` paths above, which resolve the same way. See
+     item 5 for how the layers combine.
 
    Both moments write the same two artifacts with different default modes,
    because they have different readers. `.env` lands at **0600**: Compose
@@ -113,27 +121,28 @@ sequenceDiagram
    any variable or file left out of the new bundle is removed from a
    checkout the next time secrets are injected.
 
-5. **Layering at deploy time.** `rpi deploy` loads each group named in
-   `[secrets].groups`, in the declared order, then the deploy key's own
-   bundle — always last, so a value scoped to one key always wins over a
-   shared group. The layers are merged per object, not per group: a later
-   layer replaces an earlier one entry by entry, by variable name for
-   variables and by file path for files, so an untouched variable from an
-   earlier layer survives even when a later layer redefines a different one.
-   `[secrets].file_mode` resolves the same way — from the last layer in the
-   list that actually set one, so a later layer that leaves it unset does
-   not erase an earlier layer's choice. Masking is armed on the *merged*
-   bundle, so a value contributed by any layer — group or key — is masked in
-   deploy output, not only one that came from the key's own bundle. The
-   "secrets injected" log line names every layer that contributed and the
-   revision it was loaded at, in order, ending with the key's own (for
-   example `groups: common@r3, preview@r1, key@r5`), so provenance is
-   visible without ever printing a value.
+5. **Layering.** `rpi deploy`, `--apply`, and `POST .../secrets/apply` all
+   load each group named in `[secrets].groups`, in the declared order, then
+   the deploy key's own bundle — always last, so a value scoped to one key
+   always wins over a shared group. The layers are merged per object, not
+   per group: a later layer replaces an earlier one entry by entry, by
+   variable name for variables and by file path for files, so an untouched
+   variable from an earlier layer survives even when a later layer redefines
+   a different one. `[secrets].file_mode` resolves the same way — from the
+   last layer in the list that actually set one, so a later layer that
+   leaves it unset does not erase an earlier layer's choice. Masking is
+   armed on the *merged* bundle, so a value contributed by any layer — group
+   or key — is masked in the operation's output, not only one that came from
+   the key's own bundle. The "secrets injected" log line names every layer
+   that contributed and the revision it was loaded at, in order, ending with
+   the key's own (for example `groups: common@r3, preview@r1, key@r5`), so
+   provenance is visible without ever printing a value.
    - *Failure*: a group named in `[secrets].groups` that doesn't exist, or
-     exists with no secrets in it, fails the deploy right here — nothing has
-     been written to the checkout yet — rather than starting the
-     application without configuration it depends on. This is different
-     from the deploy key's own bundle, which is allowed to be empty (see
+     exists with no secrets in it, fails the operation right here — nothing
+     has been written to the checkout yet — rather than starting (or
+     restarting) the application without configuration it depends on. This
+     applies to `rpi deploy` and to both apply paths above alike, and is
+     different from the deploy key's own bundle, which is allowed to be empty (see
      item 8): a *declared* group is a promise the project made about what it
      needs, and an empty one breaks that promise silently if it's allowed
      through.
@@ -174,9 +183,25 @@ sequenceDiagram
    aborts that write instead of touching the filesystem outside the
    checkout.
 
+10. **Group management routes (agent-side; no CLI command yet).** The agent
+    also serves `PUT`/`GET`/`DELETE /v1/projects/{base}/secret-groups/{group}`
+    and `GET /v1/projects/{base}/secret-groups` — push, inspect, delete, and
+    list the named groups of one base project. Push accepts `merge: true` to
+    upsert onto the stored group instead of replacing it wholesale, and an
+    `expected_revision` for the same compare-and-swap guard `rpi secrets
+    send` uses; delete refuses a group any registered project still declares
+    unless `force: true` is set. Every response carries names, sizes,
+    digests and revisions only, never a value — the same rule item 4's
+    `rpi secrets ls` follows. No released `rpi` command calls these routes
+    yet; they exist so a forthcoming `rpi secrets group ls`/`rm` (and
+    `--group`/`--merge` on `push`) has somewhere to call.
+
 ## Source anchors
 
-- `crates/application/src/secrets.rs` — send/list secrets use cases: validates the bundle isn't empty, saves it, and (with `--apply`) re-injects it and restarts the affected containers immediately.
+- `crates/application/src/secrets.rs` — `SendSecrets`/`ListSecrets` (save/list a deploy key's own bundle), `HeadKeySecrets` (metadata-only projection of that bundle, never a value), and `ApplySecrets` (resolves the key's full layer stack via `effective_secrets` and re-injects + `up -d` — the one implementation `--apply` and `POST .../secrets/apply` both call).
+- `crates/application/src/secretgroups.rs` — group CRUD use cases (`PushSecretGroup`, `ShowSecretGroup`, `ListSecretGroups`, `RemoveSecretGroup`): the only place that joins the vault (`SecretStore`) with the project registry, e.g. to report which projects declare a group or to refuse deleting one still declared.
+- `crates/bin/src/agent/http.rs` (secrets + secret-group routes) — validates and decodes an incoming bundle once (`decode_secret_payload`, shared by the per-key and group write paths), validates a group name with the same rule the `rpi.toml` parser uses (`pi_domain::secretgroup::validate_group_name`), and serves both route families; no handler ever serializes a secret value.
+- `crates/bin/src/proto.rs` (secrets + secret-group DTOs) — wire shapes for both route families; group and head responses carry names, digests, sizes and revisions only.
 - `crates/bin/src/cli/rpitoml.rs` (`SecretsSection` only) — the `[secrets]` table in `rpi.toml`: names the local env file `rpi secrets send` reads (`[secrets].env`, default `.env`), the extra files it reads verbatim (`[secrets].files`), the declared group list (`[secrets].groups`, carried into `ProjectConfig.secret_groups` in declared order by `to_project_config`), and the optional `[secrets].file_mode` override, parsed and validated by `pi_domain::secretmode`.
 - `crates/application/src/mask.rs` — `MaskingSink`: replaces armed secret values (6+ characters) with `***KEY***` in every line logged afterward.
 - `crates/infrastructure/src/secrets.rs` — `EncryptedFileStore`: age-encrypts and decrypts the bundle at rest, one file per project or named group, using an agent identity key kept at file mode 0600.

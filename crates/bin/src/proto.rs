@@ -181,6 +181,70 @@ pub struct SecretsListResponse {
     pub file_mode: Option<u32>,
 }
 
+/// `PUT /v1/projects/{base}/secret-groups/{group}` (secret-groups spec).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretGroupPushRequest {
+    pub vars: BTreeMap<String, String>,
+    /// Relative path (forward slashes) -> base64-encoded contents.
+    #[serde(default)]
+    pub files: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_mode: Option<u32>,
+    /// Write only if the stored revision equals this. Absent means an
+    /// unconditional write (`--force`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
+    /// Upsert instead of replacing the group wholesale.
+    #[serde(default)]
+    pub merge: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretGroupPushResponse {
+    pub revision: u64,
+    pub keys: usize,
+    pub files: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretFileHeadDto {
+    pub size: u64,
+    pub digest: String,
+}
+
+/// Metadata projection. Never contains a value.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretGroupHeadResponse {
+    pub revision: u64,
+    /// var name -> digest
+    pub vars: BTreeMap<String, String>,
+    pub files: BTreeMap<String, SecretFileHeadDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_mode: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretGroupSummaryDto {
+    pub name: String,
+    pub revision: u64,
+    pub keys: usize,
+    pub files: usize,
+    pub bytes: u64,
+    pub updated_at: i64,
+    pub attached_by: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretGroupsListResponse {
+    pub groups: Vec<SecretGroupSummaryDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretsApplyResponse {
+    pub keys: usize,
+    pub files: usize,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GcResponse {
     pub disk_used_percent: u8,

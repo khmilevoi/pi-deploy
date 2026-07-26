@@ -5,7 +5,7 @@ use pi_domain::contracts::{
 };
 use pi_domain::entities::{ComposeStack, SecretsBundle};
 use pi_domain::error::DomainError;
-use pi_domain::secretgroup::GroupRef;
+use pi_domain::secretgroup::{GroupHead, GroupRef};
 
 use crate::mask::MaskingSink;
 
@@ -116,6 +116,80 @@ impl SendSecrets {
     }
 }
 
+/// Re-injects a deploy key's effective secrets (declared groups merged under
+/// its own bundle) and runs `up -d` so compose recreates only the affected
+/// services. Used by `rpi secrets push --apply` on both the group and the
+/// per-key path — `SendSecrets` delegates here after storing, rather than
+/// keeping a second copy of this orchestration.
+pub struct ApplySecrets {
+    secrets: Arc<dyn SecretStore>,
+    projects: Arc<dyn ProjectRepository>,
+    source: Arc<dyn Source>,
+    writer: Arc<dyn SecretsWriter>,
+    overrides: Arc<dyn OverrideStore>,
+    runtime: Arc<dyn ContainerRuntime>,
+}
+
+impl ApplySecrets {
+    pub fn new(
+        secrets: Arc<dyn SecretStore>,
+        projects: Arc<dyn ProjectRepository>,
+        source: Arc<dyn Source>,
+        writer: Arc<dyn SecretsWriter>,
+        overrides: Arc<dyn OverrideStore>,
+        runtime: Arc<dyn ContainerRuntime>,
+    ) -> Arc<ApplySecrets> {
+        Arc::new(ApplySecrets {
+            secrets,
+            projects,
+            source,
+            writer,
+            overrides,
+            runtime,
+        })
+    }
+
+    /// Returns the merged key/file counts actually written.
+    pub async fn execute(
+        &self,
+        project: &str,
+        log: Arc<dyn LogSink>,
+    ) -> Result<(usize, usize), DomainError> {
+        let registered = self.projects.get(project).await?.ok_or_else(|| {
+            DomainError::NotFound(format!(
+                "project '{project}' is not deployed yet; run `rpi deploy` first"
+            ))
+        })?;
+        let config = &registered.config;
+        let merged = crate::effective_secrets(self.secrets.as_ref(), config).await?;
+
+        let masker = MaskingSink::new(log);
+        masker.arm(&merged.bundle);
+        let log: Arc<dyn LogSink> = masker;
+
+        let workdir = self.source.workdir(project);
+        self.writer.write(&workdir, &merged.bundle).await?;
+        let override_file = self
+            .overrides
+            .write(
+                project,
+                &config.service,
+                config.expose.bind_addr(),
+                registered.host_port,
+                config.container_port,
+            )
+            .await?;
+        let stack = ComposeStack {
+            project_name: config.name.clone(),
+            workdir: workdir.clone(),
+            compose_file: workdir.join(&config.compose_path),
+            override_file,
+        };
+        self.runtime.up(&stack, log).await?;
+        Ok((merged.bundle.vars.len(), merged.bundle.files.len()))
+    }
+}
+
 /// Key names and file paths only, never values or file contents (§10:
 /// `rpi secrets ls`).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -141,6 +215,23 @@ impl ListSecrets {
             files: bundle.file_paths(),
             file_mode: bundle.secret_file_mode(),
         })
+    }
+}
+
+/// `GET /v1/projects/{name}/secrets/head` — metadata of a deploy key's own
+/// bundle only (never the groups it merges with). Kept one line so the HTTP
+/// layer never touches the store directly.
+pub struct HeadKeySecrets {
+    secrets: Arc<dyn SecretStore>,
+}
+
+impl HeadKeySecrets {
+    pub fn new(secrets: Arc<dyn SecretStore>) -> Arc<HeadKeySecrets> {
+        Arc::new(HeadKeySecrets { secrets })
+    }
+
+    pub async fn execute(&self, project: &str) -> Result<GroupHead, DomainError> {
+        self.secrets.head(&GroupRef::key(project)).await
     }
 }
 

@@ -9,6 +9,7 @@ pub mod logs;
 pub mod mask;
 pub mod remove;
 pub mod scheduler;
+pub mod secretgroups;
 pub mod secrets;
 pub mod stats;
 pub mod tail;
