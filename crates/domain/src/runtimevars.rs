@@ -15,31 +15,42 @@ use crate::entities::Project;
 /// deploy pass `None` and the project's last successful sha is used. A value
 /// that does not exist is omitted from the map rather than set to an empty
 /// string, so `${RPI_ENV:-prod}` works inside a container.
+///
+/// "Does not exist" covers an empty string as well as `None`: `--vars B=` is
+/// legal and `branch = "${B}"` then reaches the registry with an empty
+/// branch, and `RPI_BRANCH_NAME=""` would silently defeat every
+/// `${RPI_BRANCH_NAME:-fallback}` in the stack.
 pub fn rpi_vars(project: &Project, commit_sha: Option<&str>) -> BTreeMap<String, String> {
     let config = &project.config;
     let mut vars = BTreeMap::new();
     let mut put = |key: &str, value: String| {
         vars.insert(key.to_string(), value);
     };
+    let present = |s: &str| (!s.is_empty()).then(|| s.to_string());
 
     put("RPI_PROJECT", config.name.clone());
     match &config.environment {
         Some(env) => {
             put("RPI_PROJECT_BASE", env.base.clone());
             put("RPI_ENV", env.env.clone());
-            if let Some(slug) = &env.slug {
-                put("RPI_ENV_SLUG", slug.clone());
+            if let Some(slug) = env.slug.as_deref().and_then(present) {
+                put("RPI_ENV_SLUG", slug);
             }
         }
         None => put("RPI_PROJECT_BASE", config.name.clone()),
     }
-    put("RPI_BRANCH_NAME", config.branch.clone());
-    if let Some(hostname) = &config.hostname {
-        put("RPI_HOSTNAME", hostname.clone());
+    if let Some(branch) = present(&config.branch) {
+        put("RPI_BRANCH_NAME", branch);
+    }
+    if let Some(hostname) = config.hostname.as_deref().and_then(present) {
+        put("RPI_HOSTNAME", hostname);
     }
     put("RPI_HOST_PORT", project.host_port.to_string());
-    if let Some(sha) = commit_sha.or(project.last_commit_sha.as_deref()) {
-        put("RPI_COMMIT_SHA", sha.to_string());
+    let sha = commit_sha
+        .and_then(present)
+        .or_else(|| project.last_commit_sha.as_deref().and_then(present));
+    if let Some(sha) = sha {
+        put("RPI_COMMIT_SHA", sha);
     }
     vars
 }
@@ -120,6 +131,41 @@ mod tests {
             );
         }
         assert!(vars.values().all(|v| !v.is_empty()), "{vars:?}");
+    }
+
+    #[test]
+    fn an_empty_value_is_as_absent_as_none() {
+        // `--vars B=` is legal, so `branch = "${B}"` reaches the registry
+        // with an empty branch; exporting RPI_BRANCH_NAME="" would defeat
+        // every ${RPI_BRANCH_NAME:-fallback} inside a container.
+        let mut p = project("myapp");
+        p.config.branch = String::new();
+        p.config.hostname = Some(String::new());
+        p.last_commit_sha = Some(String::new());
+        p.config.environment = Some(EnvironmentMeta {
+            env: "branch".into(),
+            base: "myapp".into(),
+            slug: Some(String::new()),
+            ttl_secs: None,
+            on_create: None,
+        });
+        let vars = rpi_vars(&p, Some(""));
+        for absent in [
+            "RPI_BRANCH_NAME",
+            "RPI_HOSTNAME",
+            "RPI_COMMIT_SHA",
+            "RPI_ENV_SLUG",
+        ] {
+            assert!(
+                !vars.contains_key(absent),
+                "{absent} must be omitted, not empty: {vars:?}"
+            );
+        }
+        assert!(vars.values().all(|v| !v.is_empty()), "{vars:?}");
+
+        // An in-flight empty sha must not shadow a usable stored one either.
+        p.last_commit_sha = Some("stored".into());
+        assert_eq!(rpi_vars(&p, Some(""))["RPI_COMMIT_SHA"], "stored");
     }
 
     #[test]

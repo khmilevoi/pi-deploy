@@ -262,15 +262,17 @@ sequenceDiagram
     own current value, so a call that carries no sha refreshes the timestamp
     without erasing the stored one. That stored sha is what `RPI_COMMIT_SHA`
     falls back to outside a deploy (`flows/deploy.md`).
-12. `rpi env ls [--all]` calls `GET /v1/environments[?base=<project>]`.
-    Without `--all`, the CLI first resolves the current directory's own
-    `rpi.toml` (no overlay) to get its `base` name and passes that as the
-    filter; `--all`, or running outside any project directory, lists every
-    environment on the agent instead. Only rows with `env_name` set are ever
-    returned. This is the one resolution path with no `--vars` of its own, so
-    a base `rpi.toml` that references a user variable makes the filtered form
-    fail with that variable's "unknown variable" error; `--all` lists
-    everything without reading any configuration.
+12. `rpi env ls [--all] [--vars ...]` calls
+    `GET /v1/environments[?base=<project>]`. Without `--all`, the CLI first
+    resolves the current directory's own `rpi.toml` (no overlay, but with
+    this command's own `--vars`, since variables reach the base file too) to
+    get its `base` name and passes that as the filter; `--all`, or running
+    outside any project directory, lists every environment on the agent
+    instead. Only rows with `env_name` set are ever returned. `--vars` is
+    deliberately *not* declared as conflicting with `--all`: a resolution
+    failure here names both escape hatches (pass the variable, or use
+    `--all`, which reads no configuration file), and appending `--all` to the
+    command that just failed has to work rather than raise a second error.
 13. `rpi env destroy <env> [--vars ...]` / `rpi env destroy --full-key
     <key>` and the same two forms for `rpi env reset-data` compute the
     target key one of two ways: the `<env>` form runs the exact same local
@@ -348,7 +350,12 @@ sequenceDiagram
   in `resolve_with` (`source.branch` first, then everything else) with its
   `[project].name` ban, unreferenced-`--vars` check, lazy `git_inputs`,
   `env.slug` derivation (`derive_slug`) and circular-reference guard, the
-  no-slug key warning, the merge (`apply_overlay`), key derivation
+  no-slug key warning (fired when the `source.branch` that *wins* the merge
+  carries any `${...}` reference while nothing references `${env.slug}` —
+  "the branch is variable but the key is not", which is what makes two
+  branches collide on one key; *not* keyed on `--vars`, which would both miss
+  a `${git.*}` branch and nag about a deliberately shared stand), the merge
+  (`apply_overlay`), key derivation
   (`derive_key`), the base-hostname-hijack check (merged hostname vs. the
   base file's, captured before the merge), and the
   `resolve`/`resolve_from`/`render_resolved` entry points that
@@ -372,9 +379,11 @@ sequenceDiagram
   at all and validates the key's own `base--env[--slug]` shape
   (`is_valid_key_part` per segment) — the escape hatch for a project whose
   overlay was deleted or no longer resolves. `<env>` and `--full-key` are
-  mutually exclusive and one is required. `env ls` distinguishes "no
-  `rpi.toml` here" (its friendly `--all` hint) from any other resolution
-  failure, which propagates instead of being folded into the same message.
+  mutually exclusive and one is required. `env ls`'s `base_filter` — a pure
+  function of `(--all, the base file's text, --vars)`, with the read left in
+  `env_ls` so it stays unit-testable — distinguishes "no `rpi.toml` here"
+  (its friendly `--all` hint) from any other resolution failure, which keeps
+  its own message and only gains the `--vars`/`--all` hints on top.
 - `crates/bin/src/agent/http.rs` — `create_deployment`'s pre-registry shape
   guards (`is_valid_name`, `is_valid_env_part`, the `--`-rejection for plain
   deploys, the base/env/slug/key-match checks for environment deploys), the

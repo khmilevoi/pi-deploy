@@ -101,7 +101,7 @@ That's it — `rpi ls` shows the project, its host port, and its public hostname
 | `rpi secrets send [--apply] [--env <name> --vars K=V]` | Send the env file and secret files (encrypted at rest) |
 | `rpi secrets ls [--env <name> --vars K=V]` | List stored env keys and file paths (values are never transmitted) |
 | `rpi config show [--env <name> --vars K=V]` | Print the resolved `rpi.toml`, overlay merged in, without contacting the agent |
-| `rpi env ls [--all]` | List deployed environments for this project, or every environment with `--all` |
+| `rpi env ls [--all] [--vars K=V]` | List deployed environments for this project, or every environment with `--all` |
 | `rpi env destroy <name>\|--full-key <key> [--vars K=V] [--yes]` | Tear down an environment: stack, volumes, ingress route, DNS, secrets, registry row |
 | `rpi env reset-data <name>\|--full-key <key> [--vars K=V] [--yes]` | Wipe an environment's containers and volumes; the next deploy re-runs `on_create` |
 | `rpi setup` | Wizard: server profile + SSH key + client config |
@@ -367,6 +367,8 @@ rpi deploy --env preview --vars BRANCH_NAME=feature/login
 - The overlay merges onto the base field by field — scalars replace, tables merge key by key, `[commands]` and array fields replace wholesale, and an explicit `""` resets a field to unset. The deployed project key becomes `<base>--<env>`, or `<base>--<env>--<slug>` when the config references `${env.slug}`, and its hostname must differ from the base project's.
 - `rpi config show --env preview --vars BRANCH_NAME=feature/login` prints the fully resolved config, plus a `[runtime]` preview of the `RPI_*` variables, without touching the agent — the way to check what a deploy would actually send.
 - `rpi env destroy`/`reset-data` take the same `<env>` and `--vars` as the deploy; when the overlay is gone or no longer resolves, `--full-key <key>` (from `rpi env ls`) targets an environment without reading any config file.
+- `rpi env ls` without `--all` resolves the base `rpi.toml` just to learn the project name it filters by, so it takes `--vars` too; `rpi env ls --all` reads no config file at all and is the way out if that resolution fails.
+- When `source.branch` is computed from a variable but nothing references `${env.slug}`, the resolver warns that the key stays `<base>--<env>` — every branch deploying that environment would share it.
 - With no TTL, an environment lives until `rpi env destroy` removes it. With one, the agent's reaper tears it down on its own once it's past due (`agent.toml`'s `[environments] reap_interval`, default 1h) — as long as it isn't mid-deploy.
 - `on_create` runs exactly once per environment key, after the first successful health check; `rpi env reset-data` clears the flag so the next deploy re-runs it against a clean database.
 

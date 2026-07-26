@@ -110,8 +110,10 @@ stateDiagram-v2
    fetched — entirely from what it already knows about the project, so the
    CLI never sends them and the two sides cannot disagree about them. One
    that does not apply (no hostname configured, a plain project with no
-   environment) is left out rather than exported empty, so a container's own
-   `${RPI_ENV:-prod}` default still works. To learn which services should
+   environment, or a stored value that is the empty string — `--vars B=` is
+   legal and `branch = "${B}"` reaches the registry empty) is left out
+   rather than exported empty, so a container's own `${RPI_ENV:-prod}`
+   default still works. To learn which services should
    receive those variables, it asks
    Docker to list the services declared by the project's own compose file,
    then generates rpi's compose override: the fixed host port, bind address

@@ -256,8 +256,11 @@ Rules:
   either file references `${env.slug}`. The suffix hangs on that one
   reference and nothing else: using some other variable (`.env.${STAGE}`,
   say) leaves the key at `<base>--<env>`, so a shared stand does not turn
-  into a per-branch environment by accident. Resolving with `--vars` but no
-  `${env.slug}` anywhere prints a warning naming the key you actually get.
+  into a per-branch environment by accident. A **computed `source.branch`**
+  (any `${...}` in it) with no `${env.slug}` anywhere does print a warning
+  naming the key you actually get — that combination means every branch
+  deploying the environment lands on one shared key. A static branch never
+  warns, however many other variables the files use.
   `--` in a project name is reserved for this; a base `rpi.toml` whose
   `project.name` contains `--` is rejected agent-side.
 - If the base `rpi.toml` sets `[ingress].hostname`, the overlay must

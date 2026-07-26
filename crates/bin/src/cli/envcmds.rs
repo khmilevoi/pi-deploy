@@ -60,22 +60,44 @@ fn confirm_key(action: &str, key: &str, yes: bool) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn env_ls(all: bool, connect: ConnectOpts) -> anyhow::Result<()> {
-    // Distinguish "no rpi.toml here" (friendly hint to use --all) from any
-    // other resolution failure (e.g. a malformed rpi.toml), which must
-    // propagate instead of being swallowed into the same generic message.
-    let base = if all {
-        None
-    } else if !std::path::Path::new("rpi.toml").exists() {
-        anyhow::bail!("no rpi.toml in the current directory - use `rpi env ls --all`")
-    } else {
-        Some(
-            crate::cli::overlay::resolve(None, &[])?
-                .rpitoml
-                .project
-                .name,
-        )
+/// The `base` the agent filters the listing by: `None` for `--all` (every
+/// environment on the agent), otherwise this project's name resolved out of
+/// `./rpi.toml` — `base_text`, or `None` when there is no readable one here.
+///
+/// Two distinct failures, never folded into one message: "no rpi.toml here"
+/// keeps its friendly `--all` hint, and any other resolution failure keeps
+/// its own message (a malformed file, or — since variables reach the base
+/// file too — a `${NAME}` this invocation was not given a `--vars` for) with
+/// the escape hatches appended. `--all` reads no configuration file at all,
+/// so it is the way out of a base file that cannot be resolved here.
+fn base_filter(
+    all: bool,
+    base_text: Option<&str>,
+    vars: &[String],
+) -> anyhow::Result<Option<String>> {
+    if all {
+        return Ok(None);
+    }
+    let Some(text) = base_text else {
+        anyhow::bail!("no rpi.toml in the current directory - use `rpi env ls --all`");
     };
+    let resolved = overlay::resolve_from(text, None, vars).map_err(|e| {
+        anyhow::anyhow!(
+            "{e}\n  hint: pass it with `rpi env ls --vars KEY=VALUE`, or run `rpi env ls --all`, which reads no configuration file"
+        )
+    })?;
+    Ok(Some(resolved.rpitoml.project.name))
+}
+
+pub async fn env_ls(all: bool, vars: Vec<String>, connect: ConnectOpts) -> anyhow::Result<()> {
+    // Read here rather than inside `base_filter` so the resolution itself
+    // stays a pure function of (text, vars) and is unit-testable.
+    let base_text = if all {
+        None
+    } else {
+        std::fs::read_to_string("rpi.toml").ok()
+    };
+    let base = base_filter(all, base_text.as_deref(), &vars)?;
     let AgentConn {
         tunnel: _tunnel,
         api,
@@ -213,6 +235,54 @@ mod tests {
 
         let err = target_key(None, None, &[]).unwrap_err().to_string();
         assert!(err.contains("--full-key"), "got: {err}");
+    }
+
+    /// A base file that needs a user variable — what README recommends and
+    /// what `rpi env ls` used to be unable to read at all.
+    const BASE_WITH_VAR: &str = r#"
+schema = 1
+
+[project]
+name = "myapp"
+
+[source]
+repo = "git@github.com:acme/myapp.git"
+branch = "${BRANCH_NAME}"
+
+[ingress]
+service = "web"
+port = 3000
+"#;
+
+    #[test]
+    fn all_needs_no_configuration_file_at_all() {
+        assert_eq!(base_filter(true, None, &[]).unwrap(), None);
+        let err = base_filter(false, None, &[]).unwrap_err().to_string();
+        assert!(err.contains("--all"), "got: {err}");
+    }
+
+    #[test]
+    fn the_base_name_resolves_once_the_variable_is_passed() {
+        assert_eq!(
+            base_filter(
+                false,
+                Some(BASE_WITH_VAR),
+                &["BRANCH_NAME=feature/login".into()]
+            )
+            .unwrap(),
+            Some("myapp".to_string()),
+            "`rpi env ls --vars` must reach the base file's own variables"
+        );
+    }
+
+    #[test]
+    fn an_unresolvable_base_names_both_escape_hatches() {
+        let err = base_filter(false, Some(BASE_WITH_VAR), &[])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("BRANCH_NAME"), "got: {err}");
+        assert!(err.contains("--vars"), "got: {err}");
+        assert!(err.contains("rpi env ls --all"), "got: {err}");
     }
 
     #[test]

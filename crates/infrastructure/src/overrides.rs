@@ -249,6 +249,29 @@ mod tests {
     }
 
     #[test]
+    fn the_lan_bind_and_a_keyword_branch_name_stay_strings() {
+        // The port mapping is emitted as a plain scalar, so the other bind
+        // address `ExposeMode::bind_addr` can return has to round-trip as a
+        // string too - it is the one thing a deploy cannot work without.
+        // And RPI_BRANCH_NAME now carries a user-supplied branch name, which
+        // may well be a YAML boolean keyword.
+        let mut env = BTreeMap::new();
+        env.insert("RPI_BRANCH_NAME".to_string(), "true".to_string());
+        let yaml = override_yaml("web", "0.0.0.0", 8000, 3000, &["web".into()], &env);
+        let doc = parsed(&yaml);
+        assert_eq!(
+            doc["services"]["web"]["ports"][0].as_str(),
+            Some("0.0.0.0:8000:3000"),
+            "got:\n{yaml}"
+        );
+        assert_eq!(
+            doc["services"]["web"]["environment"]["RPI_BRANCH_NAME"].as_str(),
+            Some("true"),
+            "a branch named like a boolean must stay a string:\n{yaml}"
+        );
+    }
+
+    #[test]
     fn generated_marker_comment_is_preserved() {
         let yaml = override_yaml("web", "127.0.0.1", 8000, 3000, &["web".into()], &env());
         assert!(

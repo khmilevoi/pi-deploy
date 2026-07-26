@@ -178,7 +178,9 @@ knows its own service name and its own listen port — that is not information
 from outside.
 
 An absent variable is **not exported at all** rather than exported empty, so
-`${RPI_ENV:-prod}` works inside a container.
+`${RPI_ENV:-prod}` works inside a container. A value that is present but
+empty counts as absent for this rule — `--vars B=` is legal, so
+`branch = "${B}"` can reach the registry with an empty branch.
 
 `RPI_BRANCH_NAME` is `ProjectConfig.branch`, always. A positional
 `rpi deploy <git_ref>` does not change it: the variable means "the branch named
@@ -286,7 +288,8 @@ whole-bundle replace.
   `^[A-Z][A-Z0-9_]*$`, `RPI_` prefix rejected. No longer requires `--env`.
   Same commands as today: `deploy`, `deploy --cancel`, `command`,
   `secrets send`, `secrets ls`, `config show`, `env destroy`,
-  `env reset-data`.
+  `env reset-data` — plus `env ls`, which without `--all` resolves the base
+  `rpi.toml` for its filter and so needs the same variables.
 - `rpi env destroy --key <full-key>` and `rpi env reset-data --key <full-key>`,
   mutually exclusive with the `<env>` + `--vars` path. `rpi env ls` already
   prints the key.
@@ -350,8 +353,12 @@ rpi secrets send: key 'RPI_FOO' uses the reserved RPI_ prefix
    check forces a parameterized overlay to set its own hostname, and one
    hard-coded hostname shared by every branch is self-evidently broken. But
    "close to" is not "never", so resolution emits a **warning** — not an
-   error — when `--env` is set, `--vars` were passed, and `${env.slug}` appears
-   nowhere, stating that the key will carry no slug suffix.
+   error — when `--env` is set, `source.branch` carries any `${...}`
+   reference, and `${env.slug}` appears nowhere, stating that the key will
+   carry no slug suffix. The trigger is the *branch* being variable, not
+   `--vars` being present: `branch = "${git.short_sha}"` needs no `--vars`
+   at all yet collides just as badly, while a fixed branch plus
+   `.env.${STAGE}` is a deliberately shared stand with nothing to warn about.
 
 ### Old agent, new CLI
 

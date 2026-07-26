@@ -40,7 +40,7 @@ pub fn derive_slug(branch: &str) -> anyhow::Result<String> {
     let slug = slug.trim_end_matches('-').to_string();
     if slug.is_empty() {
         anyhow::bail!(
-            "cannot derive RPI_ENV_SLUG from BRANCH_NAME '{branch}' (no [a-z0-9] characters)"
+            "cannot derive ${{env.slug}} from branch '{branch}' (no [a-z0-9] characters)"
         );
     }
     Ok(slug)
@@ -447,8 +447,19 @@ pub fn resolve_with(
     // which git inputs to compute, whether the slug is wanted, and which
     // --vars keys went unused.
     let mut all_refs = collect_refs(&mut base_v)?;
+    let has_branch_ref =
+        |refs: &[(String, VarRef)]| refs.iter().any(|(path, _)| path == BRANCH_PATH);
+    // Whether the document that *wins* `source.branch` computes it, which is
+    // what the no-slug key warning below turns on. An overlay branch replaces
+    // the base one outright, so a base `${git.branch}` pinned to a literal by
+    // the overlay is a static branch, not a computed one.
+    let mut branch_is_computed = has_branch_ref(&all_refs);
     if let Some(o) = &mut overlay_v {
-        all_refs.extend(collect_refs(o)?);
+        let refs = collect_refs(o)?;
+        if string_at(o, BRANCH_PATH).is_some() {
+            branch_is_computed = has_branch_ref(&refs);
+        }
+        all_refs.extend(refs);
     }
 
     for key in user.keys() {
@@ -524,9 +535,15 @@ pub fn resolve_with(
     let mut overlay =
         RpiTomlOverlay::from_value(overlay_v.expect("env implies an overlay"), &file)?;
 
-    if !user.is_empty() && slug.is_none() {
+    // The signal is "the branch is variable but the key is not": whatever
+    // computes `source.branch` — `${BRANCH_NAME}`, `${git.branch}`,
+    // `${git.short_sha}` — every branch it can produce would land on the
+    // same shared key. Keying this on `--vars` instead would both miss the
+    // `${git.*}` case (no --vars at all) and nag about a deliberately shared
+    // stand that merely parameterizes, say, `.env.${STAGE}`.
+    if branch_is_computed && slug.is_none() {
         warn(&format!(
-            "{file} uses --vars but never ${{env.slug}}, so the key stays '{}--{env_name}' with no per-branch suffix",
+            "{file}: {BRANCH_PATH} is computed but nothing references ${{env.slug}}, so the key stays '{}--{env_name}' - every branch deploying this environment shares it",
             base.project.name
         ));
     }
@@ -785,7 +802,12 @@ seed = "node seed.js"
         let long = derive_slug("abcdefghij-abcdefghij-abcdefghij-tail").unwrap();
         assert!(long.len() <= 30, "got len {}: {long}", long.len());
         assert!(!long.ends_with('-'));
-        assert!(derive_slug("///").is_err());
+        let err = derive_slug("///").unwrap_err().to_string();
+        assert!(err.contains("${env.slug}"), "got: {err}");
+        assert!(
+            !err.contains("BRANCH_NAME") && !err.contains("RPI_ENV_SLUG"),
+            "the message must name only things that still exist: {err}"
+        );
     }
 
     #[test]
@@ -995,6 +1017,28 @@ seed = "node seed.js"
     }
 
     #[test]
+    fn a_git_derived_branch_without_a_slug_reference_also_warns() {
+        // No --vars at all, yet every branch resolves to a different
+        // source.branch and they would all share the key 'myapp--branch'.
+        // Reads ${git.short_sha} from the ambient repository, which is
+        // readable even on the detached HEAD a CI checkout leaves behind.
+        let mut warnings = Vec::new();
+        let r = resolve_with(
+            BASE,
+            Some((
+                "branch",
+                "[source]\nbranch = \"${git.short_sha}\"\n\n[ingress]\nhostname = \"fixed.example.com\"\n",
+            )),
+            &[],
+            &mut |w| warnings.push(w.to_string()),
+        )
+        .unwrap();
+        assert_eq!(r.rpitoml.project.name, "myapp--branch");
+        assert_eq!(warnings.len(), 1, "got: {warnings:?}");
+        assert!(warnings[0].contains("${env.slug}"), "got: {warnings:?}");
+    }
+
+    #[test]
     fn a_static_env_with_no_vars_never_warns() {
         let mut warnings = Vec::new();
         resolve_with(
@@ -1008,9 +1052,54 @@ seed = "node seed.js"
     }
 
     #[test]
+    fn an_overlay_pinning_a_static_branch_over_a_computed_base_never_warns() {
+        // The overlay's source.branch replaces the base's outright, so the
+        // branch this environment deploys is the literal "main" - shared on
+        // purpose, with nothing to warn about, even though the base file
+        // computes its own branch for the production deploy.
+        let base = BASE.replace("branch = \"main\"", "branch = \"${BRANCH_NAME}\"");
+        let mut warnings = Vec::new();
+        let r = resolve_with(
+            &base,
+            Some((
+                "test",
+                "[source]\nbranch = \"main\"\n\n[ingress]\nhostname = \"test.example.com\"\n",
+            )),
+            &["BRANCH_NAME=feature/login".into()],
+            &mut |w| warnings.push(w.to_string()),
+        )
+        .unwrap();
+        assert_eq!(r.rpitoml.source.branch, "main");
+        assert!(warnings.is_empty(), "got: {warnings:?}");
+    }
+
+    #[test]
+    fn a_shared_stand_parameterizing_something_else_never_warns() {
+        // A fixed hostname plus `.env.${STAGE}` is a deliberately shared
+        // stand (see a_variable_that_is_not_the_slug_does_not_add_a_slug_
+        // suffix). Its branch is static, so the key it gets is the key it
+        // wants and there is nothing to warn about.
+        let mut warnings = Vec::new();
+        let r = resolve_with(
+            BASE,
+            Some((
+                "test",
+                "[ingress]\nhostname = \"test.example.com\"\n\n[secrets]\nenv = \".env.${STAGE}\"\n",
+            )),
+            &["STAGE=qa".into()],
+            &mut |w| warnings.push(w.to_string()),
+        )
+        .unwrap();
+        assert_eq!(r.rpitoml.project.name, "myapp--test");
+        assert!(warnings.is_empty(), "got: {warnings:?}");
+    }
+
+    #[test]
     fn substituted_values_are_revalidated() {
-        // A raw branch name substituted into a hostname is invalid DNS; the
-        // check runs post-substitution, which is why ${env.slug} exists.
+        // A raw branch name substituted into a hostname is invalid DNS - the
+        // slash in "feature/login" makes an invalid label. The check runs
+        // post-substitution, which is why ${env.slug} (the sanitized form)
+        // exists.
         let err = resolve_from(
             BASE,
             Some((
@@ -1041,25 +1130,6 @@ seed = "node seed.js"
         assert_eq!(env.slug, None);
         assert_eq!(env.ttl_secs, Some(7 * 24 * 3600));
         assert_eq!(env.on_create.as_deref(), Some("seed"));
-    }
-
-    #[test]
-    fn raw_branch_name_in_hostname_is_rejected_as_invalid_dns() {
-        // The slash in a raw BRANCH_NAME like "feature/login" makes an
-        // invalid DNS label once substituted directly into the hostname;
-        // ${RPI_ENV_SLUG} (not ${BRANCH_NAME}) is the sanitized variable
-        // meant for this field.
-        let err = resolve_from(
-            BASE,
-            Some((
-                "branch",
-                "[ingress]\nhostname = \"${BRANCH_NAME}.preview.example.com\"\n",
-            )),
-            &["BRANCH_NAME=feature/login".into()],
-        )
-        .unwrap_err()
-        .to_string();
-        assert!(err.contains("hostname"), "got: {err}");
     }
 
     #[test]

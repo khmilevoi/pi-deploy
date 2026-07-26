@@ -26,7 +26,7 @@ Primary references in this repo:
 | Deploy an environment overlay (`rpi.<env>.toml`) | `rpi deploy --env <env> [--vars KEY=VALUE]` |
 | Deploy the base project with variables (no overlay) | `rpi deploy --vars KEY=VALUE` |
 | Print the resolved config plus its `[runtime]` preview, no agent contact | `rpi config show [--env <env>] [--vars KEY=VALUE]` |
-| List environments (this project's, or `--all`) | `rpi env ls [--all]` |
+| List environments (this project's, or `--all`) | `rpi env ls [--all] [--vars KEY=VALUE]` |
 | Destroy an environment (stack, volumes, ingress, DNS, secrets, registry) | `rpi env destroy <env> [--vars ...] [--yes]` |
 | Destroy an environment whose config no longer resolves | `rpi env destroy --full-key <key> [--yes]` |
 | Remove an environment's volumes; next deploy re-runs `on_create` | `rpi env reset-data <env> [--vars ...] [--yes]` |
@@ -155,16 +155,20 @@ rpi config show --env branch --vars BRANCH_NAME=feature/login  # preview the mer
 ```
 
 The deployed key is `<base>--<env>`, or `<base>--<env>--<slug>` when the
-configuration references `${env.slug}`. Passing `--vars` without ever
-referencing `${env.slug}` warns that the key stays `<base>--<env>` with no
-per-branch suffix — the usual cause of "my two branches keep overwriting each
-other".
+configuration references `${env.slug}`. A `source.branch` computed from a
+variable (`${BRANCH_NAME}`, `${git.branch}`, `${git.short_sha}`, …) while
+nothing references `${env.slug}` warns that the key stays `<base>--<env>`, so
+every branch deploying that environment shares it — the usual cause of "my
+two branches keep overwriting each other". A static branch never warns, no
+matter how many other variables the overlay uses: a shared stand
+(`.env.${STAGE}` behind a fixed hostname) is a legitimate configuration.
 
 `rpi env` manages what a `--env` deploy already put on the agent:
 
 ```bash
 rpi env ls                 # this project's environments (resolves ./rpi.toml for the base filter)
-rpi env ls --all           # every environment on the agent
+rpi env ls --vars BRANCH_NAME=feature/login   # ... when that base file needs a variable
+rpi env ls --all           # every environment on the agent; reads no config file
 rpi env destroy test       # tears down stack, volumes, ingress, DNS, secrets, and the registry entry
 rpi env reset-data test    # drops volumes only; next `rpi deploy --env test` re-runs on_create
 rpi env destroy --full-key myapp--branch--feature-login   # by key, reads no config file
@@ -183,10 +187,11 @@ rpi env destroy --full-key myapp--branch--feature-login   # by key, reads no con
   the SSH private key path on every remote command.)
 - `rpi env destroy` is idempotent — a key that no longer exists reports
   "already absent" instead of erroring.
-- `rpi env ls` has no `--vars` of its own: without `--all` it resolves
-  `./rpi.toml` (no overlay, no variables) just to learn the base name, so a
-  base `rpi.toml` that references a user variable makes the filtered form
-  fail. Use `rpi env ls --all` there.
+- `rpi env ls` without `--all` resolves `./rpi.toml` (no overlay) just to
+  learn the base name it filters by, so it takes its own `--vars` for a base
+  file that references user variables. `--all` ignores them — it reads no
+  configuration file at all — and stays composable with `--vars`, because it
+  is what the resolution failure tells you to fall back to.
 - These commands require an agent that advertises the `environments`
   feature (agent `>= 0.24.0`); an older agent gets an upgrade message
   instead of a raw connection error.
