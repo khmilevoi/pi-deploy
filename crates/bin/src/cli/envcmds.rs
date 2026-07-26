@@ -14,8 +14,8 @@ fn is_valid_key_part(s: &str) -> bool {
 
 /// The environment key `destroy`/`reset-data` should act on.
 ///
-/// `--key` names it outright and reads no configuration file at all — not
-/// the overlay, and not `rpi.toml` either. It is the escape hatch for a
+/// `--full-key` names it outright and reads no configuration file at all —
+/// not the overlay, and not `rpi.toml` either. It is the escape hatch for a
 /// project directory that no longer resolves, so depending on any local file
 /// would defeat it. `rpi env ls` prints the exact string to pass.
 ///
@@ -24,15 +24,15 @@ fn is_valid_key_part(s: &str) -> bool {
 fn target_key(env: Option<String>, key: Option<String>, vars: &[String]) -> anyhow::Result<String> {
     match (env, key) {
         (Some(_), Some(_)) => {
-            anyhow::bail!("--key and <env> are mutually exclusive: pass one or the other")
+            anyhow::bail!("--full-key and <env> are mutually exclusive: pass one or the other")
         }
-        (None, None) => anyhow::bail!("pass an environment name, or --key <full-key>"),
+        (None, None) => anyhow::bail!("pass an environment name, or --full-key <key>"),
         (None, Some(key)) => {
             let parts: Vec<&str> = key.split("--").collect();
             let shaped = matches!(parts.len(), 2 | 3) && parts.iter().all(|p| is_valid_key_part(p));
             if !shaped {
                 anyhow::bail!(
-                    "--key '{key}' is not an environment key (expected base--env or base--env--slug); run `rpi env ls` to see the exact key"
+                    "--full-key '{key}' is not an environment key (expected base--env or base--env--slug); run `rpi env ls` to see the exact key"
                 );
             }
             Ok(key)
@@ -200,7 +200,7 @@ mod tests {
             let err = target_key(None, Some(bad.into()), &[])
                 .unwrap_err()
                 .to_string();
-            assert!(err.contains("--key"), "{bad}: {err}");
+            assert!(err.contains("--full-key"), "{bad}: {err}");
         }
     }
 
@@ -209,16 +209,16 @@ mod tests {
         let err = target_key(Some("test".into()), Some("myapp--test".into()), &[])
             .unwrap_err()
             .to_string();
-        assert!(err.contains("--key"), "got: {err}");
+        assert!(err.contains("--full-key"), "got: {err}");
 
         let err = target_key(None, None, &[]).unwrap_err().to_string();
-        assert!(err.contains("--key"), "got: {err}");
+        assert!(err.contains("--full-key"), "got: {err}");
     }
 
     #[test]
     fn key_path_ignores_vars_entirely() {
-        // --key exists for a directory that no longer resolves, so it must
-        // not consult --vars, rpi.toml, or the overlay.
+        // --full-key exists for a directory that no longer resolves, so it
+        // must not consult --vars, rpi.toml, or the overlay.
         assert_eq!(
             target_key(None, Some("myapp--test".into()), &["TYPO=1".into()]).unwrap(),
             "myapp--test"
