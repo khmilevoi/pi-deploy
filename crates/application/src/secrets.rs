@@ -15,6 +15,7 @@ pub struct SecretsSaved {
     pub keys: usize,
     pub files: usize,
     pub applied: bool,
+    pub revision: u64,
 }
 
 /// Accept and store a SecretsBundle; with `apply` re-injects `.env` + secret
@@ -52,14 +53,16 @@ impl SendSecrets {
         &self,
         project: &str,
         bundle: SecretsBundle,
+        expected: Option<u64>,
         apply: bool,
         log: Arc<dyn LogSink>,
     ) -> Result<SecretsSaved, DomainError> {
         if bundle.is_empty() {
             return Err(DomainError::Invalid("secrets bundle is empty".into()));
         }
-        self.secrets
-            .save(&GroupRef::key(project), &bundle, None)
+        let revision = self
+            .secrets
+            .save(&GroupRef::key(project), &bundle, expected)
             .await?;
         let keys = bundle.vars.len();
         let files = bundle.files.len();
@@ -68,6 +71,7 @@ impl SendSecrets {
                 keys,
                 files,
                 applied: false,
+                revision,
             });
         }
 
@@ -112,6 +116,7 @@ impl SendSecrets {
             keys,
             files,
             applied: true,
+            revision,
         })
     }
 }
@@ -441,7 +446,7 @@ mod tests {
             .returning(|_, _, _| Ok(1));
 
         let saved = build(m)
-            .execute("rateme", bundle(), false, CollectSink::new())
+            .execute("rateme", bundle(), None, false, CollectSink::new())
             .await
             .unwrap();
         assert_eq!(
@@ -449,7 +454,8 @@ mod tests {
             SecretsSaved {
                 keys: 2,
                 files: 1,
-                applied: false
+                applied: false,
+                revision: 1,
             }
         );
     }
@@ -462,6 +468,7 @@ mod tests {
             .execute(
                 "rateme",
                 SecretsBundle::default(),
+                None,
                 false,
                 CollectSink::new(),
             )
@@ -477,7 +484,7 @@ mod tests {
         let mut b = SecretsBundle::default();
         b.files.insert("id_rsa".into(), b"key".to_vec());
         let saved = build(m)
-            .execute("rateme", b, false, CollectSink::new())
+            .execute("rateme", b, None, false, CollectSink::new())
             .await
             .unwrap();
         assert_eq!(
@@ -485,7 +492,8 @@ mod tests {
             SecretsSaved {
                 keys: 0,
                 files: 1,
-                applied: false
+                applied: false,
+                revision: 1,
             }
         );
     }
@@ -530,7 +538,7 @@ mod tests {
 
         let sink = CollectSink::new();
         let saved = build(m)
-            .execute("rateme", bundle(), true, sink.clone())
+            .execute("rateme", bundle(), None, true, sink.clone())
             .await
             .unwrap();
 
@@ -539,7 +547,8 @@ mod tests {
             SecretsSaved {
                 keys: 2,
                 files: 1,
-                applied: true
+                applied: true,
+                revision: 1,
             }
         );
         let lines = sink.lines.lock().unwrap();
@@ -566,7 +575,7 @@ mod tests {
         m.runtime.expect_up().times(0);
 
         let err = build(m)
-            .execute("rateme", bundle(), true, CollectSink::new())
+            .execute("rateme", bundle(), None, true, CollectSink::new())
             .await
             .unwrap_err();
         assert!(matches!(err, DomainError::NotFound(_)), "got: {err}");
@@ -926,5 +935,36 @@ mod tests {
             head.vars.get("DB_PASSWORD").map(String::as_str),
             Some("abc123def456")
         );
+    }
+
+    #[tokio::test]
+    async fn send_passes_the_expected_revision_through_to_the_store() {
+        let mut m = mocks();
+        m.secrets
+            .expect_save()
+            .withf(|r, _, expected| *r == GroupRef::key("rateme") && *expected == Some(4))
+            .times(1)
+            .returning(|_, _, _| Ok(5));
+
+        let saved = build(m)
+            .execute("rateme", bundle(), Some(4), false, CollectSink::new())
+            .await
+            .unwrap();
+        assert_eq!(saved.revision, 5);
+    }
+
+    #[tokio::test]
+    async fn a_conflict_from_the_store_surfaces_unchanged() {
+        let mut m = mocks();
+        m.secrets.expect_save().returning(|_, _, _| {
+            Err(DomainError::Conflict(
+                "secret group changed since revision 1".into(),
+            ))
+        });
+        let err = build(m)
+            .execute("rateme", bundle(), Some(1), false, CollectSink::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DomainError::Conflict(_)), "got: {err}");
     }
 }

@@ -356,18 +356,30 @@ pub async fn secrets_push(
             }
         }
         None => {
-            if !compat.supports(crate::compat::Feature::SecretGroups) {
+            // Distinguish "this agent predates secret groups" (the route
+            // doesn't exist, so don't even try the lookup — send an
+            // unconditional write like every pre-0.27.0 CLI always has) from
+            // "the lookup itself failed" (a transient network/server error,
+            // which must surface via `?` rather than silently downgrading to
+            // an unconditional write).
+            let expected = if !compat.supports(crate::compat::Feature::SecretGroups) {
                 output::warn(
                     "this agent predates secret groups: the overwrite guard is unavailable, \
                      so a concurrent change on the agent will be replaced silently",
                 );
-            }
+                None
+            } else if force {
+                None
+            } else {
+                Some(api.head_key_secrets(&project_name).await?.revision)
+            };
             let (n, m) = (vars_map.len(), files.len());
             let resp = api
-                .send_secrets(&project_name, vars_map, files, file_mode, apply)
+                .send_secrets(&project_name, vars_map, files, file_mode, expected, apply)
                 .await?;
             output::success(format!(
-                "saved {n} key(s) and {m} file(s) for project '{project_name}'"
+                "saved {n} key(s) and {m} file(s) for project '{project_name}' (revision {})",
+                resp.revision
             ));
             if resp.applied {
                 output::success("secrets applied to running containers");

@@ -331,12 +331,14 @@ impl ApiClient {
         vars: BTreeMap<String, String>,
         files: BTreeMap<String, String>,
         file_mode: Option<u32>,
+        expected_revision: Option<u64>,
         apply: bool,
     ) -> anyhow::Result<SecretsSendResponse> {
         let req = SecretsSendRequest {
             vars,
             files,
             file_mode,
+            expected_revision,
             apply,
         };
         let resp = self
@@ -833,7 +835,7 @@ mod tests {
         let app = Router::new().route("/v1/projects/demo/secrets", put(not_found_plain));
         let api = ApiClient::new(spawn_app(app).await);
         let err = api
-            .send_secrets("demo", BTreeMap::new(), BTreeMap::new(), None, false)
+            .send_secrets("demo", BTreeMap::new(), BTreeMap::new(), None, None, false)
             .await
             .unwrap_err()
             .to_string();

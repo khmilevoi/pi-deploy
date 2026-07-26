@@ -776,7 +776,7 @@ async fn send_env_handler(
     };
     let saved = state
         .send_secrets
-        .execute(&name, bundle, req.apply, Arc::new(TracingSink))
+        .execute(&name, bundle, None, req.apply, Arc::new(TracingSink))
         .await
         .map_err(ApiError)?;
     Ok(Json(EnvSendResponse {
@@ -881,7 +881,13 @@ async fn send_secrets_handler(
     let bundle = decode_secret_payload(req.vars, &req.files, req.file_mode)?;
     let saved = state
         .send_secrets
-        .execute(&name, bundle, false, Arc::new(TracingSink))
+        .execute(
+            &name,
+            bundle,
+            req.expected_revision,
+            false,
+            Arc::new(TracingSink),
+        )
         .await
         .map_err(ApiError)?;
     if req.apply {
@@ -895,6 +901,7 @@ async fn send_secrets_handler(
         saved_keys: saved.keys,
         saved_files: saved.files,
         applied: req.apply,
+        revision: saved.revision,
     }))
 }
 
@@ -2406,6 +2413,35 @@ mod tests {
             !rendered.contains("super-secret-value"),
             "value leaked: {rendered}"
         );
+    }
+
+    #[tokio::test]
+    async fn per_key_secrets_put_honours_expected_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = state_with_secret_groups(dir.path());
+        let body = serde_json::json!({ "vars": { "A": "1" }, "expected_revision": 0 });
+        let (status, json) =
+            request(app.clone(), put_json("/v1/projects/rateme/secrets", &body)).await;
+        assert_eq!(status, 200, "{json:?}");
+        assert_eq!(json["revision"], 1);
+
+        let (status, json) = request(app, put_json("/v1/projects/rateme/secrets", &body)).await;
+        assert_eq!(status, 409, "{json:?}");
+    }
+
+    #[tokio::test]
+    async fn per_key_secrets_put_without_expected_revision_still_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = state_with_secret_groups(dir.path());
+        let body = serde_json::json!({ "vars": { "A": "1" } });
+        for _ in 0..2 {
+            let (status, _) =
+                request(app.clone(), put_json("/v1/projects/rateme/secrets", &body)).await;
+            assert_eq!(
+                status, 200,
+                "an old CLI that sends no expected_revision must keep working"
+            );
+        }
     }
 
     /// A real workdir + a custom `Source` so `ApplySecrets` can actually

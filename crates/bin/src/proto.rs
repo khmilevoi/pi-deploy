@@ -160,6 +160,11 @@ pub struct SecretsSendRequest {
     /// `[secrets].file_mode`, already parsed. Absent -> agent defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_mode: Option<u32>,
+    /// Write only if the stored revision equals this. Absent means an
+    /// unconditional write — which is what every CLI before 0.27.0 sends, so
+    /// the guard is opt-in on this path and never breaks an old client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
     #[serde(default)]
     pub apply: bool,
 }
@@ -169,6 +174,8 @@ pub struct SecretsSendResponse {
     pub saved_keys: usize,
     pub saved_files: usize,
     pub applied: bool,
+    #[serde(default)]
+    pub revision: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
