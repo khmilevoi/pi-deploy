@@ -43,6 +43,14 @@ struct StoredBundle {
 pub struct EncryptedFileStore {
     dir: PathBuf,
     identity: age::x25519::Identity,
+    /// Serializes `save`'s read-compare-write critical section. Without it,
+    /// two concurrent guarded saves against the same group can both read the
+    /// same `current` revision, both pass the `expected` check, and the
+    /// second silently overwrites the first — exactly the lost update the
+    /// guard exists to prevent. Store-wide (not per-group) granularity is
+    /// fine: secret writes are rare, so contention costs nothing. Must be a
+    /// `tokio::sync::Mutex`, not `std`'s — the guard is held across `.await`.
+    save_lock: tokio::sync::Mutex<()>,
 }
 
 impl EncryptedFileStore {
@@ -52,7 +60,11 @@ impl EncryptedFileStore {
         let identity = open_or_create_identity(&key_path)?;
         let dir = data_dir.join("secrets");
         std::fs::create_dir_all(&dir).map_err(secrets_err)?;
-        Ok(Arc::new(EncryptedFileStore { dir, identity }))
+        Ok(Arc::new(EncryptedFileStore {
+            dir,
+            identity,
+            save_lock: tokio::sync::Mutex::new(()),
+        }))
     }
 
     fn bundle_path(&self, project: &str) -> Result<PathBuf, DomainError> {
@@ -193,6 +205,10 @@ impl SecretStore for EncryptedFileStore {
         objects: &SecretsBundle,
         expected: Option<u64>,
     ) -> Result<u64, DomainError> {
+        // Held across the read (`load`) below and the write at the bottom of
+        // this function, so the whole read-compare-write is one atomic
+        // section per store — see `save_lock`'s doc comment.
+        let _guard = self.save_lock.lock().await;
         let current = self.load(r).await?.revision;
         if let Some(expected) = expected {
             if expected != current {
@@ -603,6 +619,46 @@ mod tests {
             store.save(&r, &bundle(), None).await.unwrap(),
             3,
             "force must continue the counter, not restart it"
+        );
+    }
+
+    #[tokio::test]
+    async fn concurrent_guarded_saves_serialize_so_exactly_one_wins() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EncryptedFileStore::open(dir.path()).unwrap();
+        let r = GroupRef::named("myapp", "preview");
+
+        // Both racers assume the group is still freshly created (revision
+        // 0). Without serializing `save`'s read-compare-write section, both
+        // could read revision 0 concurrently, both pass the `expected(0)`
+        // guard, and the second would silently clobber the first on disk —
+        // the lost update the guard exists to prevent — while both report
+        // success. `tokio::join!` polls both futures on this one task, so
+        // the assertion below is deterministic: it holds regardless of
+        // which racer's internal await points happen to interleave first.
+        let bundle_a = bundle();
+        let bundle_b = bundle();
+        let (a, b) = tokio::join!(
+            store.save(&r, &bundle_a, Some(0)),
+            store.save(&r, &bundle_b, Some(0)),
+        );
+
+        let results = [&a, &b];
+        let ok_count = results.iter().filter(|res| res.is_ok()).count();
+        let conflict_count = results
+            .iter()
+            .filter(|res| matches!(res, Err(DomainError::Conflict(_))))
+            .count();
+        assert_eq!(
+            (ok_count, conflict_count),
+            (1, 1),
+            "exactly one concurrent guarded save must win and the other must see \
+             a conflict, not both silently succeeding: {a:?} / {b:?}"
+        );
+        assert_eq!(
+            store.load(&r).await.unwrap().revision,
+            1,
+            "one winning write must land as revision 1, not two writes collapsed into one"
         );
     }
 
