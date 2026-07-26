@@ -184,6 +184,7 @@ mod tests {
             created_at: 1,
             on_create_done: false,
             last_success_at: None,
+            last_commit_sha: None,
         }
     }
 

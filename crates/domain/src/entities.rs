@@ -284,6 +284,10 @@ pub struct Project {
     pub on_create_done: bool,
     /// Timestamp (unix seconds) of the most recent successful deploy.
     pub last_success_at: Option<i64>,
+    /// Commit sha of the most recent successful deploy. Feeds
+    /// `RPI_COMMIT_SHA` outside a deploy (`rpi command`, `rpi restart`),
+    /// where no fetch has just happened to supply one.
+    pub last_commit_sha: Option<String>,
 }
 
 /// Branch or specific commit-sha (§4).

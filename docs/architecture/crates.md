@@ -124,7 +124,7 @@ sequenceDiagram
   depends on `application`, `infrastructure`, and `domain`; `application` and
   `infrastructure` each depend only on `domain`).
 - `crates/domain/src/lib.rs` — domain crate's module list: `contracts`,
-  `entities`, `error`.
+  `entities`, `error`, `runtimevars`, `secretmode`.
 - `crates/application/src/lib.rs` — application crate's module list, one
   module per use case (`deploy`, `gc`, `logs`, `command`, `scheduler`, ...).
 - `crates/infrastructure/src/lib.rs` — infrastructure crate's module list,

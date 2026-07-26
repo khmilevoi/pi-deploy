@@ -10,7 +10,7 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use crate::sqlite::{storage_err, Db};
 
-const SELECT: &str = "SELECT name, repo, branch, compose_path, service, container_port, hostname, host_port, created_at, expose, commands, command_timeout_secs, env_name, env_base, env_slug, env_ttl_secs, env_on_create, env_on_create_done, last_success_at FROM projects";
+const SELECT: &str = "SELECT name, repo, branch, compose_path, service, container_port, hostname, host_port, created_at, expose, commands, command_timeout_secs, env_name, env_base, env_slug, env_ttl_secs, env_on_create, env_on_create_done, last_success_at, last_commit_sha FROM projects";
 
 pub struct SqliteProjectRepo {
     db: Db,
@@ -59,6 +59,7 @@ fn row_to_project(row: &rusqlite::Row<'_>) -> Result<Project, rusqlite::Error> {
         created_at: row.get(8)?,
         on_create_done: row.get::<_, i64>(17)? != 0,
         last_success_at: row.get(18)?,
+        last_commit_sha: row.get(19)?,
     })
 }
 
@@ -265,13 +266,19 @@ impl ProjectRepository for SqliteProjectRepo {
             .await
     }
 
-    async fn mark_deploy_success(&self, name: &str, at: i64) -> Result<(), DomainError> {
+    async fn mark_deploy_success<'a>(
+        &self,
+        name: &str,
+        at: i64,
+        commit_sha: Option<&'a str>,
+    ) -> Result<(), DomainError> {
         let name = name.to_string();
+        let commit_sha = commit_sha.map(str::to_string);
         self.db
             .call(move |conn| {
                 conn.execute(
-                    "UPDATE projects SET last_success_at = ?2 WHERE name = ?1",
-                    params![name, at],
+                    "UPDATE projects SET last_success_at = ?2, last_commit_sha = COALESCE(?3, last_commit_sha) WHERE name = ?1",
+                    params![name, at, commit_sha],
                 )
                 .map(|_| ())
                 .map_err(storage_err)
@@ -503,7 +510,7 @@ mod tests {
         assert_eq!(p.last_success_at, None);
 
         repo.set_on_create_done("myapp--test", true).await.unwrap();
-        repo.mark_deploy_success("myapp--test", 12345)
+        repo.mark_deploy_success("myapp--test", 12345, None)
             .await
             .unwrap();
         // re-upsert (new deploy) must NOT reset the runtime flags
@@ -513,6 +520,29 @@ mod tests {
             .unwrap();
         assert!(p.on_create_done);
         assert_eq!(p.last_success_at, Some(12345));
+    }
+
+    #[tokio::test]
+    async fn mark_deploy_success_stores_the_sha_and_never_erases_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = repo(&dir, 8000, 8999);
+        repo.upsert(&cfg("a")).await.unwrap();
+
+        repo.mark_deploy_success("a", 100, Some("sha-one"))
+            .await
+            .unwrap();
+        let p = repo.get("a").await.unwrap().unwrap();
+        assert_eq!(p.last_success_at, Some(100));
+        assert_eq!(p.last_commit_sha.as_deref(), Some("sha-one"));
+
+        repo.mark_deploy_success("a", 200, None).await.unwrap();
+        let p = repo.get("a").await.unwrap().unwrap();
+        assert_eq!(p.last_success_at, Some(200));
+        assert_eq!(
+            p.last_commit_sha.as_deref(),
+            Some("sha-one"),
+            "a call with no sha must not erase the stored one"
+        );
     }
 
     #[tokio::test]

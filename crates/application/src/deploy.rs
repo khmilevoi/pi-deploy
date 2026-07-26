@@ -193,7 +193,7 @@ impl DeployProject {
                 deployment.log_tail = tail.tail();
                 if let Err(err) = self
                     .projects
-                    .mark_deploy_success(&config.name, finished_at)
+                    .mark_deploy_success(&config.name, finished_at, None)
                     .await
                 {
                     log.line(&format!(
@@ -522,7 +522,7 @@ mod tests {
         let mut projects = MockProjectRepository::new();
         projects
             .expect_mark_deploy_success()
-            .returning(|_, _| Ok(()));
+            .returning(|_, _, _| Ok(()));
         Mocks {
             source: MockSource::new(),
             runtime: MockContainerRuntime::new(),
@@ -577,6 +577,7 @@ mod tests {
                 created_at: 1,
                 on_create_done: false,
                 last_success_at: None,
+                last_commit_sha: None,
             })
         });
         let stage_order = Arc::clone(&order);
@@ -779,6 +780,7 @@ mod tests {
                 created_at: 1,
                 on_create_done: false,
                 last_success_at: None,
+                last_commit_sha: None,
             })
         });
         m.source.expect_fetch().returning(|_, _, _| {
@@ -992,6 +994,7 @@ mod tests {
                 created_at: 1,
                 on_create_done: false,
                 last_success_at: None,
+                last_commit_sha: None,
             })
         });
         m.source.expect_fetch().returning(|_, _, _| {
@@ -1061,6 +1064,7 @@ mod tests {
                 created_at: 1,
                 on_create_done: false,
                 last_success_at: None,
+                last_commit_sha: None,
             })
         });
         m.source.expect_fetch().returning(|_, _, _| {
@@ -1269,6 +1273,7 @@ mod tests {
                 created_at: 1,
                 on_create_done: false,
                 last_success_at: None,
+                last_commit_sha: None,
             })
         });
         m.source.expect_fetch().returning(|_, _, _| {
@@ -1327,6 +1332,7 @@ mod tests {
                 created_at: 1,
                 on_create_done: false,
                 last_success_at: None,
+                last_commit_sha: None,
             })
         });
         m.history.expect_mark_running().returning(|_, _| Ok(()));
@@ -1383,6 +1389,7 @@ mod tests {
                 created_at: 1,
                 on_create_done: false,
                 last_success_at: None,
+                last_commit_sha: None,
             })
         });
         m.history.expect_mark_running().returning(|_, _| Ok(()));
@@ -1524,6 +1531,7 @@ mod tests {
                 created_at: 1,
                 on_create_done: false,
                 last_success_at: None,
+                last_commit_sha: None,
             })
         });
         m.source.expect_fetch().returning(|p, _, _| {
@@ -1821,6 +1829,7 @@ mod tests {
                 created_at: 1,
                 on_create_done: false,
                 last_success_at: None,
+                last_commit_sha: None,
             })
         });
         m.source.expect_fetch().returning(|_, _, _| {
@@ -1852,9 +1861,9 @@ mod tests {
             .returning(|_, _| Ok(()));
         m.projects
             .expect_mark_deploy_success()
-            .withf(|name, at| name == "rateme--test" && *at == 100)
+            .withf(|name, at, _| name == "rateme--test" && *at == 100)
             .times(1)
-            .returning(|_, _| Ok(()));
+            .returning(|_, _, _| Ok(()));
         m.history.expect_mark_running().returning(|_, _| Ok(()));
         m.history
             .expect_record_finished()
@@ -1886,6 +1895,7 @@ mod tests {
                 created_at: 1,
                 on_create_done: true,
                 last_success_at: Some(50),
+                last_commit_sha: None,
             })
         });
         m.source.expect_fetch().returning(|_, _, _| {
@@ -1939,6 +1949,7 @@ mod tests {
                 created_at: 1,
                 on_create_done: false,
                 last_success_at: None,
+                last_commit_sha: None,
             })
         });
         m.source.expect_fetch().returning(|_, _, _| {
@@ -1999,9 +2010,9 @@ mod tests {
         ok_pre_stages(&mut m);
         m.projects
             .expect_mark_deploy_success()
-            .withf(|name, at| name == "rateme" && *at == 100)
+            .withf(|name, at, _| name == "rateme" && *at == 100)
             .times(1)
-            .returning(|_, _| Ok(()));
+            .returning(|_, _, _| Ok(()));
         m.secrets
             .expect_load()
             .returning(|_| Ok(SecretsBundle::default()));

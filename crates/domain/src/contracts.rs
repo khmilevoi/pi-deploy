@@ -131,8 +131,14 @@ pub trait ProjectRepository: Send + Sync {
         &self,
         base: Option<&'a str>,
     ) -> Result<Vec<Project>, DomainError>;
-    /// Sets last_success_at (TTL sliding anchor).
-    async fn mark_deploy_success(&self, name: &str, at: i64) -> Result<(), DomainError>;
+    /// Sets last_success_at (TTL sliding anchor) and, when a sha is given,
+    /// last_commit_sha (source of RPI_COMMIT_SHA outside a deploy).
+    async fn mark_deploy_success<'a>(
+        &self,
+        name: &str,
+        at: i64,
+        commit_sha: Option<&'a str>,
+    ) -> Result<(), DomainError>;
     async fn set_on_create_done(&self, name: &str, done: bool) -> Result<(), DomainError>;
 }
 
