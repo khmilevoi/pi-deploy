@@ -514,8 +514,8 @@ sudo useradd --system --no-create-home --shell /usr/sbin/nologin rpi-agent || tr
 sudo usermod -aG docker rpi-agent
 sudo usermod -aG rpi-agent "$USER"   # tunnel access to the socket; re-login after
 
-sudo mkdir -p /var/lib/rpi /etc/rpi
-sudo chown -R rpi-agent:rpi-agent /var/lib/rpi
+sudo install -d -m 0750 -o rpi-agent -g rpi-agent /var/lib/rpi
+sudo mkdir -p /etc/rpi
 ```
 
 Create `/etc/rpi/agent.toml`:
