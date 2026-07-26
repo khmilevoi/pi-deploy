@@ -1,6 +1,6 @@
 ---
 name: rpi-cli
-description: Use when operating, installing, testing, or troubleshooting the rpi deploy CLI, including rpi deploy, rpi ls, rpi secrets send, rpi secrets ls, rpi command, rpi logs, rpi stats, rpi start/stop/restart/rm, rpi status, rpi doctor, rpi gc, rpi agent run, rpi setup, rpi init, rpi agent setup, rpi upgrade, rpi agent update, install.sh, SSH profiles, PI_SERVER, PI_AGENT_URL, local dev agents, CLI-to-agent connection failures, rpi config show, rpi env ls/destroy/reset-data, and --env/--vars environment overlays.
+description: Use when operating, installing, testing, or troubleshooting the rpi deploy CLI, including rpi deploy, rpi ls, rpi secrets send, rpi secrets ls, rpi command, rpi logs, rpi stats, rpi start/stop/restart/rm, rpi status, rpi doctor, rpi gc, rpi agent run, rpi setup, rpi init, rpi agent setup, rpi upgrade, rpi agent update, install.sh, SSH profiles, PI_SERVER, PI_AGENT_URL, local dev agents, CLI-to-agent connection failures, rpi config show and its [runtime] block, rpi env ls/destroy/reset-data (including --full-key), --env/--vars environment overlays, configuration variables, and the RPI_* runtime variables injected into containers.
 ---
 
 # Rpi CLI
@@ -24,10 +24,13 @@ Primary references in this repo:
 | Deploy a ref | `rpi deploy --ref <branch-tag-or-sha>` |
 | Cancel active deploys for current `rpi.toml` project | `rpi deploy --cancel` |
 | Deploy an environment overlay (`rpi.<env>.toml`) | `rpi deploy --env <env> [--vars KEY=VALUE]` |
-| Print the resolved config (base + overlay), no agent contact | `rpi config show [--env <env>] [--vars KEY=VALUE]` |
+| Deploy the base project with variables (no overlay) | `rpi deploy --vars KEY=VALUE` |
+| Print the resolved config plus its `[runtime]` preview, no agent contact | `rpi config show [--env <env>] [--vars KEY=VALUE]` |
 | List environments (this project's, or `--all`) | `rpi env ls [--all]` |
 | Destroy an environment (stack, volumes, ingress, DNS, secrets, registry) | `rpi env destroy <env> [--vars ...] [--yes]` |
+| Destroy an environment whose config no longer resolves | `rpi env destroy --full-key <key> [--yes]` |
 | Remove an environment's volumes; next deploy re-runs `on_create` | `rpi env reset-data <env> [--vars ...] [--yes]` |
+| Same, by key, with no config file | `rpi env reset-data --full-key <key> [--yes]` |
 | List projects | `rpi ls` or `rpi ps` |
 | Send secrets bundle (env + files) | `rpi secrets send [--env <env>] [--vars ...]` |
 | Send secrets bundle and restart running stack | `rpi secrets send --apply` |
@@ -91,20 +94,71 @@ rpi command create-invite -- --email x@y.com  # `--` separates extra args, appen
   "agent does not support [commands]; update rpi-agent on the Pi" — update the
   agent binary and redeploy.
 
+## Configuration Variables
+
+`--vars KEY=VALUE` (repeatable) supplies user variables to any command that
+reads a configuration: `rpi deploy`, `rpi command`, `rpi secrets send`,
+`rpi secrets ls`, `rpi config show`, and `rpi env destroy`/`reset-data`.
+
+- **`--vars` does not require `--env`.** It works against the base
+  `rpi.toml` alone.
+- **Names are arbitrary**, matching `^[A-Z][A-Z0-9_]*$` — `BRANCH_NAME` has
+  no special status. `RPI_`-prefixed names are refused (that namespace is
+  runtime-only). A `--vars` key nothing references is an error naming the
+  key, so a typo never passes silently.
+- Besides user variables, a configuration can reference resolver inputs
+  `${git.branch}`, `${git.sha}`, `${git.short_sha}` and — only when `--env`
+  selected an environment — `${env.name}`, `${env.slug}`. `${git.*}` is read
+  lazily, so a config that uses none still resolves outside a repository; a
+  detached `HEAD` is an error telling you to pass the branch via `--vars`.
+  See the `rpi-toml` skill for the full model.
+
+`rpi config show` resolves everything locally and prints the merged TOML,
+then a `[runtime]` block previewing the `RPI_*` variables a deploy would
+inject into the containers. `RPI_HOST_PORT` and `RPI_COMMIT_SHA` appear as
+`<assigned by agent>` — the agent allocates the port and learns the sha at
+fetch time, so the CLI cannot know them:
+
+```bash
+rpi config show --vars BRANCH_NAME=feature/login
+```
+
+```toml
+# ... resolved rpi.toml ...
+
+[runtime]
+RPI_PROJECT = "myapp"
+RPI_PROJECT_BASE = "myapp"
+RPI_BRANCH_NAME = "feature/login"
+RPI_HOSTNAME = "app.example.com"
+RPI_HOST_PORT = "<assigned by agent>"
+RPI_COMMIT_SHA = "<assigned by agent>"
+```
+
+`RPI_*` injection needs an agent `>= 0.27.0` (`runtime-vars`). It is a
+degradable capability: against an older agent `rpi deploy` prints one warning
+and deploys anyway, with no `RPI_*` reaching any container.
+
 ## Environment Overlays
 
 `--env <name>` (with an optional repeatable `--vars KEY=VALUE`) deploys or
 operates a variant of the current project defined by an `rpi.<env>.toml`
 overlay next to `rpi.toml` — a shared `test` environment, or a per-branch
-preview keyed off `BRANCH_NAME`. Accepted by `rpi deploy`, `rpi command`,
-`rpi secrets send`, and `rpi secrets ls`; see the `rpi-toml` skill for the
-overlay file's schema, merge rules, and `${...}` interpolation.
+preview. Accepted by `rpi deploy`, `rpi command`, `rpi secrets send`, and
+`rpi secrets ls`; see the `rpi-toml` skill for the overlay file's schema and
+merge rules.
 
 ```bash
 rpi deploy --env test                              # static overlay: rpi.test.toml
 rpi deploy --env branch --vars BRANCH_NAME=feature/login  # parameterized overlay
 rpi config show --env branch --vars BRANCH_NAME=feature/login  # preview the merge, no agent contact
 ```
+
+The deployed key is `<base>--<env>`, or `<base>--<env>--<slug>` when the
+configuration references `${env.slug}`. Passing `--vars` without ever
+referencing `${env.slug}` warns that the key stays `<base>--<env>` with no
+per-branch suffix — the usual cause of "my two branches keep overwriting each
+other".
 
 `rpi env` manages what a `--env` deploy already put on the agent:
 
@@ -113,13 +167,26 @@ rpi env ls                 # this project's environments (resolves ./rpi.toml fo
 rpi env ls --all           # every environment on the agent
 rpi env destroy test       # tears down stack, volumes, ingress, DNS, secrets, and the registry entry
 rpi env reset-data test    # drops volumes only; next `rpi deploy --env test` re-runs on_create
+rpi env destroy --full-key myapp--branch--feature-login   # by key, reads no config file
 ```
 
-- `rpi env destroy`/`reset-data` resolve the local overlay to compute the
-  target key (same validation as `rpi deploy --env`), then prompt for that
+- `rpi env destroy`/`reset-data` resolve the local overlay on the `<env>`
+  path to compute the target key (same resolution and validation as
+  `rpi deploy --env`, so the same `--vars` are needed), then prompt for that
   key to be typed back for confirmation unless `--yes` is passed.
+- `--full-key <key>` is the escape hatch when that no longer works — a
+  deleted overlay, a renamed branch, a directory that stopped resolving. It
+  reads **no** configuration file at all (not the overlay, not `rpi.toml`),
+  validating only the key's own `base--env` / `base--env--slug` shape, and is
+  mutually exclusive with both `<env>` and `--vars`. Copy the key from
+  `rpi env ls`. (The flag is `--full-key`, not `--key`: `--key` is already
+  the SSH private key path on every remote command.)
 - `rpi env destroy` is idempotent — a key that no longer exists reports
   "already absent" instead of erroring.
+- `rpi env ls` has no `--vars` of its own: without `--all` it resolves
+  `./rpi.toml` (no overlay, no variables) just to learn the base name, so a
+  base `rpi.toml` that references a user variable makes the filtered form
+  fail. Use `rpi env ls --all` there.
 - These commands require an agent that advertises the `environments`
   feature (agent `>= 0.24.0`); an older agent gets an upgrade message
   instead of a raw connection error.
@@ -219,6 +286,9 @@ When changing CLI behavior, update both implementation and documentation:
 - CLI shape: `crates/bin/src/main.rs`
 - profile resolution: `crates/bin/src/cli/config.rs`
 - command behavior: `crates/bin/src/cli/commands.rs`
+- configuration resolution: `crates/bin/src/cli/overlay.rs`, `vars.rs`, `gitctx.rs`
+- `rpi env` subcommands: `crates/bin/src/cli/envcmds.rs`
+- capability gates and their policies: `crates/bin/src/compat.rs`
 - user-facing docs and examples: `README.md`
 
 Run focused tests first, then the workspace suite when practical:

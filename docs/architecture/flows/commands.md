@@ -25,7 +25,7 @@ sequenceDiagram
     else resolved
         Agent-->>CLI: SSE stream opens
         Agent->>Runner: execute declared argv plus extra args
-        Runner->>Svc: docker compose exec into the service
+        Runner->>Svc: docker compose exec into the service, RPI_* passed as -e flags
         loop command is running
             Svc-->>Runner: stdout or stderr line
             Runner-->>Agent: line
@@ -76,13 +76,18 @@ sequenceDiagram
    command line) and runs it with `docker compose exec`, inside the pinned
    service if the command specifies one, otherwise the project's main
    service — using the same Compose file, working directory, and deployed
-   override file the project's regular deploy uses, and exporting the same
-   `RPI_*` runtime variables to the `docker compose` call, so a `${RPI_*}`
-   reference in the compose file resolves here just as it did at deploy time
-   (see `flows/deploy.md`). The run is bounded by a
-   time budget (ten minutes, unless the project sets its own override); a
-   run that hangs past that budget is killed and reported as a timeout, the
-   same way a stuck deploy stage would be.
+   override file the project's regular deploy uses. The same `RPI_*` runtime
+   variables a deploy exports (see `flows/deploy.md`) are attached twice
+   here: once to the `docker compose` process itself, so a `${RPI_*}`
+   reference in the compose file resolves just as it did at deploy time, and
+   once as `-e KEY=VALUE` flags on the exec, so the command's own process
+   sees current values rather than whatever the container was started with by
+   an earlier deploy. Their values come from the registry, so
+   `RPI_COMMIT_SHA` is the last *successfully* deployed commit — no deploy is
+   in flight to supply a fresher one. The run is bounded by a time budget
+   (ten minutes, unless the project sets its own override); a run that hangs
+   past that budget is killed and reported as a timeout, the same way a stuck
+   deploy stage would be.
 6. **Streaming output.** stdout/stderr lines from the exec are pushed onto
    the response as an event stream as they're produced, and the CLI prints
    each one to its own stdout the moment it arrives — every line, in full,
@@ -126,8 +131,12 @@ sequenceDiagram
 - `crates/application/src/command.rs` — the `RunCommand` use case: resolves
   the project and its deployed command (allowlist only, never an arbitrary
   argv), builds the exec target (service, Compose file, override file,
-  workdir, `RPI_*` runtime variables), enforces the run's time budget, and
-  returns the in-container exit code.
+  workdir, `RPI_*` runtime variables derived from the registry row), enforces
+  the run's time budget, and returns the in-container exit code.
+- `crates/infrastructure/src/docker.rs` — the exec itself: `exec_tail`
+  expands the runtime map into the `-e KEY=VALUE` flags that precede the
+  service name and argv, and the shared `compose` builder puts the same map
+  in the spawned process's own environment.
 - `crates/bin/src/cli/commands.rs` — the CLI side of `rpi command`: the
   no-name listing (deployed commands plus the "declared but never deployed"
   hint), and the run path that streams every output line straight to stdout
