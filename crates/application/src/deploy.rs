@@ -499,6 +499,7 @@ mod tests {
             commands: Default::default(),
             command_timeout_secs: None,
             environment: None,
+            secret_groups: Vec::new(),
         }
     }
 

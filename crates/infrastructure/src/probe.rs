@@ -475,6 +475,7 @@ mod tests {
                 commands: Default::default(),
                 command_timeout_secs: None,
                 environment: None,
+                secret_groups: Vec::new(),
             },
             host_port: 8002,
             created_at: 1,

@@ -406,6 +406,10 @@ impl RpiToml {
             // The deploy path fills this from the resolved `EnvSelection`
             // (later task); rpi.toml alone never carries an environment.
             environment: None,
+            // Deploy-time layering of [secrets].groups into the deploy
+            // request is a later task (secret-groups spec); this task only
+            // persists the field once it is set.
+            secret_groups: Vec::new(),
         }
     }
 }

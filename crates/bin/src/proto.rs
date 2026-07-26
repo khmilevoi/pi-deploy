@@ -51,6 +51,8 @@ pub struct ProjectDto {
     pub timeouts: Option<TimeoutsDto>,
     #[serde(default)]
     pub commands: BTreeMap<String, CommandSpec>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_groups: Vec<String>,
 }
 
 impl From<ProjectDto> for ProjectConfig {
@@ -89,6 +91,7 @@ impl From<ProjectDto> for ProjectConfig {
             command_timeout_secs,
             // The handler fills this in from the request's `environment` block.
             environment: None,
+            secret_groups: dto.secret_groups,
         }
     }
 }
@@ -116,6 +119,7 @@ impl From<&ProjectConfig> for ProjectDto {
                 command_secs: config.command_timeout_secs,
             }),
             commands: config.commands.clone(),
+            secret_groups: config.secret_groups.clone(),
         }
     }
 }
@@ -578,6 +582,7 @@ mod tests {
             healthcheck: None,
             timeouts: None,
             commands: BTreeMap::new(),
+            secret_groups: Vec::new(),
         }
         .into();
         config.healthcheck.path = Some("/health".into());
@@ -686,6 +691,7 @@ mod tests {
             commands: Default::default(),
             command_timeout_secs: Some(1800),
             environment: None,
+            secret_groups: Vec::new(),
         };
         config.commands.insert(
             "migrate".into(),
@@ -716,6 +722,7 @@ mod tests {
             commands: Default::default(),
             command_timeout_secs: None,
             environment: None,
+            secret_groups: Vec::new(),
         };
         config.commands.insert(
             "create-invite".into(),
