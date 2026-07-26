@@ -22,6 +22,10 @@ git commit -m "fixture: $SCENARIO app"
 EXTRA_BRANCHES=/opt/e2e/scenarios/$SCENARIO/extra-branches
 if [[ -f $EXTRA_BRANCHES ]]; then
   while IFS= read -r branch; do
+    # Belt-and-braces: .gitattributes pins this file to LF, but strip a
+    # trailing CR anyway in case a clone somehow still normalized it -- a
+    # ref name containing \r is a hard git error, not a soft one.
+    branch=${branch%$'\r'}
     [[ -z $branch ]] && continue
     git branch "$branch"
   done <"$EXTRA_BRANCHES"

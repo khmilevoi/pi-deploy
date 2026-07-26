@@ -30,6 +30,7 @@ test('default app skeleton uses local Git, managed port allocation, HTTP fallbac
   assert.match(attributes, /tests\/e2e\/\*\*\/\*\.sh text eol=lf/);
   assert.match(attributes, /tests\/e2e\/scenarios\/\*\/app\/health text eol=lf/);
   assert.match(attributes, /tests\/e2e\/app\.default\/health text eol=lf/);
+  assert.match(attributes, /tests\/e2e\/scenarios\/\*\/extra-branches text eol=lf/);
   assert.match(config, /name = "e2e-fixture"/);
   assert.match(config, /repo = "git:\/\/git-fixture\/fixture\.git"/);
   assert.match(config, /service = "web"/);

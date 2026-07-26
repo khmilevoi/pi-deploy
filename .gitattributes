@@ -1,4 +1,5 @@
 tests/e2e/**/*.sh text eol=lf
 tests/e2e/scenarios/*/app/health text eol=lf
 tests/e2e/app.default/health text eol=lf
+tests/e2e/scenarios/*/extra-branches text eol=lf
 scripts/*.sh text eol=lf

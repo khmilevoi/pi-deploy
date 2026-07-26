@@ -238,26 +238,35 @@ sequenceDiagram
     the group push item 10 describes — go through the same conditional-write
     guard in the store, reached through `GroupRef` rather than two separate
     mechanisms. Every stored bundle, named group or deploy key's own, carries
-    a revision counter that increments by one on each successful write.
-    Unless `--force` is passed, the CLI first reads the target's current
-    head to learn that revision, then sends the push with it as
-    `expected_revision`; the agent commits the write only if the store's
-    live revision still equals `expected_revision` at that moment — checked
-    and updated under the same per-store lock, so two concurrent pushes can
-    never both pass the check against the same starting revision. A stale
-    expectation (someone else pushed in between the CLI's read and its
-    write) is rejected as `DomainError::Conflict`, which the agent surfaces
-    as HTTP 409 with a message naming both revisions and pointing at the
-    fix: re-run to see what changed, or pass `--force` to overwrite anyway.
-    `--force` skips the head read entirely and sends no `expected_revision`,
-    which always writes unconditionally regardless of what is currently
-    stored. Either way a successful write returns the new revision, which is
-    what lets `rpi secrets push`'s success line report "now at revision N".
-    An agent that predates secret groups (< 0.27.0) never had this guard on
-    the per-key path either — a CLI new enough to ask for it there prints a
-    one-time warning that the overwrite guard is unavailable and a
-    concurrent change on that agent will be replaced silently, then sends
-    the same unconditional write every pre-0.27.0 CLI always has.
+    a revision counter that increments by one on each successful write. The
+    CLI sends `expected_revision` from a head read of the target — but
+    `--force` changes what that means differently on each path. On the
+    **per-key** path, `--force` skips the head read entirely: there is
+    nothing left to compare against, so the push carries no
+    `expected_revision` at all. On the **group** path, the head is read
+    unconditionally either way, because the CLI also needs it to print the
+    pre-push key/file diff (`env keys: ...`/`files: ...`); `--force` there
+    only changes what gets sent — the read revision as `expected_revision`
+    normally, or none of it when forced — the diff output is unaffected.
+    Either way, the agent commits the write only if the store's live
+    revision still equals whatever `expected_revision` it was sent (a push
+    that carries none always commits) — checked and updated under the same
+    per-store lock, so two concurrent pushes can never both pass the check
+    against the same starting revision. A stale expectation (someone else
+    pushed in between the CLI's read and its write) is rejected as
+    `DomainError::Conflict`, which the agent surfaces as HTTP 409 with a
+    message naming both revisions and pointing at the fix: re-run to see
+    what changed, or pass `--force` to overwrite anyway. Against an agent
+    that supports secret groups, a successful write always returns the new
+    revision, which is what lets `rpi secrets push`'s success line report
+    "now at revision N", forced or not. An agent that predates secret
+    groups (< 0.27.0) never had this guard on the per-key path either — a
+    CLI new enough to ask for it there prints a one-time warning that the
+    overwrite guard is unavailable and a concurrent change on that agent
+    will be replaced silently, then sends the same unconditional write
+    every pre-0.27.0 CLI always has; that agent's response never carries a
+    real revision either, so the success line omits it rather than print
+    the meaningless zero the response decodes to.
 
 ## Source anchors
 
@@ -266,7 +275,7 @@ sequenceDiagram
 - `crates/application/src/remove.rs` — `RemoveProject`: always removes the target's own key bundle, and additionally calls `SecretStore::remove_base` when (and only when) `existing.config.environment.is_none()` — the base-vs-environment check item 11 describes. `rpi rm` and `rpi env destroy`/the TTL reaper (`flows/environments.md`) both tear down through this one use case, so the base/environment split lives in exactly one place.
 - `crates/bin/src/agent/http.rs` (secrets + secret-group routes) — validates and decodes an incoming bundle once (`decode_secret_payload`, shared by the per-key and group write paths), validates a group name with the same rule the `rpi.toml` parser uses (`pi_domain::secretgroup::validate_group_name`), and serves both route families; no handler ever serializes a secret value. `ApiError`'s `IntoResponse` maps `DomainError::Conflict` (item 12's stale-revision case) to HTTP 409 for every route in this file, not only the secret ones.
 - `crates/bin/src/proto.rs` (secrets + secret-group DTOs) — wire shapes for both route families; group and head responses carry names, digests, sizes and revisions only. `SecretsListResponse.layers` (`Vec<SecretLayerDto>`) carries the per-layer provenance `rpi secrets ls` renders; absent (not merely empty) from an agent older than 0.27.0, which is how the CLI tells "nothing to show" apart from "this agent doesn't know about layers."
-- `crates/bin/src/cli/commands.rs` (`secrets_push`, `secrets_diff`, `secrets_ls`, `secrets_group_ls`, `secrets_group_rm`) — the CLI side of every route above; `effective_rows` turns a `SecretsListResponse` into (name, winning layer, shadowed?) rows for `secrets_ls`'s effective view, and `render_group_head` renders one group's head (revision, names, digests, sizes) for `secrets_ls --group`. `rm_confirmation_text` (used by `rm`) is the pure function behind item 11's confirmation wording; `rm` feeds it best-effort `list_secret_groups`/`list_environments` results before prompting. `secrets_push` is also where item 12's client half lives: it reads the target's head to compute `expected_revision` unless `--force`, and `should_look_up_key_revision` decides whether that read happens at all on the per-key path (never against an agent that predates secret groups, since the lookup route itself wouldn't exist there).
+- `crates/bin/src/cli/commands.rs` (`secrets_push`, `secrets_diff`, `secrets_ls`, `secrets_group_ls`, `secrets_group_rm`) — the CLI side of every route above; `effective_rows` turns a `SecretsListResponse` into (name, winning layer, shadowed?) rows for `secrets_ls`'s effective view, and `render_group_head` renders one group's head (revision, names, digests, sizes) for `secrets_ls --group`. `rm_confirmation_text` (used by `rm`) is the pure function behind item 11's confirmation wording; `rm` feeds it best-effort `list_secret_groups`/`list_environments` results before prompting. `secrets_push` is also where item 12's client half lives, and it differs by path: on the group branch the head is always fetched (`head_secret_group(...).ok()`, both for the diff lines and for `expected_revision`), with `--force` only zeroing the latter; on the per-key branch `should_look_up_key_revision` decides whether the head read (`head_key_secrets`) happens at all, and it never does when `--force` is set or the agent predates secret groups (the lookup route itself wouldn't exist there).
 - `crates/bin/src/cli/rpitoml.rs` (`SecretsSection` only) — the `[secrets]` table in `rpi.toml`: names the local env file `rpi secrets send` reads (`[secrets].env`, default `.env`), the extra files it reads verbatim (`[secrets].files`), the declared group list (`[secrets].groups`, carried into `ProjectConfig.secret_groups` in declared order by `to_project_config`), and the optional `[secrets].file_mode` override, parsed and validated by `pi_domain::secretmode`.
 - `crates/application/src/mask.rs` — `MaskingSink`: replaces armed secret values (6+ characters) with `***KEY***` in every line logged afterward.
 - `crates/infrastructure/src/secrets.rs` — `EncryptedFileStore`: age-encrypts and decrypts the bundle at rest, one file per project or named group, using an agent identity key kept at file mode 0600; `save` also owns the conditional-write guard (item 12) — the revision compare-and-set against `expected`, `DomainError::Conflict` on a mismatch — under a per-store lock that makes the whole read-compare-write atomic.
