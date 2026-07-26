@@ -2375,6 +2375,135 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn head_key_secrets_route_reports_digests_not_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = state_with_secret_groups(dir.path());
+        let body = serde_json::json!({
+            "vars": { "DB_PASSWORD": "super-secret-value" },
+            "apply": false
+        });
+        let (status, _) = request(app.clone(), put_json("/v1/projects/myapp/secrets", &body)).await;
+        assert_eq!(status, 200);
+
+        let (status, json) = request(app, get_req("/v1/projects/myapp/secrets/head")).await;
+        assert_eq!(status, 200, "{json:?}");
+        assert_eq!(json["revision"], 1);
+        assert!(json["vars"]["DB_PASSWORD"].is_string());
+        let rendered = json.to_string();
+        assert!(
+            !rendered.contains("super-secret-value"),
+            "value leaked: {rendered}"
+        );
+    }
+
+    /// A real workdir + a custom `Source` so `ApplySecrets` can actually
+    /// write `.env` and the test can read it back — the merged content on
+    /// disk is the only way to prove groups + key bundle were really merged,
+    /// not just that the route returned 200.
+    fn state_with_writable_workdir(dir: &std::path::Path) -> (AppState, std::path::PathBuf) {
+        let workdir = dir.join("wd");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let mut source = MockSource::new();
+        let wd = workdir.clone();
+        source.expect_workdir().returning(move |_| wd.clone());
+        let state = state_with(dir, Arc::new(source), Arc::new(ok_runtime()));
+        (state, workdir)
+    }
+
+    #[tokio::test]
+    async fn secrets_apply_flag_injects_the_merged_layered_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, workdir) = state_with_writable_workdir(dir.path());
+        let mut config = project_with_environment("myapp", None).config;
+        config.secret_groups = vec!["common".into()];
+        state.projects.upsert(&config).await.unwrap();
+        let app = router(state);
+
+        let group_body =
+            serde_json::json!({ "vars": { "SHARED": "shared-value" }, "expected_revision": 0 });
+        let (status, _) = request(
+            app.clone(),
+            put_json("/v1/projects/myapp/secret-groups/common", &group_body),
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        let key_body = serde_json::json!({ "vars": { "OWN": "own-value" }, "apply": true });
+        let (status, json) = request(app, put_json("/v1/projects/myapp/secrets", &key_body)).await;
+        assert_eq!(status, 200, "{json:?}");
+        assert_eq!(json["applied"], true);
+
+        let env = std::fs::read_to_string(workdir.join(".env")).unwrap();
+        assert!(env.contains("SHARED=shared-value"), "{env}");
+        assert!(env.contains("OWN=own-value"), "{env}");
+    }
+
+    #[tokio::test]
+    async fn secrets_apply_route_reapplies_the_merged_layered_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, workdir) = state_with_writable_workdir(dir.path());
+        let mut config = project_with_environment("myapp", None).config;
+        config.secret_groups = vec!["common".into()];
+        state.projects.upsert(&config).await.unwrap();
+        let app = router(state);
+
+        let group_body =
+            serde_json::json!({ "vars": { "SHARED": "shared-value" }, "expected_revision": 0 });
+        let (status, _) = request(
+            app.clone(),
+            put_json("/v1/projects/myapp/secret-groups/common", &group_body),
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        // stored, not applied yet
+        let key_body = serde_json::json!({ "vars": { "OWN": "own-value" }, "apply": false });
+        let (status, _) = request(
+            app.clone(),
+            put_json("/v1/projects/myapp/secrets", &key_body),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(
+            !workdir.join(".env").exists(),
+            "nothing should be written without apply"
+        );
+
+        let (status, json) = request(app, post_empty("/v1/projects/myapp/secrets/apply")).await;
+        assert_eq!(status, 200, "{json:?}");
+        assert_eq!(json["keys"], 2);
+        assert_eq!(json["files"], 0);
+
+        let env = std::fs::read_to_string(workdir.join(".env")).unwrap();
+        assert!(env.contains("SHARED=shared-value"), "{env}");
+        assert!(env.contains("OWN=own-value"), "{env}");
+    }
+
+    #[tokio::test]
+    async fn secrets_apply_fails_when_a_declared_group_has_no_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with(dir.path(), Arc::new(ok_source()), Arc::new(ok_runtime()));
+        let mut config = project_with_environment("myapp", None).config;
+        config.secret_groups = vec!["missing".into()];
+        state.projects.upsert(&config).await.unwrap();
+        let app = router(state);
+
+        let body = serde_json::json!({ "vars": { "OWN": "own-value-long-enough" }, "apply": true });
+        let (status, json) =
+            request(app.clone(), put_json("/v1/projects/myapp/secrets", &body)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{json:?}");
+        assert!(
+            json["error"].as_str().unwrap().contains("missing"),
+            "{json:?}"
+        );
+
+        // the bundle was still saved before the failed apply
+        let (status, json) = request(app, get_req("/v1/projects/myapp/secrets")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["keys"], serde_json::json!(["OWN"]));
+    }
+
+    #[tokio::test]
     async fn secrets_ls_for_unknown_project_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         let app = router(state_with(

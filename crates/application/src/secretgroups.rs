@@ -48,6 +48,20 @@ impl PushSecretGroup {
         } else {
             objects
         };
+        // `merge` unions onto what is already stored, so a payload under the
+        // per-request ceiling (enforced before this use-case ever sees it)
+        // can still produce a group over the per-group ceiling — check the
+        // result, not just the increment. Same limit `effective_secrets`
+        // enforces on the merged deploy-time view, so a group that fits here
+        // can never blow that ceiling on its own.
+        let total: usize = objects.files.values().map(|b| b.len()).sum();
+        if total > crate::MAX_MERGED_SECRET_BYTES {
+            return Err(DomainError::Invalid(format!(
+                "secret group '{name}' of project '{base}' would be {total} bytes; max is {} \
+                 (push smaller files, or split across more groups)",
+                crate::MAX_MERGED_SECRET_BYTES
+            )));
+        }
         self.secrets.save(&r, &objects, expected).await
     }
 }
@@ -272,6 +286,42 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, DomainError::Invalid(_)), "got: {err}");
+    }
+
+    /// Two payloads that each individually fit the per-request ceiling can
+    /// still union, via `merge`, into a group over the per-group ceiling —
+    /// the check must look at the *result*, not the increment, and it must
+    /// run before `save` so the previously-stored group is untouched.
+    #[tokio::test]
+    async fn push_rejects_a_merge_that_would_exceed_the_group_ceiling() {
+        let mut store = MockSecretStore::new();
+        let stored_big = vec![0u8; crate::MAX_MERGED_SECRET_BYTES - 10];
+        store.expect_load().returning(move |_| {
+            let mut objects = SecretsBundle::default();
+            objects
+                .files
+                .insert("already-stored.bin".into(), stored_big.clone());
+            Ok(SecretGroup {
+                objects,
+                revision: 1,
+            })
+        });
+        store.expect_save().times(0);
+
+        let mut incoming = SecretsBundle::default();
+        incoming.files.insert("more.bin".into(), vec![1u8; 100]);
+
+        let err = PushSecretGroup::new(Arc::new(store))
+            .execute("myapp", "preview", incoming, Some(1), true)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DomainError::Invalid(_)), "got: {err}");
+        let msg = err.to_string();
+        assert!(msg.contains("preview"), "got: {msg}");
+        assert!(
+            msg.contains(&crate::MAX_MERGED_SECRET_BYTES.to_string()),
+            "got: {msg}"
+        );
     }
 
     #[tokio::test]

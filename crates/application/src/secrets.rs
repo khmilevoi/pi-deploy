@@ -169,6 +169,18 @@ impl ApplySecrets {
 
         let workdir = self.source.workdir(project);
         self.writer.write(&workdir, &merged.bundle).await?;
+        let provenance: Vec<String> = merged
+            .revisions
+            .iter()
+            .map(|(label, r)| format!("{label}@r{r}"))
+            .collect();
+        log.line(&format!(
+            "secrets injected ({} keys, {} files, mode {:04o}; groups: {})",
+            merged.bundle.vars.len(),
+            merged.bundle.files.len(),
+            merged.bundle.secret_file_mode(),
+            provenance.join(", ")
+        ));
         let override_file = self
             .overrides
             .write(
@@ -312,6 +324,25 @@ mod tests {
             Arc::new(m.overrides),
             Arc::new(m.runtime),
         )
+    }
+
+    fn build_apply(m: Mocks) -> Arc<ApplySecrets> {
+        ApplySecrets::new(
+            Arc::new(m.secrets),
+            Arc::new(m.projects),
+            Arc::new(m.source),
+            Arc::new(m.writer),
+            Arc::new(m.overrides),
+            Arc::new(m.runtime),
+        )
+    }
+
+    /// Like `registered()`, but declaring `groups` in `[secrets].groups` so
+    /// `effective_secrets` has layers to load beyond the key's own bundle.
+    fn registered_with_groups(groups: &[&str]) -> Project {
+        let mut p = registered();
+        p.config.secret_groups = groups.iter().map(|g| (*g).to_string()).collect();
+        p
     }
 
     #[tokio::test]
@@ -494,5 +525,144 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stored.file_mode, 0o644);
+    }
+
+    /// `ApplySecrets` must resolve the *same* effective view `rpi deploy`
+    /// does — declared groups, then the key's own bundle, merged — not just
+    /// re-inject whatever the caller last uploaded. It must also log the
+    /// same shape of provenance line `deploy.rs` logs, so the agent journal
+    /// says which layers (and revisions) actually landed.
+    #[tokio::test]
+    async fn apply_merges_declared_groups_under_the_key_bundle_and_logs_provenance() {
+        let mut m = mocks();
+        m.projects
+            .expect_get()
+            .withf(|n| n == "rateme")
+            .returning(|_| Ok(Some(registered_with_groups(&["common"]))));
+        m.secrets
+            .expect_load()
+            .withf(|r| *r == GroupRef::named("rateme", "common"))
+            .returning(|_| {
+                let mut objects = SecretsBundle::default();
+                objects.vars.insert("SHARED".into(), "shared-long".into());
+                Ok(SecretGroup {
+                    objects,
+                    revision: 3,
+                })
+            });
+        m.secrets
+            .expect_load()
+            .withf(|r| *r == GroupRef::key("rateme"))
+            .returning(|_| {
+                Ok(SecretGroup {
+                    objects: bundle(),
+                    revision: 5,
+                })
+            });
+        m.source
+            .expect_workdir()
+            .withf(|n| n == "rateme")
+            .returning(|_| PathBuf::from("/wd/rateme"));
+        m.writer
+            .expect_write()
+            .withf(|wd, b| {
+                wd == Path::new("/wd/rateme")
+                    && b.vars.get("SHARED").map(String::as_str) == Some("shared-long")
+                    && b.vars.get("DB_PASSWORD").map(String::as_str) == Some("hunter2-long")
+                    && b.vars.len() == 3
+                    && b.files.len() == 1
+            })
+            .times(1)
+            .returning(|_, _| Ok(()));
+        m.overrides
+            .expect_write()
+            .returning(|_, _, _, _, _| Ok(PathBuf::from("/ov/rateme.yml")));
+        m.runtime.expect_up().times(1).returning(|_, log| {
+            log.line("recreating with hunter2-long and shared-long");
+            Ok(())
+        });
+
+        let sink = CollectSink::new();
+        let (keys, files) = build_apply(m)
+            .execute("rateme", sink.clone())
+            .await
+            .unwrap();
+        assert_eq!((keys, files), (3, 1));
+
+        let lines = sink.lines.lock().unwrap();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("secrets injected") && l.contains("groups: common@r3, key@r5")),
+            "lines: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("***DB_PASSWORD***")),
+            "the merged bundle must be masked too: {lines:?}"
+        );
+        assert!(
+            !lines
+                .iter()
+                .any(|l| l.contains("hunter2-long") || l.contains("shared-long")),
+            "secret leaked: {lines:?}"
+        );
+    }
+
+    /// A group named in `[secrets].groups` that was never pushed (or is
+    /// empty) must fail `--apply`/`POST .../secrets/apply` the same way it
+    /// fails `rpi deploy` — before anything is written to the checkout —
+    /// rather than silently applying a partial, misconfigured set.
+    #[tokio::test]
+    async fn apply_fails_when_a_declared_group_has_no_secrets() {
+        let mut m = mocks();
+        m.projects
+            .expect_get()
+            .returning(|_| Ok(Some(registered_with_groups(&["missing"]))));
+        m.secrets
+            .expect_load()
+            .withf(|r| *r == GroupRef::named("rateme", "missing"))
+            .returning(|_| {
+                Ok(SecretGroup {
+                    objects: SecretsBundle::default(),
+                    revision: 0,
+                })
+            });
+        m.writer.expect_write().times(0);
+        m.runtime.expect_up().times(0);
+
+        let err = build_apply(m)
+            .execute("rateme", CollectSink::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, DomainError::NotFound(_)), "got: {err}");
+        assert!(err.to_string().contains("missing"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn head_key_secrets_returns_metadata_of_the_keys_own_bundle_only() {
+        let mut secrets = MockSecretStore::new();
+        secrets
+            .expect_head()
+            .withf(|r| *r == GroupRef::key("rateme"))
+            .returning(|_| {
+                let mut vars = std::collections::BTreeMap::new();
+                vars.insert("DB_PASSWORD".to_string(), "abc123def456".to_string());
+                Ok(GroupHead {
+                    revision: 2,
+                    vars,
+                    files: Default::default(),
+                    file_mode: None,
+                })
+            });
+
+        let head = HeadKeySecrets::new(Arc::new(secrets))
+            .execute("rateme")
+            .await
+            .unwrap();
+        assert_eq!(head.revision, 2);
+        assert_eq!(
+            head.vars.get("DB_PASSWORD").map(String::as_str),
+            Some("abc123def456")
+        );
     }
 }
