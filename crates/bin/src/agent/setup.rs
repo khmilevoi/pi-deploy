@@ -178,28 +178,28 @@ async fn ensure_dir(
         // Repair pre-existing state dir toward the wanted ownership/mode (PR #7
         // K1 for ownership): after uninstall+reinstall the kept files keep an
         // old numeric UID, and a host provisioned before this dir was tightened
-        // may still carry a wider mode.
+        // may still carry a wider mode. The `stat` probes below run even under
+        // `--dry-run`: a `stat` only reads, so it costs nothing to decide
+        // whether a repair is needed, and it is the only way a dry run can
+        // surface a security-relevant mode drift instead of misreporting it
+        // as merely "skipped".
         let mut repairs: Vec<&str> = Vec::new();
         if let Some(og) = owner_group {
-            if !dry {
-                let want = format!("{og}:{og}");
-                let cur = sys.run("stat", &["-c", "%U:%G", path]).await;
-                if cur.ok().as_deref() != Some(want.as_str())
-                    && sys.run("chown", &["-R", &want, path]).await.is_ok()
-                {
-                    repairs.push("ownership");
-                }
+            let want = format!("{og}:{og}");
+            let cur = sys.run("stat", &["-c", "%U:%G", path]).await;
+            let drifted = cur.ok().as_deref() != Some(want.as_str());
+            // Dry run: report the drift without running `chown`. Real run:
+            // only report it once `chown` actually succeeded.
+            if drifted && (dry || sys.run("chown", &["-R", &want, path]).await.is_ok()) {
+                repairs.push("ownership");
             }
         }
         if let Some(m) = mode {
-            if !dry {
-                // `stat -c %a` prints no leading zero, hence the trim.
-                let cur = sys.run("stat", &["-c", "%a", path]).await;
-                if cur.ok().as_deref().map(str::trim) != Some(m.trim_start_matches('0'))
-                    && sys.run("chmod", &[m, path]).await.is_ok()
-                {
-                    repairs.push("mode");
-                }
+            // `stat -c %a` prints no leading zero, hence the trim.
+            let cur = sys.run("stat", &["-c", "%a", path]).await;
+            let drifted = cur.ok().as_deref().map(str::trim) != Some(m.trim_start_matches('0'));
+            if drifted && (dry || sys.run("chmod", &[m, path]).await.is_ok()) {
+                repairs.push("mode");
             }
         }
         if repairs.is_empty() {
@@ -2032,6 +2032,76 @@ mod tests {
         let report = setup(&sys, &opts).await;
         assert!(!sys.calls().iter().any(|c| c.starts_with("chmod 0750")));
         assert!(report.skipped.iter().any(|s| s == "/var/lib/rpi"));
+    }
+
+    #[tokio::test]
+    async fn dry_run_reports_a_drifted_data_dir_mode_as_would_repair_without_chmod() {
+        // Regression guard: before the fix, both repair branches in
+        // `ensure_dir` were gated on `!dry`, so a drifted /var/lib/rpi was
+        // reported "skipped" under --dry-run instead of surfacing the mode
+        // drift a dry run exists to preview. `stat` (a read) must still run
+        // and drive the report; `chmod` (a write) must not.
+        let mut sys = fresh_sys();
+        sys.paths.insert("/var/lib/rpi".into());
+        sys.ok.insert(
+            FakeSys::key("stat", &["-c", "%U:%G", "/var/lib/rpi"]),
+            "rpi-agent:rpi-agent".into(),
+        );
+        sys.ok.insert(
+            FakeSys::key("stat", &["-c", "%a", "/var/lib/rpi"]),
+            "755".into(),
+        );
+        let opts = SetupOpts {
+            login_user: "piuser".into(),
+            with_cloudflared: false,
+            dry_run: true,
+            cf_token: None,
+            domain: None,
+            tunnel_name: None,
+        };
+        let report = setup(&sys, &opts).await;
+        assert!(
+            !sys.calls().iter().any(|c| c.starts_with("chmod")),
+            "dry run must never chmod: {:?}",
+            sys.calls()
+        );
+        assert!(
+            report
+                .repaired
+                .iter()
+                .any(|r| r.contains("/var/lib/rpi (mode)")),
+            "mode drift reported under dry-run: {:?}",
+            report.repaired
+        );
+        assert!(
+            !report.skipped.iter().any(|s| s == "/var/lib/rpi"),
+            "a drifted dir must not be reported as merely skipped"
+        );
+    }
+
+    #[tokio::test]
+    async fn dry_run_still_reports_a_correct_data_dir_as_skipped() {
+        let mut sys = fresh_sys();
+        sys.paths.insert("/var/lib/rpi".into());
+        sys.ok.insert(
+            FakeSys::key("stat", &["-c", "%U:%G", "/var/lib/rpi"]),
+            "rpi-agent:rpi-agent".into(),
+        );
+        sys.ok.insert(
+            FakeSys::key("stat", &["-c", "%a", "/var/lib/rpi"]),
+            "750".into(),
+        );
+        let opts = SetupOpts {
+            login_user: "piuser".into(),
+            with_cloudflared: false,
+            dry_run: true,
+            cf_token: None,
+            domain: None,
+            tunnel_name: None,
+        };
+        let report = setup(&sys, &opts).await;
+        assert!(report.skipped.iter().any(|s| s == "/var/lib/rpi"));
+        assert!(!report.repaired.iter().any(|r| r.contains("/var/lib/rpi")));
     }
 
     #[tokio::test]
