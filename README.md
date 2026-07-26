@@ -101,7 +101,7 @@ That's it — `rpi ls` shows the project, its host port, and its public hostname
 | `rpi secrets ls [--group <name>] [--env <name> --vars K=V]` | List the effective merged secrets, or one group's head with `--group` (names, paths, sizes, revisions — values are never transmitted) |
 | `rpi secrets diff [--group <name>] [--env <name> --vars K=V]` | Compare local secret sources against the agent by digest, without pushing |
 | `rpi secrets group ls [--env <name> --vars K=V]` | List this project's secret groups and who attaches each one |
-| `rpi secrets group rm <name> [--force] [--env <name> --vars K=V]` | Delete a secret group |
+| `rpi secrets group rm <name> [--force] [--yes] [--env <name> --vars K=V]` | Delete a secret group (prompts for the name unless `--yes`) |
 | `rpi config show [--env <name> --vars K=V]` | Print the resolved `rpi.toml`, overlay merged in, without contacting the agent |
 | `rpi env ls [--all]` | List deployed environments for this project, or every environment with `--all` |
 | `rpi env destroy <name> [--vars K=V] [--yes]` | Tear down an environment: stack, volumes, ingress route, DNS, secrets, registry row |
@@ -400,10 +400,10 @@ The CLI reads the local env file and `[secrets].files`, sends them encrypted, an
 ```bash
 rpi secrets push --group shared  # push (or rotate) the named group once
 rpi secrets group ls             # this project's groups and who attaches each one
-rpi secrets group rm shared      # delete a group (--force if a project still declares it)
+rpi secrets group rm shared      # delete a group (type its name to confirm, or pass --yes)
 ```
 
-Declared groups apply in the order listed, then this deploy key's own bundle on top; a declared group that is missing or empty fails the deploy naming the group. Every push is a conditional write guarded by a revision — a stale push is refused with an HTTP 409 unless `--force` is passed. Groups require an agent `>= 0.27.0` (the `secret-groups` capability); `rpi rm <project>` on a base project drops its groups, but `rpi env destroy` never does.
+Declared groups apply in the order listed, then this deploy key's own bundle on top; a declared group that is missing or empty fails the deploy naming the group. Every push is a conditional write guarded by a revision — a stale push is refused with an HTTP 409 unless `--force` is passed. Deleting a group asks for its name to be typed back (`--yes` skips that; `--force` is a different waiver — "delete even though a project still declares it"). Groups require an agent `>= 0.27.0` (the `secret-groups` capability), including for a `rpi deploy` whose `rpi.toml` declares any; `rpi rm <project>` on a base project drops its groups, but `rpi env destroy` never does.
 
 By default `.env` is written `0600` and every file from `[secrets].files` is written `0644` — deliberately wider, because a container that consumes a bind-mounted secret usually runs as its own image's uid, not the agent's, and Docker has no way to `chown`/`chmod` a `file:`-sourced Compose secret on its own. Set `[secrets].file_mode` (see the sample above) to use one mode for both instead; it requires an agent `>= 0.26.0`. **The mode travels with the bundle**, so changing `file_mode` only takes effect the next time you actually push it — `rpi secrets push` (or `--apply`) — not on a plain `rpi deploy`, which just reuses whatever bundle (and mode) is already stored.
 

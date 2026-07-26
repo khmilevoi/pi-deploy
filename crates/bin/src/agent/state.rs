@@ -252,14 +252,7 @@ pub fn build_state(
     let list_secret_groups = ListSecretGroups::new(secrets.clone(), projects.clone());
     let remove_secret_group = RemoveSecretGroup::new(secrets.clone(), projects.clone());
     let head_key_secrets = HeadKeySecrets::new(secrets.clone());
-    let send_secrets = SendSecrets::new(
-        secrets.clone(),
-        projects.clone(),
-        source.clone(),
-        secrets_writer,
-        overrides,
-        runtime,
-    );
+    let send_secrets = SendSecrets::new(secrets.clone(), Arc::clone(&apply_secrets));
     let list_secrets = ListSecrets::new(secrets, projects);
 
     Ok((

@@ -14,6 +14,16 @@ use crate::error::DomainError;
 /// name stays readable in a `groups = [...]` line and in a deploy log.
 pub const MAX_GROUP_NAME_LEN: usize = 40;
 
+/// The single ceiling on secret file bytes: one stored group may not exceed
+/// it, and neither may a merged set of layers. Defined here, next to
+/// `merge_layers` (which takes it as a parameter), because the domain is the
+/// one crate every consumer already depends on — the wire DTOs
+/// (`proto::MAX_SECRETS_BUNDLE_BYTES`) and the merge orchestration
+/// (`pi_application::MAX_MERGED_SECRET_BYTES`) are re-exports of this
+/// constant under the names their call sites already use, not second
+/// definitions that could drift apart.
+pub const MAX_SECRET_BUNDLE_BYTES: usize = 8 * 1024 * 1024;
+
 /// Same charset as environment names (`cli/overlay.rs`), so an operator who
 /// already knows `--env` names does not learn a second rule. The charset is
 /// also what keeps a name safe as a single path component: no separator, no
@@ -206,10 +216,10 @@ pub struct MergedSecrets {
 /// `file_mode` resolves to the last layer that sets one: a later layer that
 /// leaves it unset is not asking for the default, it is not asking at all.
 ///
-/// `max_bytes` bounds the merged file payload (the caller passes
-/// `MAX_SECRETS_BUNDLE_BYTES`); the error names the contributing layers,
-/// since with several layers "8 MiB exceeded" alone does not say where to
-/// look.
+/// `max_bytes` bounds the merged file payload (every caller passes
+/// `MAX_SECRET_BUNDLE_BYTES`, or an alias of it); the error names the
+/// contributing layers, since with several layers "8 MiB exceeded" alone does
+/// not say where to look.
 pub fn merge_layers(layers: &[Layer<'_>], max_bytes: usize) -> Result<MergedSecrets, DomainError> {
     let mut merged = MergedSecrets::default();
     for layer in layers {

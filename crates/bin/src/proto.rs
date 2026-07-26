@@ -149,7 +149,12 @@ pub struct EnvKeysResponse {
 /// Secrets bundle limits, enforced by the CLI before upload and re-checked
 /// by the agent (secrets spec §2.7). Decoded byte sizes.
 pub const MAX_SECRET_FILE_BYTES: usize = 1024 * 1024;
-pub const MAX_SECRETS_BUNDLE_BYTES: usize = 8 * 1024 * 1024;
+
+/// The 8 MiB total, re-exported under the name this module has always used.
+/// The definition lives in `pi_domain::secretgroup`, so the ceiling on a
+/// payload accepted here is the same number that bounds a stored group and a
+/// merged set — one constant, not three that could drift.
+pub use pi_domain::secretgroup::MAX_SECRET_BUNDLE_BYTES as MAX_SECRETS_BUNDLE_BYTES;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecretsSendRequest {

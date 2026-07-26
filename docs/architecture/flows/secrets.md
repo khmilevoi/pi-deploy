@@ -167,6 +167,16 @@ sequenceDiagram
    purpose, to avoid masking ordinary output that happens to match a short
    value. Secret file contents are not scanned for masking.
 
+   `rpi logs`, which streams container stdout rather than injecting anything,
+   arms the same masking on the same *merged* bundle: it resolves the
+   project's layer stack (item 5) purely to know what to redact, and never
+   writes any of it. Arming on the deploy key's own bundle alone would mean
+   that moving a secret into a shared group — the point of groups — silently
+   un-redacted it in streamed output. Being a reader, it resolves layers
+   tolerantly, exactly as `rpi secrets ls` does: a declared-but-empty group
+   is not the failure it is for an injection, because an operator debugging
+   that condition still needs their logs.
+
 7. **Failure: sending to a project that doesn't exist.**
    `rpi secrets send --apply` for a project the agent has never deployed
    fails — the response reports the project isn't deployed yet and to run
@@ -202,16 +212,37 @@ sequenceDiagram
     upsert onto the stored group instead of replacing it wholesale, and an
     `expected_revision` for the same compare-and-swap guard `rpi secrets
     send` uses; delete refuses a group any registered project still declares
-    unless `force: true` is set. Every response carries names, sizes,
+    unless `force: true` is set, and answers 404 for a group that was never
+    pushed at all (`force` does not change that — it waives the attachers
+    guard, not the existence check), so a mistyped name is distinguishable
+    from a real deletion. Every response carries names, sizes,
     digests and revisions only, never a value — the same rule item 4's
     `rpi secrets ls` follows. `rpi secrets push --group NAME [--merge]
     [--force]` and `rpi secrets diff --group NAME` push and inspect one
     group; `rpi secrets ls --group NAME` also inspects one (item 4); `rpi
     secrets group ls` lists a base project's groups with who attaches each
-    one, and `rpi secrets group rm NAME [--force]` deletes one. All of these
-    (like every remote `rpi` command) are gated on the agent advertising the
-    `secret-groups` capability (>= 0.27.0); an older agent gets a "update the
-    agent on the Pi" error instead of a route-not-found.
+    one, and `rpi secrets group rm NAME [--force] [--yes]` deletes one —
+    prompting for the group name unless `--yes`, after printing its revision
+    and everyone who still declares it (`docs/cli-philosophy.md`'s rule for
+    destructive operations; the blast radius is wider than `rpi rm` of one
+    project, whose prompt this one mirrors). Every group name arriving from a
+    caller — the `--group` flag, `secrets group rm`'s positional argument,
+    `[secrets].groups` in a deploy request, and each route's path segment —
+    goes through the one shared `validate_group_name`, so all four produce
+    the same message for the same typo and none of them can smuggle a path
+    separator through.
+
+    All of these (like every remote `rpi` command) are gated on the agent
+    advertising the `secret-groups` capability (>= 0.27.0); an older agent
+    gets a "update the agent on the Pi" error instead of a route-not-found.
+    **`rpi deploy` is gated too**, whenever the resolved `rpi.toml` declares
+    any group. That gate is not redundant with the agent-side checks: the
+    declared list travels inside `ProjectDto`, which does not
+    `deny_unknown_fields`, so a pre-0.27.0 agent silently ignores it — the
+    deploy would succeed, the `.env` would be built from the deploy key's own
+    bundle alone (empty, on a fresh preview), and the application would start
+    with no configuration. The `require_non_empty` guard that would catch
+    that lives on the new agent, which never sees the request.
 
 11. **Group ownership on teardown.** Declared groups belong to the base
     project that declared them, not to any one registry row, so only tearing
@@ -270,18 +301,19 @@ sequenceDiagram
 
 ## Source anchors
 
-- `crates/application/src/secrets.rs` — `SendSecrets` (save a deploy key's own bundle), `HeadKeySecrets` (metadata-only projection of that bundle, never a value), `ApplySecrets` (resolves the key's full layer stack via `effective_secrets` and re-injects + `up -d` — the one implementation `--apply` and `POST .../secrets/apply` both call), and `ListSecrets` (resolves that same layer stack read-only, via its own `ProjectRepository` lookup rather than calling `effective_secrets`, because a declared-but-empty group must not fail a listing the way it fails a deploy — `rpi secrets ls`'s `StoredSecrets.layers` carries each layer's own, unmerged names alongside the merged view).
-- `crates/application/src/secretgroups.rs` — group CRUD use cases (`PushSecretGroup`, `ShowSecretGroup`, `ListSecretGroups`, `RemoveSecretGroup`): the only place that joins the vault (`SecretStore`) with the project registry, e.g. to report which projects declare a group or to refuse deleting one still declared.
+- `crates/application/src/secrets.rs` — `SendSecrets` (save a deploy key's own bundle, then hand `--apply` to `ApplySecrets` — it owns no injection of its own, so the legacy `/env` route's `apply` flag cannot write a group-less bundle over a running container), `HeadKeySecrets` (metadata-only projection of that bundle, never a value), `ApplySecrets` (resolves the key's full layer stack via `effective_secrets` and re-injects + `up -d` — the one implementation every apply path reaches, whether through the HTTP handler or through `SendSecrets`), and `ListSecrets` (resolves that same layer stack read-only, via its own `ProjectRepository` lookup rather than calling `effective_secrets`, because a declared-but-empty group must not fail a listing the way it fails a deploy — `rpi secrets ls`'s `StoredSecrets.layers` carries each layer's own, unmerged names alongside the merged view).
+- `crates/application/src/logs.rs` — `StreamLogs`: resolves the same layer stack read-only (`load_layer_stack` with `require_non_empty: false`, then `merge_loaded_layers`) purely to arm `MaskingSink` on the merged bundle before streaming container output (item 6). Deliberately not `effective_secrets`: a reader must not 404 on a declared-but-empty group.
+- `crates/application/src/secretgroups.rs` — group CRUD use cases (`PushSecretGroup`, `ShowSecretGroup`, `ListSecretGroups`, `RemoveSecretGroup`): the only place that joins the vault (`SecretStore`) with the project registry, e.g. to report which projects declare a group or to refuse deleting one still declared. `RemoveSecretGroup` checks existence (`head().revision == 0` -> `NotFound`) before the attachers guard, so `--force` waives the guard without also swallowing a typo.
 - `crates/application/src/remove.rs` — `RemoveProject`: always removes the target's own key bundle, and additionally calls `SecretStore::remove_base` when (and only when) `existing.config.environment.is_none()` — the base-vs-environment check item 11 describes. `rpi rm` and `rpi env destroy`/the TTL reaper (`flows/environments.md`) both tear down through this one use case, so the base/environment split lives in exactly one place.
-- `crates/bin/src/agent/http.rs` (secrets + secret-group routes) — validates and decodes an incoming bundle once (`decode_secret_payload`, shared by the per-key and group write paths), validates a group name with the same rule the `rpi.toml` parser uses (`pi_domain::secretgroup::validate_group_name`), and serves both route families; no handler ever serializes a secret value. `ApiError`'s `IntoResponse` maps `DomainError::Conflict` (item 12's stale-revision case) to HTTP 409 for every route in this file, not only the secret ones.
+- `crates/bin/src/agent/http.rs` (secrets + secret-group routes) — validates and decodes an incoming bundle once (`decode_secret_payload`, shared by the per-key and group write paths), validates a group name with the same rule the `rpi.toml` parser uses (`pi_domain::secretgroup::validate_group_name`) on both the group routes' path segments (`valid_group_path`) and every entry of a deploy request's `secret_groups` (in `create_deployment`, alongside the project/service/command-name checks and before `projects.upsert`, so a junk name never reaches the registry), and serves both route families; no handler ever serializes a secret value. `ApiError`'s `IntoResponse` maps `DomainError::Conflict` (item 12's stale-revision case) to HTTP 409 for every route in this file, not only the secret ones.
 - `crates/bin/src/proto.rs` (secrets + secret-group DTOs) — wire shapes for both route families; group and head responses carry names, digests, sizes and revisions only. `SecretsListResponse.layers` (`Vec<SecretLayerDto>`) carries the per-layer provenance `rpi secrets ls` renders; absent (not merely empty) from an agent older than 0.27.0, which is how the CLI tells "nothing to show" apart from "this agent doesn't know about layers."
-- `crates/bin/src/cli/commands.rs` (`secrets_push`, `secrets_diff`, `secrets_ls`, `secrets_group_ls`, `secrets_group_rm`) — the CLI side of every route above; `effective_rows` turns a `SecretsListResponse` into (name, winning layer, shadowed?) rows for `secrets_ls`'s effective view, and `render_group_head` renders one group's head (revision, names, digests, sizes) for `secrets_ls --group`. `rm_confirmation_text` (used by `rm`) is the pure function behind item 11's confirmation wording; `rm` feeds it best-effort `list_secret_groups`/`list_environments` results before prompting. `secrets_push` is also where item 12's client half lives, and it differs by path: on the group branch the head is always fetched (`head_secret_group(...).ok()`, both for the diff lines and for `expected_revision`), with `--force` only zeroing the latter; on the per-key branch `should_look_up_key_revision` decides whether the head read (`head_key_secrets`) happens at all, and it never does when `--force` is set or the agent predates secret groups (the lookup route itself wouldn't exist there).
+- `crates/bin/src/cli/commands.rs` (`secrets_push`, `secrets_diff`, `secrets_ls`, `secrets_group_ls`, `secrets_group_rm`) — the CLI side of every route above; `effective_rows` turns a `SecretsListResponse` into (name, winning layer, shadowed?) rows for `secrets_ls`'s effective view, and `render_group_head` renders one group's head (revision, names, digests, sizes) for `secrets_ls --group`. `validate_group_arg` is the single local entry point for a group name off the command line, called first by all four of `push`/`ls`/`diff`/`group rm` so the same typo produces the same message and never reaches URL construction. `rm_confirmation_text` (used by `rm`) and `group_rm_confirmation_text` (used by `secrets group rm`) are the pure functions behind item 11's and item 10's confirmation wording; each command feeds them best-effort `list_secret_groups`/`list_environments` results before prompting. `gate_deploy_features` holds `deploy`'s use-site compat gates — `Environments` when an env is selected, `SecretGroups` when `[secrets].groups` is non-empty (item 10). `secrets_push` is also where item 12's client half lives, and it differs by path: on the group branch the head is always fetched (`head_secret_group(...).ok()`, both for the diff lines and for `expected_revision`), with `--force` only zeroing the latter; on the per-key branch `should_look_up_key_revision` decides whether the head read (`head_key_secrets`) happens at all, and it never does when `--force` is set or the agent predates secret groups (the lookup route itself wouldn't exist there).
 - `crates/bin/src/cli/rpitoml.rs` (`SecretsSection` only) — the `[secrets]` table in `rpi.toml`: names the local env file `rpi secrets send` reads (`[secrets].env`, default `.env`), the extra files it reads verbatim (`[secrets].files`), the declared group list (`[secrets].groups`, carried into `ProjectConfig.secret_groups` in declared order by `to_project_config`), and the optional `[secrets].file_mode` override, parsed and validated by `pi_domain::secretmode`.
 - `crates/application/src/mask.rs` — `MaskingSink`: replaces armed secret values (6+ characters) with `***KEY***` in every line logged afterward.
-- `crates/infrastructure/src/secrets.rs` — `EncryptedFileStore`: age-encrypts and decrypts the bundle at rest, one file per project or named group, using an agent identity key kept at file mode 0600; `save` also owns the conditional-write guard (item 12) — the revision compare-and-set against `expected`, `DomainError::Conflict` on a mismatch — under a per-store lock that makes the whole read-compare-write atomic.
+- `crates/infrastructure/src/secrets.rs` — `EncryptedFileStore`: age-encrypts and decrypts the bundle at rest, one file per project or named group, using an agent identity key kept at file mode 0600; `save` also owns the conditional-write guard (item 12) — the revision compare-and-set against `expected`, `DomainError::Conflict` on a mismatch — under a per-store lock that makes the whole read-compare-write atomic. `remove` and `remove_base` take that same lock, so a deletion can never interleave with a save that already read the old revision and would otherwise write the group back whole.
 - `crates/infrastructure/src/secretsfile.rs` — `FsSecretsWriter`: writes `.env` (0600 by default) and secret files (0644 by default; both overridable by `bundle.file_mode`/`[secrets].file_mode`) into a checkout, creates directories at 0755 and widens a directory it created earlier at exactly 0700, replaces the previous bundle's files via a small manifest (always 0600), and guards every write and cleanup against symlink escapes.
 - `crates/infrastructure/src/secretpath.rs` — shared relative-path validation and symlink-safe path resolution, used by both the CLI (before sending) and the agent (before writing).
 - `crates/infrastructure/src/dotenv.rs` — `.env` parsing and serialization shared by the CLI (reading the local file to send) and the agent (writing the injected file).
-- `crates/domain/src/secretgroup.rs` — `GroupRef` (named group vs. the deploy key's implicit one), `SecretGroup`, `Layer`, and `merge_layers`: the pure per-object merge (later layer wins by variable name/file path, `file_mode` from the last layer that set one) the deploy pipeline builds its layer resolution on.
-- `crates/application/src/lib.rs` (`effective_secrets`, `MAX_MERGED_SECRET_BYTES`) — resolves one project's full layer stack (every declared group in order, then the key bundle) against the `SecretStore` and merges it, failing if a declared group is empty. Deliberately factored out of `deploy.rs` so `ApplySecrets` (item 4) resolves the same view identically rather than re-implementing the layering rules; `ListSecrets` does *not* call it — a read-only listing must not fail on the same empty-group condition an injection must (item 5), so it resolves its own layers with the same order but without that failure.
+- `crates/domain/src/secretgroup.rs` — `GroupRef` (named group vs. the deploy key's implicit one), `SecretGroup`, `Layer`, and `merge_layers`: the pure per-object merge (later layer wins by variable name/file path, `file_mode` from the last layer that set one) the deploy pipeline builds its layer resolution on. Also `validate_group_name` (the one rule every caller shares) and `MAX_SECRET_BUNDLE_BYTES`, the single 8 MiB ceiling on a stored group *and* on a merged set — `proto::MAX_SECRETS_BUNDLE_BYTES` and `pi_application::MAX_MERGED_SECRET_BYTES` are re-exports of it under the names their call sites already use, not second definitions.
+- `crates/application/src/lib.rs` (`effective_secrets`, `load_layer_stack`, `group_base`, `merge_loaded_layers`) — resolves one project's full layer stack (every declared group in order, then the key bundle) against the `SecretStore` and merges it, failing if a declared group is empty. Deliberately factored out of `deploy.rs` so `ApplySecrets` (item 4) resolves the same view identically rather than re-implementing the layering rules; `ListSecrets` and `StreamLogs` do *not* call it — a read-only caller must not fail on the same empty-group condition an injection must (item 5) — but they share its parts: `group_base` (an environment's groups belong to its base, every other key's to itself) and `merge_loaded_layers` (the merge plus the ceiling), so the three can differ only in `require_non_empty`.
 - `crates/application/src/deploy.rs` — the deploy pipeline's secret-injection point: calls `effective_secrets`, arms masking on the merged bundle, writes it into the freshly fetched checkout before the stack starts, and logs the contributing layers and their revisions.

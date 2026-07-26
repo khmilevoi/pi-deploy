@@ -262,6 +262,12 @@ impl SecretStore for EncryptedFileStore {
     }
 
     async fn remove(&self, r: &GroupRef) -> Result<(), DomainError> {
+        // Same lock `save` takes: without it a concurrent `save` that already
+        // read `current` can write its incremented revision *after* this
+        // deletion, resurrecting a group the operator just deleted — the
+        // wrong outcome for "delete this secret", which is often a response
+        // to a leak.
+        let _guard = self.save_lock.lock().await;
         let mut targets = Vec::new();
         if let GroupRef::Key(key) = r {
             // Legacy first: if the primary deletion then fails, `load` still
@@ -317,6 +323,9 @@ impl SecretStore for EncryptedFileStore {
     }
 
     async fn remove_base(&self, base: &str) -> Result<(), DomainError> {
+        // As in `remove`: a concurrent group `save` under this base must not
+        // land after the directory is gone and recreate it.
+        let _guard = self.save_lock.lock().await;
         let dir = self.groups_dir(base)?;
         match tokio::fs::remove_dir_all(&dir).await {
             Ok(()) => Ok(()),
@@ -660,6 +669,54 @@ mod tests {
             1,
             "one winning write must land as revision 1, not two writes collapsed into one"
         );
+    }
+
+    /// `remove` takes the same store-wide lock `save` does, so a deletion can
+    /// never interleave with a save's read-compare-write. Without it the save
+    /// reads the current revision, the delete removes the file, and the save
+    /// then writes the next revision — bringing back whole a group the
+    /// operator had just deleted, possibly in response to a leak.
+    ///
+    /// `tokio::join!` polls the save first: it takes the lock and yields
+    /// inside `load`, so the remove is guaranteed to be waiting on the lock
+    /// rather than racing the write. The deletion therefore always lands
+    /// last, and the group is gone.
+    #[tokio::test]
+    async fn a_concurrent_remove_wins_over_an_in_flight_save_instead_of_being_undone() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EncryptedFileStore::open(dir.path()).unwrap();
+        let r = GroupRef::named("myapp", "preview");
+        store.save(&r, &bundle(), Some(0)).await.unwrap();
+
+        let next = bundle();
+        let (saved, removed) = tokio::join!(store.save(&r, &next, Some(1)), store.remove(&r));
+        saved.unwrap();
+        removed.unwrap();
+
+        assert_eq!(
+            store.load(&r).await.unwrap().revision,
+            0,
+            "a deleted group must stay deleted, not be resurrected by a save that \
+             read its revision before the deletion"
+        );
+        assert!(store.list("myapp").await.unwrap().is_empty());
+    }
+
+    /// The same guarantee for the whole-base teardown `rpi rm <base>` uses.
+    #[tokio::test]
+    async fn a_concurrent_remove_base_wins_over_an_in_flight_group_save() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EncryptedFileStore::open(dir.path()).unwrap();
+        let r = GroupRef::named("myapp", "preview");
+        store.save(&r, &bundle(), Some(0)).await.unwrap();
+
+        let next = bundle();
+        let (saved, removed) =
+            tokio::join!(store.save(&r, &next, Some(1)), store.remove_base("myapp"));
+        saved.unwrap();
+        removed.unwrap();
+
+        assert!(store.list("myapp").await.unwrap().is_empty());
     }
 
     #[tokio::test]

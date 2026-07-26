@@ -139,7 +139,23 @@ impl RemoveSecretGroup {
         Arc::new(RemoveSecretGroup { secrets, projects })
     }
 
+    /// A group that does not exist is `NotFound`, `force` or not: reporting
+    /// success for a typo would tell an operator their group is gone when it
+    /// is still sitting there under its real name. (`remove_base`, the
+    /// whole-project teardown, stays idempotent — it is called unconditionally
+    /// during `rpi rm` and has no name for a user to mistype.)
     pub async fn execute(&self, base: &str, name: &str, force: bool) -> Result<(), DomainError> {
+        if self
+            .secrets
+            .head(&GroupRef::named(base, name))
+            .await?
+            .revision
+            == 0
+        {
+            return Err(DomainError::NotFound(format!(
+                "secret group '{name}' of project '{base}'"
+            )));
+        }
         if !force {
             let attached = attachers(&self.projects.list().await?, base, name);
             if !attached.is_empty() {
@@ -364,9 +380,21 @@ mod tests {
         );
     }
 
+    /// `head` of an existing group, so the existence check `RemoveSecretGroup`
+    /// runs first passes and the test can exercise the attachers guard.
+    fn expect_existing_head(store: &mut MockSecretStore) {
+        store.expect_head().returning(|_| {
+            Ok(GroupHead {
+                revision: 2,
+                ..GroupHead::default()
+            })
+        });
+    }
+
     #[tokio::test]
     async fn remove_refuses_while_a_project_declares_the_group() {
         let mut store = MockSecretStore::new();
+        expect_existing_head(&mut store);
         store.expect_remove().times(0);
         let mut projects = MockProjectRepository::new();
         projects
@@ -384,6 +412,7 @@ mod tests {
     #[tokio::test]
     async fn remove_with_force_deletes_an_attached_group() {
         let mut store = MockSecretStore::new();
+        expect_existing_head(&mut store);
         store
             .expect_remove()
             .withf(|r| *r == GroupRef::named("myapp", "preview"))
@@ -398,5 +427,27 @@ mod tests {
             .execute("myapp", "preview", true)
             .await
             .unwrap();
+    }
+
+    /// A typo must be distinguishable from a real deletion: removing a group
+    /// that was never there is `NotFound`, not a cheerful "removed". `--force`
+    /// does not change that — it only waives the attachers guard, which is
+    /// never reached here.
+    #[tokio::test]
+    async fn removing_a_group_that_does_not_exist_is_not_found_even_with_force() {
+        for force in [false, true] {
+            let mut store = MockSecretStore::new();
+            store.expect_head().returning(|_| Ok(GroupHead::default()));
+            store.expect_remove().times(0);
+            let mut projects = MockProjectRepository::new();
+            projects.expect_list().times(0).returning(|| Ok(Vec::new()));
+
+            let err = RemoveSecretGroup::new(Arc::new(store), Arc::new(projects))
+                .execute("myapp", "typo", force)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, DomainError::NotFound(_)), "got: {err}");
+            assert!(err.to_string().contains("typo"), "got: {err}");
+        }
     }
 }

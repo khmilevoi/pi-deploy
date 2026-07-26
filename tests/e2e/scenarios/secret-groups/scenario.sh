@@ -61,7 +61,11 @@ assert_deploy_log recreate.log
 assert_log recreate.log 'groups: shared@r3, key@r0'
 
 # A declared group that does not exist fails loudly at the secrets stage.
-run_capture rm.log rpi secrets group rm shared --force "${CONNECT[@]}"
+# --force waives the "a project still declares it" guard; --yes waives the
+# typed-group-name confirmation. They are separate flags, so a script that
+# deletes an attached group must pass both.
+run_capture rm.log rpi secrets group rm shared --force --yes "${CONNECT[@]}"
+assert_log rm.log "removed secret group 'e2e-fixture/shared'"
 expect_fail missing.log rpi deploy --env branch --vars BRANCH_NAME=feature/one "${CONNECT[@]}"
 assert_log missing.log "secret group 'shared'"
 

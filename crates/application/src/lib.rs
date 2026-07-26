@@ -17,11 +17,46 @@ pub mod tail;
 #[cfg(test)]
 pub mod test_support;
 
-/// Ceiling for the merged secret payload, mirroring
-/// `crate::proto::MAX_SECRETS_BUNDLE_BYTES` in the bin crate (8 MiB). Kept
-/// here because the merge happens in this crate and `pi-application` must
-/// never depend on bin-crate code.
-pub const MAX_MERGED_SECRET_BYTES: usize = 8 * 1024 * 1024;
+/// Ceiling for the merged secret payload (8 MiB). An alias, not a second
+/// definition: the constant lives in `pi_domain::secretgroup` next to
+/// `merge_layers`, so a stored group and a merged set can never be bounded by
+/// two numbers that drift apart.
+pub use pi_domain::secretgroup::MAX_SECRET_BUNDLE_BYTES as MAX_MERGED_SECRET_BYTES;
+
+/// The project that owns a deploy key's declared groups: an environment
+/// overlay borrows its *base* project's groups, every other key owns its own.
+/// One function, so `effective_secrets`, `ListSecrets` and `StreamLogs`
+/// cannot disagree about which project a `groups = [...]` entry points at.
+pub fn group_base(config: &pi_domain::entities::ProjectConfig) -> &str {
+    config
+        .environment
+        .as_ref()
+        .map(|e| e.base.as_str())
+        .unwrap_or(config.name.as_str())
+}
+
+/// Merges an already-loaded layer stack under the one shared ceiling and
+/// records each layer's revision. Split out of `effective_secrets` so the
+/// read-only callers (`ListSecrets`, `StreamLogs`) merge exactly the same way
+/// without inheriting the fail-fast-on-an-empty-group behavior only an
+/// injection needs — that decision belongs to `load_layer_stack`'s
+/// `require_non_empty`, and nowhere else.
+pub fn merge_loaded_layers(
+    loaded: &[(String, pi_domain::secretgroup::SecretGroup)],
+) -> Result<pi_domain::secretgroup::MergedSecrets, pi_domain::error::DomainError> {
+    use pi_domain::secretgroup::{merge_layers, Layer};
+
+    let layers: Vec<Layer<'_>> = loaded
+        .iter()
+        .map(|(label, group)| Layer::new(label, group))
+        .collect();
+    let mut merged = merge_layers(&layers, MAX_MERGED_SECRET_BYTES)?;
+    merged.revisions = loaded
+        .iter()
+        .map(|(label, g)| (label.clone(), g.revision))
+        .collect();
+    Ok(merged)
+}
 
 /// Loads one project's layer stack in deploy order: every group in `groups`,
 /// resolved against `base`, then `key_project`'s own bundle last
@@ -74,24 +109,13 @@ pub async fn effective_secrets(
     secrets: &dyn pi_domain::contracts::SecretStore,
     config: &pi_domain::entities::ProjectConfig,
 ) -> Result<pi_domain::secretgroup::MergedSecrets, pi_domain::error::DomainError> {
-    use pi_domain::secretgroup::{merge_layers, Layer};
-
-    let base = config
-        .environment
-        .as_ref()
-        .map(|e| e.base.clone())
-        .unwrap_or_else(|| config.name.clone());
-    let loaded =
-        load_layer_stack(secrets, &base, &config.name, &config.secret_groups, true).await?;
-
-    let layers: Vec<Layer<'_>> = loaded
-        .iter()
-        .map(|(label, group)| Layer::new(label, group))
-        .collect();
-    let mut merged = merge_layers(&layers, MAX_MERGED_SECRET_BYTES)?;
-    merged.revisions = loaded
-        .iter()
-        .map(|(label, g)| (label.clone(), g.revision))
-        .collect();
-    Ok(merged)
+    let loaded = load_layer_stack(
+        secrets,
+        group_base(config),
+        &config.name,
+        &config.secret_groups,
+        true,
+    )
+    .await?;
+    merge_loaded_layers(&loaded)
 }

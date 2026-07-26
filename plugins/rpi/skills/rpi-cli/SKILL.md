@@ -34,7 +34,7 @@ Primary references in this repo:
 | List the effective merged secrets, or one group's head | `rpi secrets ls [--group <name>] [--env <env>] [--vars ...]` |
 | Compare local secret sources against the agent by digest | `rpi secrets diff [--group <name>] [--env <env>] [--vars ...]` |
 | List this project's secret groups and who attaches them | `rpi secrets group ls [--env <env>] [--vars ...]` |
-| Delete a secret group | `rpi secrets group rm <name> [--force] [--env <env>] [--vars ...]` |
+| Delete a secret group | `rpi secrets group rm <name> [--force] [--yes] [--env <env>] [--vars ...]` |
 | Stream container logs | `rpi logs <project> [-f] [--tail N]` |
 | Live CPU/memory/disk metrics | `rpi stats [project]` |
 | Start / stop / restart project containers | `rpi start\|stop\|restart <project>` |
@@ -148,7 +148,8 @@ rpi secrets push --group shared --force      # overwrite unconditionally, skip t
 rpi secrets group ls                         # this project's groups, revision, size, who attaches each
 rpi secrets ls --group shared                # one group's head: names, digests, sizes, no merging
 rpi secrets diff --group shared              # what a push would change, by digest, never a value
-rpi secrets group rm shared                  # delete; --force if a registered project still declares it
+rpi secrets group rm shared                  # delete; prompts for the group name
+rpi secrets group rm shared --force --yes    # --force: delete though a project declares it; --yes: skip the prompt
 ```
 
 - `rpi secrets push` (no `--group`) targets this deploy key's own bundle and
@@ -166,11 +167,21 @@ rpi secrets group rm shared                  # delete; --force if a registered p
   the diff, or pass `--force`. No command or endpoint ever returns a secret
   value — only names, paths, sizes, revisions and digests, whether listing,
   diffing, or reporting a push's result.
+- `rpi secrets group rm` destroys encrypted secrets several environments may
+  share, so unless `--yes` is passed it prints the group's revision and
+  everyone who still declares it, then asks for the group name to be typed
+  back — the same shape as `rpi rm`. `--force` and `--yes` are separate
+  flags on purpose: `--force` only waives the "a project still declares it"
+  guard, and must not double as confirmation. Deleting a name that was never
+  pushed is a 404, so a typo is distinguishable from a real deletion.
 - `rpi rm <project>` on a base project drops its groups along with it;
   `rpi env destroy` and the TTL reaper never do — an environment borrows its
   base's groups, it doesn't own them.
 - Requires an agent `>= 0.27.0` (the `secret-groups` capability); an older
-  agent gets an upgrade message instead of a raw connection error. See
+  agent gets an upgrade message instead of a raw connection error. That
+  includes `rpi deploy`: a project whose `[secrets].groups` is non-empty is
+  gated too, because an agent that predates groups would silently ignore the
+  field and start the application with a group-less (often empty) `.env`. See
   `docs/architecture/flows/secrets.md` for the full layering, conditional-
   write, and teardown-ownership rules.
 

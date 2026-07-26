@@ -13,6 +13,31 @@ use crate::duration::parse_duration_secs;
 use crate::output;
 use crate::proto::{DeployRequest, DiagnosticCheckDto};
 
+/// Every optional agent feature a deploy request *uses*, gated at the point
+/// of use like `SecretModes` on `[secrets].file_mode` and `SourceCheck` on
+/// the preflight.
+///
+/// `secret_groups` in particular must be gated rather than trusted to fail
+/// server-side: it travels inside `ProjectDto`, which is not
+/// `deny_unknown_fields`, so an agent older than 0.27.0 simply *ignores* the
+/// field. The deploy then succeeds, the `.env` is built from the deploy key's
+/// own bundle alone — empty, on a fresh preview — and the application starts
+/// with no configuration at all. The `require_non_empty` guard that would
+/// catch this lives on the new agent, which never sees the request.
+fn gate_deploy_features(
+    compat: &crate::compat::CompatSession,
+    env_selected: bool,
+    secret_groups: &[String],
+) -> anyhow::Result<()> {
+    if env_selected {
+        compat.gate(crate::compat::Feature::Environments)?;
+    }
+    if !secret_groups.is_empty() {
+        compat.gate(crate::compat::Feature::SecretGroups)?;
+    }
+    Ok(())
+}
+
 pub async fn deploy(
     git_ref: Option<String>,
     no_gh_key: bool,
@@ -37,9 +62,7 @@ pub async fn deploy(
         compat.agent_api()
     ));
 
-    if env_selection.is_some() {
-        compat.gate(crate::compat::Feature::Environments)?;
-    }
+    gate_deploy_features(&compat, env_selection.is_some(), &project.secret_groups)?;
 
     if compat.gate(crate::compat::Feature::SourceCheck)? {
         crate::cli::sourcekey::preflight(
@@ -277,6 +300,23 @@ pub fn diff_files(
     d
 }
 
+/// One rule and one message for every place a group name arrives from the
+/// command line — `--group` on `push`/`ls`/`diff` and the positional name of
+/// `secrets group rm`. It is the same `validate_group_name` the agent applies
+/// to the path segment and the `rpi.toml` parser applies to `[secrets].groups`,
+/// so nothing this accepts is rejected there or vice versa.
+///
+/// Checking locally is not redundant with the agent's check: the name goes
+/// into a `format!`-built URL, and `Url` normalizes `..` before the request is
+/// sent, so `--group '../secrets'` would silently become a request to a
+/// different route whose response the client then fails to parse. The agent
+/// stays safe either way; the point here is a legible message instead of a
+/// nonsense one.
+fn validate_group_arg(name: &str) -> anyhow::Result<()> {
+    pi_domain::secretgroup::validate_group_name(name)
+        .map_err(|e| anyhow::anyhow!("group name: {e}"))
+}
+
 /// `rpi secrets push`. Without `--group` this targets the deploy key's own
 /// bundle and behaves exactly like the pre-groups `rpi secrets send`.
 pub async fn secrets_push(
@@ -288,6 +328,9 @@ pub async fn secrets_push(
     vars: Vec<String>,
     connect: ConnectOpts,
 ) -> anyhow::Result<()> {
+    if let Some(group) = &group {
+        validate_group_arg(group)?;
+    }
     let resolved = crate::cli::overlay::resolve(env.as_deref(), &vars)?;
     let is_env = resolved.env.is_some();
     let base = resolve_base(&resolved);
@@ -319,8 +362,6 @@ pub async fn secrets_push(
 
     match group {
         Some(group) => {
-            pi_domain::secretgroup::validate_group_name(&group)
-                .map_err(|e| anyhow::anyhow!("--group: {e}"))?;
             compat.gate(crate::compat::Feature::SecretGroups)?;
             let head = api.head_secret_group(&base, &group).await.ok();
             let expected = if force {
@@ -465,6 +506,9 @@ pub async fn secrets_diff(
     vars: Vec<String>,
     connect: ConnectOpts,
 ) -> anyhow::Result<()> {
+    if let Some(group) = &group {
+        validate_group_arg(group)?;
+    }
     let resolved = crate::cli::overlay::resolve(env.as_deref(), &vars)?;
     let base = resolve_base(&resolved);
     let project_name = resolved.rpitoml.project.name.clone();
@@ -682,15 +726,44 @@ pub async fn secrets_group_ls(
     Ok(())
 }
 
+/// Confirmation text for `rpi secrets group rm`. Deleting a group destroys
+/// age-encrypted secrets that several environments may share, so the prompt
+/// names the revision being destroyed and everyone who still declares the
+/// group — the blast radius is wider than `rpi rm` of a single project, whose
+/// prompt already names both.
+///
+/// `revision` is `None` when the group lookup didn't come back (see
+/// `rm_confirmation_text` for the same best-effort pattern): the clause is
+/// dropped rather than guessed at.
+pub(crate) fn group_rm_confirmation_text(
+    base: &str,
+    name: &str,
+    revision: Option<u64>,
+    attached_by: &[String],
+) -> String {
+    let mut text = format!("this permanently deletes secret group '{base}/{name}'");
+    if let Some(revision) = revision {
+        text.push_str(&format!(" at revision {revision}"));
+    }
+    text.push_str("; its values cannot be recovered");
+    if !attached_by.is_empty() {
+        text.push_str(&format!(
+            "\nprojects that declare it and would fail their next deploy: {}",
+            attached_by.join(", ")
+        ));
+    }
+    text
+}
+
 pub async fn secrets_group_rm(
     name: String,
     force: bool,
+    yes: bool,
     env: Option<String>,
     vars: Vec<String>,
     connect: ConnectOpts,
 ) -> anyhow::Result<()> {
-    pi_domain::secretgroup::validate_group_name(&name)
-        .map_err(|e| anyhow::anyhow!("group name: {e}"))?;
+    validate_group_arg(&name)?;
     let resolved = crate::cli::overlay::resolve(env.as_deref(), &vars)?;
     let base = resolve_base(&resolved);
     let AgentConn {
@@ -699,6 +772,30 @@ pub async fn secrets_group_rm(
         compat,
     } = crate::cli::connect::connect_agent(connect).await?;
     compat.gate(crate::compat::Feature::SecretGroups)?;
+
+    if !yes {
+        // Best-effort, like `rm`'s: the listing is only there to make the
+        // prompt specific, so a lookup that fails drops its clauses instead
+        // of failing the command.
+        let listed = api.list_secret_groups(&base).await.ok();
+        let row = listed
+            .as_ref()
+            .and_then(|resp| resp.groups.iter().find(|g| g.name == name));
+        output::warn(group_rm_confirmation_text(
+            &base,
+            &name,
+            row.map(|g| g.revision),
+            row.map(|g| g.attached_by.as_slice()).unwrap_or(&[]),
+        ));
+        eprint!("type the group name to confirm: ");
+        use std::io::Write;
+        std::io::stderr().flush()?;
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if input.trim() != name {
+            anyhow::bail!("confirmation failed: expected '{name}'");
+        }
+    }
 
     api.delete_secret_group(&base, &name, force).await?;
     output::success(format!("removed secret group '{base}/{name}'"));
@@ -711,6 +808,9 @@ pub async fn secrets_ls(
     vars: Vec<String>,
     connect: ConnectOpts,
 ) -> anyhow::Result<()> {
+    if let Some(group) = &group {
+        validate_group_arg(group)?;
+    }
     let resolved = crate::cli::overlay::resolve(env.as_deref(), &vars)?;
     let is_env = resolved.env.is_some();
     let base = resolve_base(&resolved);
@@ -1394,6 +1494,95 @@ mod tests {
             text,
             "saved 2 key(s) and 1 file(s) for project 'myapp' (revision 5)"
         );
+    }
+
+    fn session(agent_version: &str, features: &[&str]) -> crate::compat::CompatSession {
+        crate::compat::CompatSession::with_sink(
+            "0.27.0",
+            &crate::proto::VersionInfo {
+                version: agent_version.to_string(),
+                api: "v1".to_string(),
+                features: Some(features.iter().map(|s| s.to_string()).collect()),
+            },
+            Box::new(|_| {}),
+        )
+    }
+
+    /// `secret_groups` rides inside `ProjectDto`, which is not
+    /// `deny_unknown_fields`: a pre-0.27.0 agent ignores the field, deploys
+    /// happily, and starts the application with an empty `.env`. Gating at
+    /// the point of use is the only thing that catches it, because the guard
+    /// that would is on the agent that never sees the request.
+    #[test]
+    fn deploy_gates_secret_groups_only_when_the_config_declares_some() {
+        let old = session("0.26.0", &["secrets", "environments"]);
+        let err = gate_deploy_features(&old, false, &["shared".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("secret groups"), "{err}");
+        assert!(err.contains(">= 0.27.0"), "{err}");
+        assert!(err.contains("update the agent on the Pi"), "{err}");
+
+        assert!(
+            gate_deploy_features(&old, false, &[]).is_ok(),
+            "a project that declares no groups must keep deploying to an old agent"
+        );
+    }
+
+    #[test]
+    fn deploy_still_gates_environments_and_passes_on_a_current_agent() {
+        let old = session("0.23.0", &["secrets"]);
+        assert!(gate_deploy_features(&old, true, &[]).is_err());
+
+        let current = session("0.27.0", &["secrets", "environments", "secret-groups"]);
+        assert!(gate_deploy_features(&current, true, &["shared".to_string()]).is_ok());
+    }
+
+    /// One rule and one message wherever a group name comes off the command
+    /// line. `../secrets` matters specifically: `Url` normalizes `..`, so an
+    /// unvalidated name would turn `GET .../secret-groups/../secrets` into a
+    /// request to a completely different route and produce a nonsense parse
+    /// error instead of "that is not a group name".
+    #[test]
+    fn group_arg_validation_shares_one_rule_and_one_message() {
+        for bad in ["../secrets", "Preview", "a/b", "under_score", ""] {
+            let err = validate_group_arg(bad).unwrap_err().to_string();
+            assert!(err.starts_with("group name:"), "{bad:?}: {err}");
+        }
+        let err = validate_group_arg("../secrets").unwrap_err().to_string();
+        assert!(
+            err.contains("^[a-z][a-z0-9-]*$"),
+            "the message must match the agent's: {err}"
+        );
+        for ok in ["preview", "db-creds", "a1"] {
+            assert!(validate_group_arg(ok).is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn group_rm_confirmation_names_the_revision_and_who_attaches_it() {
+        let text = group_rm_confirmation_text(
+            "myapp",
+            "shared",
+            Some(4),
+            &["myapp--preview".into(), "myapp--staging".into()],
+        );
+        assert!(text.contains("myapp/shared"), "got: {text}");
+        assert!(text.contains("revision 4"), "got: {text}");
+        assert!(text.contains("cannot be recovered"), "got: {text}");
+        assert!(text.contains("myapp--preview"), "got: {text}");
+        assert!(text.contains("myapp--staging"), "got: {text}");
+    }
+
+    /// Same best-effort shape as `rm_confirmation_text`: a lookup that didn't
+    /// come back drops its clause instead of inventing a revision or implying
+    /// nobody attaches the group.
+    #[test]
+    fn group_rm_confirmation_drops_clauses_it_could_not_look_up() {
+        let text = group_rm_confirmation_text("myapp", "shared", None, &[]);
+        assert!(text.contains("myapp/shared"), "got: {text}");
+        assert!(!text.contains("revision"), "got: {text}");
+        assert!(!text.contains("declare it"), "got: {text}");
     }
 
     #[test]

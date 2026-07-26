@@ -5,7 +5,7 @@ use pi_domain::contracts::{
 };
 use pi_domain::entities::{ComposeStack, SecretsBundle};
 use pi_domain::error::DomainError;
-use pi_domain::secretgroup::{merge_layers, GroupHead, GroupRef, Layer};
+use pi_domain::secretgroup::{GroupHead, GroupRef};
 
 use crate::mask::MaskingSink;
 
@@ -18,37 +18,29 @@ pub struct SecretsSaved {
     pub revision: u64,
 }
 
-/// Accept and store a SecretsBundle; with `apply` re-injects `.env` + secret
-/// files and runs `up -d` so compose recreates only the affected services
-/// (§7, §10).
+/// Accept and store a deploy key's own SecretsBundle; with `apply`, hands off
+/// to `ApplySecrets` to re-inject and run `up -d` so compose recreates only
+/// the affected services (§7, §10).
+///
+/// The apply step deliberately owns no orchestration of its own. Writing the
+/// request's bundle here would drop every group layer — a project that moved
+/// a secret into a shared group would get a group-less `.env` written over
+/// the running container's until its next deploy — so `apply` resolves the
+/// same effective view `rpi deploy` does, through the one use case that
+/// knows how.
 pub struct SendSecrets {
     secrets: Arc<dyn SecretStore>,
-    projects: Arc<dyn ProjectRepository>,
-    source: Arc<dyn Source>,
-    writer: Arc<dyn SecretsWriter>,
-    overrides: Arc<dyn OverrideStore>,
-    runtime: Arc<dyn ContainerRuntime>,
+    apply: Arc<ApplySecrets>,
 }
 
 impl SendSecrets {
-    pub fn new(
-        secrets: Arc<dyn SecretStore>,
-        projects: Arc<dyn ProjectRepository>,
-        source: Arc<dyn Source>,
-        writer: Arc<dyn SecretsWriter>,
-        overrides: Arc<dyn OverrideStore>,
-        runtime: Arc<dyn ContainerRuntime>,
-    ) -> Arc<SendSecrets> {
-        Arc::new(SendSecrets {
-            secrets,
-            projects,
-            source,
-            writer,
-            overrides,
-            runtime,
-        })
+    pub fn new(secrets: Arc<dyn SecretStore>, apply: Arc<ApplySecrets>) -> Arc<SendSecrets> {
+        Arc::new(SendSecrets { secrets, apply })
     }
 
+    /// `keys`/`files` count what was *saved* (the incoming bundle), which is
+    /// what the response has always reported; what an `apply` then writes is
+    /// the merged set, which can legitimately be larger.
     pub async fn execute(
         &self,
         project: &str,
@@ -74,44 +66,7 @@ impl SendSecrets {
                 revision,
             });
         }
-
-        let registered = self.projects.get(project).await?.ok_or_else(|| {
-            DomainError::NotFound(format!(
-                "project '{project}' is not deployed yet; run `rpi deploy` first"
-            ))
-        })?;
-        let config = &registered.config;
-
-        // mask the freshly received values in the `up` output (§8.1)
-        let masker = MaskingSink::new(log);
-        masker.arm(&bundle);
-        let log: Arc<dyn LogSink> = masker;
-
-        let workdir = self.source.workdir(project);
-        self.writer.write(&workdir, &bundle).await?;
-        log.line(&format!(
-            "secrets applied ({} keys, {} files, mode {:04o})",
-            keys,
-            files,
-            bundle.secret_file_mode()
-        ));
-        let override_file = self
-            .overrides
-            .write(
-                project,
-                &config.service,
-                registered.config.expose.bind_addr(),
-                registered.host_port,
-                config.container_port,
-            )
-            .await?;
-        let stack = ComposeStack {
-            project_name: config.name.clone(),
-            workdir: workdir.clone(),
-            compose_file: workdir.join(&config.compose_path),
-            override_file,
-        };
-        self.runtime.up(&stack, log).await?;
+        self.apply.execute(project, log).await?;
         Ok(SecretsSaved {
             keys,
             files,
@@ -123,9 +78,12 @@ impl SendSecrets {
 
 /// Re-injects a deploy key's effective secrets (declared groups merged under
 /// its own bundle) and runs `up -d` so compose recreates only the affected
-/// services. Used by `rpi secrets push --apply` on both the group and the
-/// per-key path — `SendSecrets` delegates here after storing, rather than
-/// keeping a second copy of this orchestration.
+/// services. The single implementation behind every apply path: `rpi secrets
+/// push --apply` on the group branch and `POST .../secrets/apply` reach it
+/// through the HTTP handler, and the per-key `--apply` (new route and the
+/// legacy `/env` one alike) reaches it through `SendSecrets`, which delegates
+/// here after storing rather than keeping a second copy of this
+/// orchestration.
 pub struct ApplySecrets {
     secrets: Arc<dyn SecretStore>,
     projects: Arc<dyn ProjectRepository>,
@@ -253,11 +211,7 @@ impl ListSecrets {
         let registered = self.projects.get(project).await?;
         let (base, declared_groups) = match &registered {
             Some(p) => (
-                p.config
-                    .environment
-                    .as_ref()
-                    .map(|e| e.base.clone())
-                    .unwrap_or_else(|| p.config.name.clone()),
+                crate::group_base(&p.config).to_string(),
                 p.config.secret_groups.clone(),
             ),
             None => (project.to_string(), Vec::new()),
@@ -271,12 +225,7 @@ impl ListSecrets {
             false,
         )
         .await?;
-
-        let layers: Vec<Layer<'_>> = loaded
-            .iter()
-            .map(|(label, group)| Layer::new(label, group))
-            .collect();
-        let merged = merge_layers(&layers, crate::MAX_MERGED_SECRET_BYTES)?;
+        let merged = crate::merge_loaded_layers(&loaded)?;
 
         let layer_rows = loaded
             .into_iter()
@@ -382,15 +331,20 @@ mod tests {
         }
     }
 
+    /// `SendSecrets` now owns only the store and an `ApplySecrets` to hand
+    /// `--apply` to, so building one for a test means building that
+    /// `ApplySecrets` over the same mocks.
     fn build(m: Mocks) -> Arc<SendSecrets> {
-        SendSecrets::new(
-            Arc::new(m.secrets),
+        let secrets = Arc::new(m.secrets);
+        let apply = ApplySecrets::new(
+            secrets.clone(),
             Arc::new(m.projects),
             Arc::new(m.source),
             Arc::new(m.writer),
             Arc::new(m.overrides),
             Arc::new(m.runtime),
-        )
+        );
+        SendSecrets::new(secrets, apply)
     }
 
     fn build_apply(m: Mocks) -> Arc<ApplySecrets> {
@@ -498,10 +452,22 @@ mod tests {
         );
     }
 
+    /// The apply branch re-reads the layer stack from the store rather than
+    /// re-using the request bundle in memory, so the store must serve the
+    /// key's own group back.
     #[tokio::test]
     async fn apply_reinjects_env_and_runs_up_with_masked_logs() {
         let mut m = mocks();
         m.secrets.expect_save().returning(|_, _, _| Ok(1));
+        m.secrets
+            .expect_load()
+            .withf(|r| *r == GroupRef::key("rateme"))
+            .returning(|_| {
+                Ok(SecretGroup {
+                    objects: bundle(),
+                    revision: 1,
+                })
+            });
         m.projects
             .expect_get()
             .withf(|n| n == "rateme")
@@ -579,6 +545,83 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, DomainError::NotFound(_)), "got: {err}");
+    }
+
+    /// `SendSecrets`'s apply branch used to write the *request's* bundle,
+    /// which silently dropped every declared group — so an old CLI running
+    /// `rpi env send --apply` (the legacy `/env` route passes `apply`
+    /// straight through) overwrote the running container's `.env` with a
+    /// group-less version until the next deploy. It must write the same
+    /// merged, layered set `rpi deploy` would.
+    #[tokio::test]
+    async fn apply_writes_the_merged_layer_stack_not_just_the_request_bundle() {
+        let mut m = mocks();
+        m.secrets.expect_save().returning(|_, _, _| Ok(2));
+        m.projects
+            .expect_get()
+            .returning(|_| Ok(Some(registered_with_groups(&["common"]))));
+        m.secrets
+            .expect_load()
+            .withf(|r| *r == GroupRef::named("rateme", "common"))
+            .returning(|_| {
+                let mut objects = SecretsBundle::default();
+                objects.vars.insert("SHARED".into(), "shared-long".into());
+                Ok(SecretGroup {
+                    objects,
+                    revision: 3,
+                })
+            });
+        m.secrets
+            .expect_load()
+            .withf(|r| *r == GroupRef::key("rateme"))
+            .returning(|_| {
+                Ok(SecretGroup {
+                    objects: bundle(),
+                    revision: 2,
+                })
+            });
+        m.source
+            .expect_workdir()
+            .returning(|_| PathBuf::from("/wd/rateme"));
+        m.writer
+            .expect_write()
+            .withf(|_, b| {
+                b.vars.get("SHARED").map(String::as_str) == Some("shared-long")
+                    && b.vars.get("DB_PASSWORD").map(String::as_str) == Some("hunter2-long")
+                    && b.vars.len() == 3
+            })
+            .times(1)
+            .returning(|_, _| Ok(()));
+        m.overrides
+            .expect_write()
+            .returning(|_, _, _, _, _| Ok(PathBuf::from("/ov/rateme.yml")));
+        m.runtime.expect_up().times(1).returning(|_, log| {
+            log.line("recreating with shared-long");
+            Ok(())
+        });
+
+        let sink = CollectSink::new();
+        let saved = build(m)
+            .execute("rateme", bundle(), None, true, sink.clone())
+            .await
+            .unwrap();
+        assert_eq!(
+            (saved.keys, saved.files, saved.applied, saved.revision),
+            (2, 1, true, 2),
+            "the response still counts what was saved, not what the merge wrote"
+        );
+
+        let lines = sink.lines.lock().unwrap();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("secrets injected") && l.contains("groups: common@r3, key@r2")),
+            "the apply must log the same provenance a deploy does: {lines:?}"
+        );
+        assert!(
+            !lines.iter().any(|l| l.contains("shared-long")),
+            "a group's value leaked: {lines:?}"
+        );
     }
 
     /// `ListSecrets::new` needs a `ProjectRepository` to resolve declared

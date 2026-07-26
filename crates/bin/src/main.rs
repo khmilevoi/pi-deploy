@@ -351,6 +351,9 @@ enum SecretsGroupCmd {
         /// Delete even while a registered project declares it
         #[arg(long)]
         force: bool,
+        /// Skip the typed-group-name confirmation
+        #[arg(long)]
+        yes: bool,
         /// Deploy/operate an environment defined by rpi.<env>.toml
         #[arg(long)]
         env: Option<String>,
@@ -620,12 +623,13 @@ async fn run() -> anyhow::Result<()> {
                         SecretsGroupCmd::Rm {
                             name,
                             force,
+                            yes,
                             env,
                             vars,
                             connect,
                         },
                 },
-        } => cli::commands::secrets_group_rm(name, force, env, vars, connect).await,
+        } => cli::commands::secrets_group_rm(name, force, yes, env, vars, connect).await,
         Cmd::Secrets {
             cmd:
                 SecretsCmd::Push {
@@ -1028,11 +1032,40 @@ mod tests {
             Cmd::Secrets {
                 cmd:
                     SecretsCmd::Group {
-                        cmd: SecretsGroupCmd::Rm { name, force, .. },
+                        cmd:
+                            SecretsGroupCmd::Rm {
+                                name, force, yes, ..
+                            },
                     },
             } => {
                 assert_eq!(name, "preview");
                 assert!(force);
+                assert!(
+                    !yes,
+                    "--force waives the attachers guard; it must never imply confirmation"
+                );
+            }
+            _ => panic!("expected secrets group rm"),
+        }
+    }
+
+    /// `--yes` is what skips the typed-group-name prompt, and it is a
+    /// separate flag from `--force` on purpose: an operator whose attachers
+    /// guard fires must not reach for `--force` and thereby lose the
+    /// confirmation as well.
+    #[test]
+    fn secrets_group_rm_takes_yes_independently_of_force() {
+        let cli =
+            Cli::try_parse_from(["pi", "secrets", "group", "rm", "preview", "--yes"]).unwrap();
+        match cli.cmd.unwrap() {
+            Cmd::Secrets {
+                cmd:
+                    SecretsCmd::Group {
+                        cmd: SecretsGroupCmd::Rm { force, yes, .. },
+                    },
+            } => {
+                assert!(yes);
+                assert!(!force);
             }
             _ => panic!("expected secrets group rm"),
         }

@@ -180,6 +180,15 @@ async fn create_deployment(
             ))));
         }
     }
+    // Same shared rule, and the same message, the group routes apply
+    // (`valid_group_path`) and the `rpi.toml` parser applies locally — checked
+    // here, alongside every other name in the request, so a junk name is
+    // rejected before `projects.upsert` puts it in the registry rather than
+    // surfacing later from the store with different wording.
+    for group in &config.secret_groups {
+        pi_domain::secretgroup::validate_group_name(group)
+            .map_err(|e| ApiError(DomainError::Invalid(e)))?;
+    }
     let env_meta: Option<EnvironmentMeta> = req.environment.map(Into::into);
     match &env_meta {
         Some(env) => {
@@ -1394,14 +1403,7 @@ mod tests {
         let list_secret_groups = ListSecretGroups::new(secrets.clone(), projects.clone());
         let remove_secret_group = RemoveSecretGroup::new(secrets.clone(), projects.clone());
         let head_key_secrets = HeadKeySecrets::new(secrets.clone());
-        let send_secrets = SendSecrets::new(
-            secrets.clone(),
-            projects.clone(),
-            source.clone(),
-            FsSecretsWriter::new(),
-            overrides,
-            runtime,
-        );
+        let send_secrets = SendSecrets::new(secrets.clone(), Arc::clone(&apply_secrets));
         let list_secrets = ListSecrets::new(secrets, projects);
         AppState {
             scheduler,
@@ -2354,8 +2356,12 @@ mod tests {
         assert_eq!(groups[0]["attached_by"].as_array().unwrap().len(), 0);
     }
 
+    /// Both reads and deletes of a name that was never pushed are 404. Delete
+    /// used to answer 200, which made a typo indistinguishable from a real
+    /// deletion — the CLI cheerfully printed "removed secret group
+    /// 'base/typo'" while the actual group sat untouched.
     #[tokio::test]
-    async fn head_of_an_absent_group_is_404_and_delete_is_idempotent() {
+    async fn head_and_delete_of_an_absent_group_are_both_404() {
         let dir = tempfile::tempdir().unwrap();
         let app = state_with_secret_groups(dir.path());
         let (status, _) = request(
@@ -2365,12 +2371,39 @@ mod tests {
         .await;
         assert_eq!(status, 404);
 
+        for uri in [
+            "/v1/projects/myapp/secret-groups/ghost",
+            "/v1/projects/myapp/secret-groups/ghost?force=true",
+        ] {
+            let (status, json) = request(app.clone(), delete_req(uri)).await;
+            assert_eq!(status, 404, "{uri}: {json}");
+            assert!(json["error"].as_str().unwrap().contains("ghost"), "{json}");
+        }
+    }
+
+    /// The real deletion still works and is reported as such.
+    #[tokio::test]
+    async fn deleting_an_existing_group_removes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = state_with_secret_groups(dir.path());
+        let body = serde_json::json!({ "vars": { "A": "1" }, "expected_revision": 0 });
         let (status, _) = request(
             app.clone(),
-            delete_req("/v1/projects/myapp/secret-groups/ghost"),
+            put_json("/v1/projects/myapp/secret-groups/common", &body),
         )
         .await;
-        assert_eq!(status, 200, "deleting an absent group is not an error");
+        assert_eq!(status, 200);
+
+        let (status, json) = request(
+            app.clone(),
+            delete_req("/v1/projects/myapp/secret-groups/common"),
+        )
+        .await;
+        assert_eq!(status, 200, "{json}");
+        assert_eq!(json["removed"], "common");
+
+        let (status, _) = request(app, get_req("/v1/projects/myapp/secret-groups/common")).await;
+        assert_eq!(status, 404, "it is really gone");
     }
 
     #[tokio::test]
@@ -2660,6 +2693,43 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{json}");
     }
 
+    /// The legacy `/env` route passes `apply` straight into `SendSecrets`, so
+    /// an *old* CLI running `rpi env send --apply` reaches the apply path
+    /// without going through `send_secrets_handler`'s explicit `ApplySecrets`
+    /// call. It must still write the merged, layered set — writing only the
+    /// request's bundle would blow the running container's group values away
+    /// until its next deploy.
+    #[tokio::test]
+    async fn legacy_env_apply_writes_the_merged_layered_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, workdir) = state_with_writable_workdir(dir.path());
+        let mut config = project_with_environment("myapp", None).config;
+        config.secret_groups = vec!["common".into()];
+        state.projects.upsert(&config).await.unwrap();
+        let app = router(state);
+
+        let group_body =
+            serde_json::json!({ "vars": { "SHARED": "shared-value" }, "expected_revision": 0 });
+        let (status, _) = request(
+            app.clone(),
+            put_json("/v1/projects/myapp/secret-groups/common", &group_body),
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        let env_body = serde_json::json!({ "vars": { "OWN": "own-value" }, "apply": true });
+        let (status, json) = request(app, put_json("/v1/projects/myapp/env", &env_body)).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["applied"], true);
+
+        let env = std::fs::read_to_string(workdir.join(".env")).unwrap();
+        assert!(
+            env.contains("SHARED=shared-value"),
+            "the group layer was dropped: {env}"
+        );
+        assert!(env.contains("OWN=own-value"), "{env}");
+    }
+
     fn deploy_body_with_commands(name: &str) -> serde_json::Value {
         let mut body = deploy_body(name);
         body["project"]["commands"] = serde_json::json!({
@@ -2829,6 +2899,39 @@ mod tests {
         body["project"]["commands"] = serde_json::json!({ "x": [] });
         let (status, _) = request(app, post_json("/v1/deployments", &body)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// `secret_groups` travels in `ProjectDto` like every other project field
+    /// and must be validated like every other name in it — with the same
+    /// shared rule and the same message the group routes use — *before*
+    /// `projects.upsert` writes the junk name into the registry.
+    #[tokio::test]
+    async fn deploy_rejects_invalid_secret_group_names_before_registering() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with(dir.path(), Arc::new(ok_source()), Arc::new(ok_runtime()));
+        let projects = Arc::clone(&state.projects);
+        let app = router(state);
+
+        for bad in ["Bad_Name", "../escape", "1st"] {
+            let mut body = deploy_body("rateme");
+            body["project"]["secret_groups"] = serde_json::json!([bad]);
+            let (status, json) = request(app.clone(), post_json("/v1/deployments", &body)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {json}");
+            let msg = json["error"].as_str().unwrap();
+            assert!(
+                msg.contains("^[a-z][a-z0-9-]*$"),
+                "the message must match the group routes' and the CLI's: {msg}"
+            );
+        }
+        assert!(
+            projects.get("rateme").await.unwrap().is_none(),
+            "a rejected deploy must not leave the project in the registry"
+        );
+
+        let mut body = deploy_body("rateme");
+        body["project"]["secret_groups"] = serde_json::json!(["common", "db-creds"]);
+        let (status, json) = request(app, post_json("/v1/deployments", &body)).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{json}");
     }
 
     #[tokio::test]
