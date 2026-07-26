@@ -17,3 +17,4 @@ pub mod stats_tui;
 pub mod stats_view;
 pub mod tunnel;
 pub mod upgrade;
+pub mod vars;

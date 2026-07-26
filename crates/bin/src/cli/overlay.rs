@@ -25,37 +25,7 @@ pub fn validate_env_name(name: &str) -> anyhow::Result<()> {
 
 const MAX_SLUG_LEN: usize = 30;
 
-fn is_valid_var_name(s: &str) -> bool {
-    let mut chars = s.chars();
-    matches!(chars.next(), Some('A'..='Z'))
-        && chars.all(|c| matches!(c, 'A'..='Z' | '0'..='9' | '_'))
-}
-
-pub fn parse_vars(pairs: &[String]) -> anyhow::Result<BTreeMap<String, String>> {
-    let mut vars = BTreeMap::new();
-    for pair in pairs {
-        let Some((key, value)) = pair.split_once('=') else {
-            anyhow::bail!("--vars expects KEY=VALUE, got '{pair}'");
-        };
-        if !is_valid_var_name(key) {
-            anyhow::bail!("--vars: variable name '{key}' must match ^[A-Z][A-Z0-9_]*$");
-        }
-        if key.starts_with("RPI_") {
-            anyhow::bail!(
-                "--vars: the RPI_ prefix is reserved for rpi-provided variables ('{key}')"
-            );
-        }
-        if key != "BRANCH_NAME" {
-            anyhow::bail!(
-                "--vars: unknown variable '{key}' (this version supports only BRANCH_NAME)"
-            );
-        }
-        if vars.insert(key.to_string(), value.to_string()).is_some() {
-            anyhow::bail!("--vars: duplicate variable '{key}'");
-        }
-    }
-    Ok(vars)
-}
+pub use crate::cli::vars::parse_vars;
 
 pub fn derive_slug(branch: &str) -> anyhow::Result<String> {
     let mut slug = String::new();
@@ -732,26 +702,6 @@ seed = "node seed.js"
             let err = validate_env_name(reserved).unwrap_err().to_string();
             assert!(err.contains("reserved"), "{reserved}: {err}");
         }
-    }
-
-    #[test]
-    fn parse_vars_accepts_branch_name_only() {
-        let vars = parse_vars(&["BRANCH_NAME=feature/login".into()]).unwrap();
-        assert_eq!(vars["BRANCH_NAME"], "feature/login");
-        assert!(parse_vars(&[]).unwrap().is_empty());
-        for (bad, needle) in [
-            ("BRANCH_NAME", "KEY=VALUE"),      // no '='
-            ("branch=x", "^[A-Z][A-Z0-9_]*$"), // lowercase name
-            ("RPI_ENV_SLUG=x", "reserved"),    // RPI_ namespace
-            ("FOO=x", "BRANCH_NAME"),          // unknown var in v1
-        ] {
-            let err = parse_vars(&[bad.to_string()]).unwrap_err().to_string();
-            assert!(err.contains(needle), "{bad}: {err}");
-        }
-        let err = parse_vars(&["BRANCH_NAME=a".into(), "BRANCH_NAME=b".into()])
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("duplicate"), "got: {err}");
     }
 
     #[test]
