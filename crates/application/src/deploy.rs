@@ -9,6 +9,7 @@ use pi_domain::entities::{
     StageTimeouts,
 };
 use pi_domain::error::DomainError;
+use pi_domain::secretgroup::GroupRef;
 use tokio::sync::Semaphore;
 use tokio_util::sync::CancellationToken;
 
@@ -263,7 +264,11 @@ impl DeployProject {
         log.line(&format!("fetched {}", fetched.commit_sha));
 
         // secrets spec §7: decrypt -> arm masking -> inject .env + secret files
-        let bundle = self.secrets.load(&config.name).await?;
+        let bundle = self
+            .secrets
+            .load(&GroupRef::key(&config.name))
+            .await?
+            .objects;
         if !bundle.is_empty() {
             masker.arm(&bundle);
             self.secrets_writer.write(&fetched.workdir, &bundle).await?;
@@ -473,6 +478,7 @@ mod tests {
         ProjectConfig, SecretsBundle, StageTimeoutOverrides, StageTimeouts,
     };
     use pi_domain::error::DomainError;
+    use pi_domain::secretgroup::SecretGroup;
     use std::{
         path::{Path, PathBuf},
         sync::{Arc, Mutex},
@@ -590,7 +596,7 @@ mod tests {
         let stage_order = Arc::clone(&order);
         m.secrets.expect_load().times(1).returning(move |_| {
             stage_order.lock().unwrap().push("secrets");
-            Ok(SecretsBundle::default())
+            Ok(SecretGroup::default())
         });
         // empty bundle -> .env must NOT be written
         m.secrets_writer.expect_write().times(0);
@@ -789,7 +795,7 @@ mod tests {
         });
         m.secrets
             .expect_load()
-            .returning(|_| Ok(SecretsBundle::default()));
+            .returning(|_| Ok(SecretGroup::default()));
         m.secrets_writer.expect_write().times(0);
         m.overrides
             .expect_write()
@@ -829,7 +835,7 @@ mod tests {
         ok_pre_stages(&mut m);
         m.secrets
             .expect_load()
-            .returning(|_| Ok(SecretsBundle::default()));
+            .returning(|_| Ok(SecretGroup::default()));
         m.secrets_writer.expect_write().times(0);
         m.runtime.expect_build().returning(|_, _| Ok(()));
         m.runtime.expect_up().returning(|_, _| Ok(()));
@@ -870,7 +876,7 @@ mod tests {
         ok_pre_stages(&mut m);
         m.secrets
             .expect_load()
-            .returning(|_| Ok(SecretsBundle::default()));
+            .returning(|_| Ok(SecretGroup::default()));
         m.secrets_writer.expect_write().times(0);
         m.runtime.expect_build().returning(|_, _| Ok(()));
         m.runtime.expect_up().returning(|_, _| Ok(()));
@@ -909,7 +915,7 @@ mod tests {
         ok_pre_stages(&mut m);
         m.secrets
             .expect_load()
-            .returning(|_| Ok(SecretsBundle::default()));
+            .returning(|_| Ok(SecretGroup::default()));
         m.secrets_writer.expect_write().times(0);
         m.runtime.expect_build().returning(|_, _| Ok(()));
         m.runtime.expect_up().returning(|_, _| Ok(()));
@@ -1002,7 +1008,7 @@ mod tests {
         });
         m.secrets
             .expect_load()
-            .returning(|_| Ok(SecretsBundle::default()));
+            .returning(|_| Ok(SecretGroup::default()));
         m.secrets_writer.expect_write().times(0);
         m.overrides
             .expect_write()
@@ -1136,7 +1142,12 @@ mod tests {
     async fn stored_bundle_is_written_to_workdir_and_masked_in_logs() {
         let mut m = mocks();
         ok_pre_stages(&mut m);
-        m.secrets.expect_load().returning(|_| Ok(secret_bundle()));
+        m.secrets.expect_load().returning(|_| {
+            Ok(SecretGroup {
+                objects: secret_bundle(),
+                revision: 1,
+            })
+        });
         m.secrets_writer
             .expect_write()
             .withf(|wd, b| {
@@ -1197,7 +1208,7 @@ mod tests {
         ok_pre_stages(&mut m);
         m.secrets
             .expect_load()
-            .returning(|_| Ok(SecretsBundle::default()));
+            .returning(|_| Ok(SecretGroup::default()));
         m.secrets_writer.expect_write().times(0);
         m.runtime.expect_build().returning(|_, _| Ok(()));
         m.runtime.expect_up().returning(|_, _| Ok(()));
@@ -1232,7 +1243,7 @@ mod tests {
         ok_pre_stages(&mut m);
         m.secrets
             .expect_load()
-            .returning(|_| Ok(SecretsBundle::default()));
+            .returning(|_| Ok(SecretGroup::default()));
         m.secrets_writer.expect_write().times(0);
         m.runtime.expect_build().returning(|_, _| Ok(()));
         m.runtime.expect_up().returning(|_, _| Ok(()));
@@ -1279,7 +1290,7 @@ mod tests {
         });
         m.secrets
             .expect_load()
-            .returning(|_| Ok(SecretsBundle::default()));
+            .returning(|_| Ok(SecretGroup::default()));
         m.overrides
             .expect_write()
             .returning(|_, _, _, _, _| Ok(PathBuf::from("/o.yml")));
@@ -1534,7 +1545,7 @@ mod tests {
         });
         m.secrets
             .expect_load()
-            .returning(|_| Ok(SecretsBundle::default()));
+            .returning(|_| Ok(SecretGroup::default()));
         m.secrets_writer.expect_write().times(0);
         m.overrides
             .expect_write()
@@ -1608,7 +1619,7 @@ mod tests {
         ok_pre_stages(&mut m);
         m.secrets
             .expect_load()
-            .returning(|_| Ok(SecretsBundle::default()));
+            .returning(|_| Ok(SecretGroup::default()));
         m.secrets_writer.expect_write().times(0);
         m.runtime.expect_build().returning(|_, _| Ok(()));
         m.runtime.expect_up().returning(|_, _| Ok(()));
@@ -1648,7 +1659,7 @@ mod tests {
         ok_pre_stages(&mut m);
         m.secrets
             .expect_load()
-            .returning(|_| Ok(SecretsBundle::default()));
+            .returning(|_| Ok(SecretGroup::default()));
         m.runtime
             .expect_build()
             .returning(|_, _| Err(DomainError::Runtime("compose build exited with 1".into())));
@@ -1679,7 +1690,7 @@ mod tests {
         ok_pre_stages(&mut m);
         m.secrets
             .expect_load()
-            .returning(|_| Ok(SecretsBundle::default()));
+            .returning(|_| Ok(SecretGroup::default()));
         m.runtime.expect_build().returning(|_, _| Ok(()));
         m.runtime.expect_up().returning(|_, _| Ok(()));
         m.runtime.expect_ps().returning(|_| Ok(vec![]));
@@ -1715,7 +1726,7 @@ mod tests {
         ok_pre_stages(&mut m);
         m.secrets
             .expect_load()
-            .returning(|_| Ok(SecretsBundle::default()));
+            .returning(|_| Ok(SecretGroup::default()));
         m.runtime.expect_build().returning(|_, _| Ok(()));
         m.runtime.expect_up().returning(|_, _| Ok(()));
         m.runtime.expect_ps().returning(|_| Ok(vec![]));
@@ -1756,7 +1767,7 @@ mod tests {
         ok_pre_stages(&mut m);
         m.secrets
             .expect_load()
-            .returning(|_| Ok(SecretsBundle::default()));
+            .returning(|_| Ok(SecretGroup::default()));
         m.runtime.expect_build().returning(|_, _| Ok(()));
         m.runtime.expect_up().returning(|_, _| Ok(()));
         m.runtime.expect_ps().returning(|_| Ok(vec![]));
@@ -1831,7 +1842,7 @@ mod tests {
         });
         m.secrets
             .expect_load()
-            .returning(|_| Ok(SecretsBundle::default()));
+            .returning(|_| Ok(SecretGroup::default()));
         m.secrets_writer.expect_write().times(0);
         m.overrides
             .expect_write()
@@ -1896,7 +1907,7 @@ mod tests {
         });
         m.secrets
             .expect_load()
-            .returning(|_| Ok(SecretsBundle::default()));
+            .returning(|_| Ok(SecretGroup::default()));
         m.secrets_writer.expect_write().times(0);
         m.overrides
             .expect_write()
@@ -1949,7 +1960,7 @@ mod tests {
         });
         m.secrets
             .expect_load()
-            .returning(|_| Ok(SecretsBundle::default()));
+            .returning(|_| Ok(SecretGroup::default()));
         m.secrets_writer.expect_write().times(0);
         m.overrides
             .expect_write()
@@ -2004,7 +2015,7 @@ mod tests {
             .returning(|_, _| Ok(()));
         m.secrets
             .expect_load()
-            .returning(|_| Ok(SecretsBundle::default()));
+            .returning(|_| Ok(SecretGroup::default()));
         m.secrets_writer.expect_write().times(0);
         m.runtime.expect_build().returning(|_, _| Ok(()));
         m.runtime.expect_up().returning(|_, _| Ok(()));

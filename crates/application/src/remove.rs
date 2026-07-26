@@ -6,6 +6,7 @@ use pi_domain::contracts::{
 };
 use pi_domain::entities::ComposeStack;
 use pi_domain::error::DomainError;
+use pi_domain::secretgroup::GroupRef;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RemoveReport {
@@ -81,7 +82,7 @@ impl RemoveProject {
             self.ingress.remove(hostname, Arc::clone(&log)).await?;
         }
         self.source.cleanup(project).await?;
-        self.secrets.remove(project).await?;
+        self.secrets.remove(&GroupRef::key(project)).await?;
         self.overrides.remove(project).await?;
         self.history.remove_project(project).await?;
         self.projects.remove(project).await?;

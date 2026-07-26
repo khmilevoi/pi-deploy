@@ -2,6 +2,7 @@ use std::sync::Arc;
 
 use pi_domain::contracts::{ContainerRuntime, LogSink, ProjectRepository, SecretStore};
 use pi_domain::error::DomainError;
+use pi_domain::secretgroup::GroupRef;
 
 use crate::mask::MaskingSink;
 
@@ -42,7 +43,7 @@ impl StreamLogs {
     ) -> Result<(), DomainError> {
         self.ensure_project(project).await?;
         let mask = MaskingSink::new(log);
-        mask.arm(&self.secrets.load(project).await?);
+        mask.arm(&self.secrets.load(&GroupRef::key(project)).await?.objects);
         self.runtime.logs(project, tail, follow, mask).await
     }
 }

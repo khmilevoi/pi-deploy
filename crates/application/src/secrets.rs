@@ -5,6 +5,7 @@ use pi_domain::contracts::{
 };
 use pi_domain::entities::{ComposeStack, SecretsBundle};
 use pi_domain::error::DomainError;
+use pi_domain::secretgroup::GroupRef;
 
 use crate::mask::MaskingSink;
 
@@ -57,7 +58,9 @@ impl SendSecrets {
         if bundle.is_empty() {
             return Err(DomainError::Invalid("secrets bundle is empty".into()));
         }
-        self.secrets.save(project, &bundle).await?;
+        self.secrets
+            .save(&GroupRef::key(project), &bundle, None)
+            .await?;
         let keys = bundle.vars.len();
         let files = bundle.files.len();
         if !apply {
@@ -132,7 +135,7 @@ impl ListSecrets {
     }
 
     pub async fn execute(&self, project: &str) -> Result<StoredSecrets, DomainError> {
-        let bundle = self.secrets.load(project).await?;
+        let bundle = self.secrets.load(&GroupRef::key(project)).await?.objects;
         Ok(StoredSecrets {
             keys: bundle.keys(),
             files: bundle.file_paths(),
@@ -152,6 +155,7 @@ mod tests {
     use pi_domain::entities::{
         ExposeMode, HealthcheckConfig, Project, ProjectConfig, StageTimeoutOverrides,
     };
+    use pi_domain::secretgroup::SecretGroup;
     use std::path::{Path, PathBuf};
 
     fn bundle() -> SecretsBundle {
@@ -223,9 +227,11 @@ mod tests {
         let mut m = mocks();
         m.secrets
             .expect_save()
-            .withf(|p, b| p == "rateme" && b.vars.len() == 2 && b.files.len() == 1)
+            .withf(|r, b, _| {
+                *r == GroupRef::key("rateme") && b.vars.len() == 2 && b.files.len() == 1
+            })
             .times(1)
-            .returning(|_, _| Ok(()));
+            .returning(|_, _, _| Ok(1));
 
         let saved = build(m)
             .execute("rateme", bundle(), false, CollectSink::new())
@@ -260,7 +266,7 @@ mod tests {
     #[tokio::test]
     async fn files_only_bundle_is_saved() {
         let mut m = mocks();
-        m.secrets.expect_save().times(1).returning(|_, _| Ok(()));
+        m.secrets.expect_save().times(1).returning(|_, _, _| Ok(1));
         let mut b = SecretsBundle::default();
         b.files.insert("id_rsa".into(), b"key".to_vec());
         let saved = build(m)
@@ -280,7 +286,7 @@ mod tests {
     #[tokio::test]
     async fn apply_reinjects_env_and_runs_up_with_masked_logs() {
         let mut m = mocks();
-        m.secrets.expect_save().returning(|_, _| Ok(()));
+        m.secrets.expect_save().returning(|_, _, _| Ok(1));
         m.projects
             .expect_get()
             .withf(|n| n == "rateme")
@@ -347,7 +353,7 @@ mod tests {
     #[tokio::test]
     async fn apply_for_unknown_project_is_not_found_after_save() {
         let mut m = mocks();
-        m.secrets.expect_save().times(1).returning(|_, _| Ok(()));
+        m.secrets.expect_save().times(1).returning(|_, _, _| Ok(1));
         m.projects.expect_get().returning(|_| Ok(None));
         m.writer.expect_write().times(0);
         m.runtime.expect_up().times(0);
@@ -364,8 +370,13 @@ mod tests {
         let mut secrets = MockSecretStore::new();
         secrets
             .expect_load()
-            .withf(|p| p == "rateme")
-            .returning(|_| Ok(bundle()));
+            .withf(|r| *r == GroupRef::key("rateme"))
+            .returning(|_| {
+                Ok(SecretGroup {
+                    objects: bundle(),
+                    revision: 1,
+                })
+            });
         let stored = ListSecrets::new(Arc::new(secrets))
             .execute("rateme")
             .await
@@ -380,7 +391,12 @@ mod tests {
     #[tokio::test]
     async fn list_secrets_reports_the_effective_file_mode() {
         let mut secrets = MockSecretStore::new();
-        secrets.expect_load().returning(|_| Ok(bundle()));
+        secrets.expect_load().returning(|_| {
+            Ok(SecretGroup {
+                objects: bundle(),
+                revision: 1,
+            })
+        });
         let stored = ListSecrets::new(Arc::new(secrets))
             .execute("rateme")
             .await
