@@ -726,6 +726,7 @@ The CLI warns when its version differs from the agent's. Update both sides to th
 - [Migration: `pi` → `rpi` (v0.5 → v0.6)](docs/migration-v0.5-to-v0.6.md)
 - [Migration: `[env]` → `[secrets]`](docs/migration-env-to-secrets.md)
 - [Migration: `rpi command --full` removed (v0.25)](docs/migration-command-full-flag.md)
+- [Migration: configuration variables reach every field (v0.27)](docs/migration-config-variables.md)
 - [Release notes](https://github.com/khmilevoi/rpi-deploy/releases) — full version history
 
 ## License
