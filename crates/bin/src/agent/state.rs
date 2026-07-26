@@ -211,6 +211,7 @@ pub fn build_state(
         disk,
         projects.clone(),
         env!("CARGO_PKG_VERSION").to_string(),
+        config.data_dir.to_string_lossy().into_owned(),
         config.gc.disk_threshold_percent,
         config.cloudflared.is_some(),
         ingress_active,

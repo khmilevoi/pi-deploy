@@ -1,0 +1,14 @@
+services:
+  web:
+    build: .
+    # The whole point: a service that is not the agent's uid. Before this
+    # change the bind-mounted 0600 secret was unreadable here.
+    user: "1000:1000"
+    expose:
+      - "8080"
+    secrets:
+      - app_secret
+
+secrets:
+  app_secret:
+    file: ./app_secret

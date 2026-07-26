@@ -118,6 +118,10 @@ pub struct SecretsSection {
     /// Secret files, relative forward-slash paths (recreated verbatim on the Pi).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub files: Vec<String>,
+    /// Mode for the materialized secrets, e.g. "0640". None -> 0644 for
+    /// `[secrets].files` and 0600 for the injected `.env`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_mode: Option<String>,
 }
 
 /// [commands] value: a shell-word string, an explicit argv array, or a table
@@ -303,6 +307,10 @@ impl RpiToml {
             if !seen.insert(path.as_str()) {
                 anyhow::bail!("rpi.toml [secrets].files: duplicate path '{path}'");
             }
+        }
+        if let Some(mode) = &self.secrets.file_mode {
+            pi_domain::secretmode::parse(mode)
+                .map_err(|e| anyhow::anyhow!("rpi.toml [secrets].file_mode: {e}"))?;
         }
         if let Some(commands) = &self.commands {
             if commands.is_empty() {
@@ -509,6 +517,34 @@ files = ["certs/server.pem"]
         );
         let err = RpiToml::parse(&toml).unwrap_err().to_string();
         assert!(err.contains("duplicate"), "got: {err}");
+    }
+
+    #[test]
+    fn secrets_file_mode_is_parsed_and_validated() {
+        let parsed = RpiToml::parse(&SAMPLE.replace(
+            "files = [\"certs/server.pem\"]",
+            "files = [\"certs/server.pem\"]\nfile_mode = \"0640\"",
+        ))
+        .unwrap();
+        assert_eq!(parsed.secrets.file_mode.as_deref(), Some("0640"));
+    }
+
+    #[test]
+    fn secrets_file_mode_defaults_to_absent() {
+        assert!(RpiToml::parse(SAMPLE).unwrap().secrets.file_mode.is_none());
+    }
+
+    #[test]
+    fn invalid_secrets_file_mode_is_rejected() {
+        for bad in ["0755", "0666", "abc", "64"] {
+            let err = RpiToml::parse(&SAMPLE.replace(
+                "files = [\"certs/server.pem\"]",
+                &format!("files = [\"certs/server.pem\"]\nfile_mode = \"{bad}\""),
+            ))
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("[secrets].file_mode"), "{bad}: {err}");
+        }
     }
 
     #[test]

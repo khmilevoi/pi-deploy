@@ -29,12 +29,16 @@ struct SecretsManifest {
     files: Vec<String>,
 }
 
-/// Writes the decrypted bundle into `<workdir>`: `.env` (0600, atomic) plus
-/// every secret file at its relative path (dirs 0700, files 0600). Each
-/// directory level between the workdir root and the target is checked for a
-/// symlink *before* being created or descended into, so a symlink committed
-/// to the repo cannot redirect writes outside the workdir (secrets spec §7).
-/// Files stay in place: compose re-reads them on `up`.
+/// Writes the decrypted bundle into `<workdir>`: `.env` (`bundle.env_mode()`,
+/// `0600` by default, atomic) plus every secret file at its relative path
+/// (`bundle.secret_file_mode()`, `0644` by default; directories created along
+/// the way get `0755`). Each directory level between the workdir root and the
+/// target is checked for a symlink *before* being created or descended into,
+/// so a symlink committed to the repo cannot redirect writes outside the
+/// workdir (secrets spec §7). Files stay in place: compose re-reads them on
+/// `up`. The manifest (see [`MANIFEST_FILE_NAME`]) is always `0600`: it is
+/// this writer's own bookkeeping, not a project secret a container needs to
+/// read.
 ///
 /// Whole-bundle replace also applies to files (secrets spec §2.5): a small
 /// manifest (see [`MANIFEST_FILE_NAME`]) dropped at the workdir root records
@@ -55,16 +59,80 @@ fn storage_err(context: String, e: impl std::fmt::Display) -> DomainError {
     DomainError::Storage(format!("{context}: {e}"))
 }
 
-fn create_private_dir(path: &Path) -> std::io::Result<()> {
+/// Mode for directories this writer creates on the way to a secret file.
+/// Traversable by anyone, like every other directory in the checkout: a
+/// directory mode protects nothing here, the file mode does.
+///
+/// Both uses sit behind `#[cfg(unix)]` (there is nothing to chmod on a
+/// non-unix target), so the constant itself is unused there — same idiom as
+/// `agent/config.rs:18`.
+#[cfg_attr(not(unix), allow(dead_code))]
+const DIR_MODE: u32 = 0o755;
+
+fn create_secret_dir(path: &Path) -> std::io::Result<()> {
     #[allow(unused_mut)]
     let mut builder = std::fs::DirBuilder::new();
     #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt;
-        builder.mode(0o700);
+        builder.mode(DIR_MODE);
     }
-    builder.create(path)
+    builder.create(path)?;
+    // `DirBuilder::mode` is masked by the process umask (same reason
+    // `fsutil::write_private_atomic` uses `set_permissions` instead of
+    // `OpenOptions::mode` for files) — set it explicitly afterward so the
+    // result does not depend on what the unit happens to set.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(DIR_MODE))?;
+    }
+    Ok(())
 }
+
+/// Widens a directory this writer created before 0.26.0 (owned by us and at
+/// exactly `0700`) so a container can traverse into it. Anything else — a
+/// directory from the repository, one with another owner, one with any other
+/// mode, or not a directory at all — is left untouched: it is not ours to
+/// change. Best-effort; a failure to stat or chmod is not worth failing a
+/// deploy over.
+///
+/// `symlink_metadata` rather than `metadata`: the caller already ruled out a
+/// symlink at this exact path via `stat_dir_component` moments ago, but using
+/// the non-following stat here too avoids re-opening a TOCTOU window, and —
+/// combined with the `is_dir()` check — also refuses a *plain file* that
+/// happens to sit at an intermediate path component. `DirStep::Existing`
+/// covers "any non-symlink entry", not "any directory", so without this
+/// check a 0700 file owned by us would get chmod'd to 0755 before the write
+/// itself fails on it not being a directory.
+#[cfg(unix)]
+fn widen_legacy_secret_dir(path: &Path) {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return;
+    };
+    if !meta.file_type().is_dir() {
+        return;
+    }
+    if meta.permissions().mode() & 0o777 != 0o700 {
+        return;
+    }
+    // SAFETY: geteuid has no preconditions and cannot fail. The effective
+    // uid, not the real uid, is what the kernel checks when deciding whether
+    // this process is allowed to `chmod` a path it doesn't own outright, so
+    // it's the right identity to compare against `meta.uid()` here. Same
+    // libc-call idiom as `current_uid` in `cloudflared.rs`, which uses
+    // `getuid` instead — that call only needs "which uid am I" to label an
+    // environment variable, not a permission check, so real vs. effective
+    // doesn't matter there.
+    if meta.uid() != unsafe { libc::geteuid() } {
+        return;
+    }
+    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(DIR_MODE));
+}
+
+#[cfg(not(unix))]
+fn widen_legacy_secret_dir(_path: &Path) {}
 
 /// Result of checking one intermediate directory-path component while
 /// walking from the (already canonicalized) workdir root toward a target
@@ -92,6 +160,7 @@ fn stat_dir_component(dir: &Path) -> std::io::Result<DirStep> {
 fn write_files_blocking(
     workdir: PathBuf,
     files: Vec<(String, Vec<u8>)>,
+    mode: u32,
 ) -> Result<(), DomainError> {
     let root = std::fs::canonicalize(&workdir)
         .map_err(|e| storage_err("canonicalize workdir".into(), e))?;
@@ -122,16 +191,16 @@ fn write_files_blocking(
                         "secret file '{rel}' escapes the workdir (symlinked directory?)"
                     )));
                 }
-                DirStep::Existing => {}
+                DirStep::Existing => widen_legacy_secret_dir(&dir),
                 DirStep::Missing => {
-                    create_private_dir(&dir)
+                    create_secret_dir(&dir)
                         .map_err(|e| storage_err(format!("create dir for '{rel}'"), e))?;
                 }
             }
         }
 
         let target = dir.join(file_component);
-        fsutil::write_private_atomic(&target, &bytes)
+        fsutil::write_private_atomic(&target, &bytes, mode)
             .map_err(|e| storage_err(format!("write secret file '{rel}'"), e))?;
     }
     Ok(())
@@ -254,7 +323,7 @@ fn sync_manifest_blocking(
         };
         let contents = serde_json::to_vec(&manifest)
             .map_err(|e| storage_err("serialize secrets manifest".into(), e))?;
-        fsutil::write_private_atomic(manifest_path, &contents)
+        fsutil::write_private_atomic(manifest_path, &contents, 0o600)
             .map_err(|e| storage_err("write secrets manifest".into(), e))?;
     }
     Ok(())
@@ -264,11 +333,12 @@ fn sync_files_blocking(
     workdir: PathBuf,
     files: Vec<(String, Vec<u8>)>,
     current: BTreeSet<String>,
+    mode: u32,
 ) -> Result<(), DomainError> {
     let manifest_path = workdir.join(MANIFEST_FILE_NAME);
     let previous = read_manifest(&manifest_path);
 
-    write_files_blocking(workdir.clone(), files)?;
+    write_files_blocking(workdir.clone(), files, mode)?;
 
     sync_manifest_blocking(&workdir, &manifest_path, previous, &current)
 }
@@ -292,8 +362,9 @@ impl SecretsWriter for FsSecretsWriter {
             }
         } else {
             let contents = dotenv::serialize(bundle);
+            let env_mode = bundle.env_mode();
             tokio::task::spawn_blocking(move || {
-                fsutil::write_private_atomic(&env_path, contents.as_bytes())
+                fsutil::write_private_atomic(&env_path, contents.as_bytes(), env_mode)
             })
             .await
             .map_err(|e| storage_err("write .env".into(), format!("join error: {e}")))?
@@ -306,7 +377,8 @@ impl SecretsWriter for FsSecretsWriter {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect();
         let current: BTreeSet<String> = bundle.files.keys().cloned().collect();
-        tokio::task::spawn_blocking(move || sync_files_blocking(root, files, current))
+        let file_mode = bundle.secret_file_mode();
+        tokio::task::spawn_blocking(move || sync_files_blocking(root, files, current, file_mode))
             .await
             .map_err(|e| storage_err("write secret files".into(), format!("join error: {e}")))?
     }
@@ -589,7 +661,7 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn secret_files_and_created_dirs_are_private() {
+    async fn secret_files_are_container_readable_and_created_dirs_are_traversable() {
         use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         FsSecretsWriter::new()
@@ -600,12 +672,142 @@ mod tests {
             .unwrap()
             .permissions()
             .mode();
-        assert_eq!(file_mode & 0o777, 0o600);
+        assert_eq!(file_mode & 0o777, 0o644);
         let dir_mode = std::fs::metadata(dir.path().join("certs"))
             .unwrap()
             .permissions()
             .mode();
-        assert_eq!(dir_mode & 0o777, 0o700);
+        assert_eq!(dir_mode & 0o777, 0o755);
+        let env_mode = std::fs::metadata(dir.path().join(".env"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(env_mode & 0o777, 0o600, ".env stays private by default");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn created_dir_mode_does_not_depend_on_the_process_umask() {
+        // `DirBuilder::mode` is masked by the process umask; a strict umask
+        // (e.g. 0027, common for service accounts) would otherwise silently
+        // narrow a newly created secret directory below DIR_MODE. This test
+        // proves the explicit `set_permissions` call in `create_secret_dir`
+        // makes the result independent of whatever umask the unit runs
+        // under, matching `write_private_atomic`'s file-side guarantee.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("certs");
+        // SAFETY: umask has no preconditions and cannot fail; restored
+        // immediately after the single directory-creation call below.
+        let old = unsafe { libc::umask(0o027) };
+        let result = create_secret_dir(&target);
+        unsafe {
+            libc::umask(old);
+        }
+        result.unwrap();
+        let mode = std::fs::metadata(&target).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o755);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn file_mode_applies_to_secret_files_and_to_env() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let mut b = bundle_with_file();
+        b.file_mode = Some(0o640);
+        FsSecretsWriter::new().write(dir.path(), &b).await.unwrap();
+        for rel in ["certs/server.pem", ".env"] {
+            let mode = std::fs::metadata(dir.path().join(rel))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(mode & 0o777, 0o640, "{rel}");
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_directory_this_writer_created_at_0700_is_widened_on_the_next_write() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // Simulate a checkout written by rpi < 0.26.0.
+        std::fs::create_dir(dir.path().join("certs")).unwrap();
+        std::fs::set_permissions(
+            dir.path().join("certs"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+
+        FsSecretsWriter::new()
+            .write(dir.path(), &bundle_with_file())
+            .await
+            .unwrap();
+
+        let mode = std::fs::metadata(dir.path().join("certs"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_directory_with_any_other_mode_is_left_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // A directory that came from the repository, not from this writer.
+        std::fs::create_dir(dir.path().join("certs")).unwrap();
+        std::fs::set_permissions(
+            dir.path().join("certs"),
+            std::fs::Permissions::from_mode(0o750),
+        )
+        .unwrap();
+
+        FsSecretsWriter::new()
+            .write(dir.path(), &bundle_with_file())
+            .await
+            .unwrap();
+
+        let mode = std::fs::metadata(dir.path().join("certs"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o750, "only an exact 0700 is ours to widen");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_plain_file_at_an_intermediate_path_component_is_never_widened() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // `stat_dir_component` reports `DirStep::Existing` for any non-symlink
+        // entry, including a plain file that happens to occupy the spot a
+        // directory component is expected at.
+        std::fs::write(dir.path().join("certs"), b"not a directory").unwrap();
+        std::fs::set_permissions(
+            dir.path().join("certs"),
+            std::fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+
+        let result = FsSecretsWriter::new()
+            .write(dir.path(), &bundle_with_file())
+            .await;
+
+        assert!(
+            result.is_err(),
+            "writing 'certs/server.pem' through a plain file 'certs' must fail"
+        );
+        let mode = std::fs::metadata(dir.path().join("certs"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "a non-directory entry at 0700 must never be widened"
+        );
     }
 
     #[cfg(unix)]

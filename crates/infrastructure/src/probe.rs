@@ -91,11 +91,51 @@ fn memory_cgroup_check(controllers: Option<String>, v1_present: bool) -> Diagnos
     }
 }
 
+/// The agent's data dir (`data_dir` in agent.toml, `/var/lib/rpi` by default)
+/// holds every project's plaintext secrets. It must be owned by the agent and
+/// no wider than 0750; the file modes inside it are deliberately
+/// container-readable, so this directory is what keeps other local users out.
+/// `data_dir` is named in the `detail` string (rather than assumed to be the
+/// default path) because it is configurable — stat-ing the wrong directory
+/// would report green over a real secrets tree that is actually too wide.
+fn data_dir_permissions_check(data_dir: &str, stat: Result<String, String>) -> DiagnosticCheck {
+    let hint = "tighten the agent data dir: sudo rpi agent setup";
+    match stat {
+        Ok(out) => {
+            let mut parts = out.split_whitespace();
+            let owner = parts.next().unwrap_or_default().to_string();
+            let mode = parts.next().unwrap_or_default().to_string();
+            let too_wide = match u32::from_str_radix(&mode, 8) {
+                Ok(bits) => bits & !0o750 != 0,
+                Err(_) => true,
+            };
+            let passed = owner == "rpi-agent" && !too_wide;
+            DiagnosticCheck {
+                name: "data dir permissions".into(),
+                passed,
+                detail: format!("{data_dir}: owner {owner}, mode {mode}"),
+                hint: if passed { None } else { Some(hint.into()) },
+            }
+        }
+        Err(err) => DiagnosticCheck {
+            name: "data dir permissions".into(),
+            passed: false,
+            detail: err,
+            hint: Some(hint.into()),
+        },
+    }
+}
+
 pub struct HostSystemProbe {
     runner: Arc<dyn ProbeRunner>,
     disk: Arc<dyn DiskProbe>,
     projects: Arc<dyn ProjectRepository>,
     version: String,
+    /// The agent's configured data dir (`config.data_dir`), stat'd by the
+    /// "data dir permissions" check below. Not assumed to be `/var/lib/rpi`:
+    /// that is only the default, and `data_dir` is an ordinary overridable
+    /// agent.toml field.
+    data_dir: String,
     disk_threshold_percent: u8,
     cloudflared_enabled: bool,
     ingress_active: bool,
@@ -110,6 +150,7 @@ impl HostSystemProbe {
         disk: Arc<dyn DiskProbe>,
         projects: Arc<dyn ProjectRepository>,
         version: String,
+        data_dir: String,
         disk_threshold_percent: u8,
         cloudflared_enabled: bool,
         ingress_active: bool,
@@ -121,6 +162,7 @@ impl HostSystemProbe {
             disk,
             projects,
             version,
+            data_dir,
             disk_threshold_percent,
             cloudflared_enabled,
             ingress_active,
@@ -211,6 +253,13 @@ impl SystemProbe for HostSystemProbe {
                 hint: Some("add rpi-agent to the 'docker' group".into()),
             },
         });
+
+        checks.push(data_dir_permissions_check(
+            &self.data_dir,
+            self.runner
+                .run("stat", &["-c", "%U %a", &self.data_dir])
+                .await,
+        ));
 
         checks.push(
             match self
@@ -444,6 +493,7 @@ mod tests {
             Arc::new(disk),
             Arc::new(repo),
             "0.0.0".into(),
+            "/var/lib/rpi".into(),
             85,
             false, // cloudflared binary/service checks off — not under test
             ingress_active,
@@ -491,6 +541,7 @@ mod tests {
             Arc::new(disk),
             Arc::new(repo),
             "0.0.0".into(),
+            "/var/lib/rpi".into(),
             85,
             cloudflared_enabled,
             ingress_active,
@@ -737,5 +788,91 @@ mod tests {
         let check = memory_cgroup_check(None, false);
         assert!(!check.passed);
         assert_eq!(check.name, "memory cgroup");
+    }
+
+    #[test]
+    fn data_dir_permissions_check_fails_on_a_world_readable_dir() {
+        let check = data_dir_permissions_check("/var/lib/rpi", Ok("rpi-agent 755".into()));
+        assert!(!check.passed);
+        assert!(check.hint.unwrap().contains("rpi agent setup"));
+    }
+
+    #[test]
+    fn data_dir_permissions_check_passes_at_0750() {
+        assert!(data_dir_permissions_check("/var/lib/rpi", Ok("rpi-agent 750".into())).passed);
+    }
+
+    #[test]
+    fn data_dir_permissions_check_passes_when_tighter() {
+        assert!(data_dir_permissions_check("/var/lib/rpi", Ok("rpi-agent 700".into())).passed);
+    }
+
+    #[test]
+    fn data_dir_permissions_check_fails_on_a_group_writable_dir() {
+        // Ends in '0' (others), so a naive last-digit check would call this
+        // healthy — but group-write matters: `rpi setup` puts the login user
+        // in the `rpi-agent` group, so this is a real escalation path.
+        let check = data_dir_permissions_check("/var/lib/rpi", Ok("rpi-agent 770".into()));
+        assert!(!check.passed);
+        assert!(check.hint.unwrap().contains("rpi agent setup"));
+    }
+
+    #[test]
+    fn data_dir_permissions_check_fails_on_an_unparseable_mode() {
+        let check = data_dir_permissions_check("/var/lib/rpi", Ok("rpi-agent garbage".into()));
+        assert!(!check.passed);
+        assert!(check.hint.unwrap().contains("rpi agent setup"));
+    }
+
+    #[test]
+    fn data_dir_permissions_check_names_a_custom_data_dir_in_its_detail() {
+        // A custom `data_dir` (agent.toml is not pinned to /var/lib/rpi) must
+        // be reflected in the check's own detail string, not a hardcoded
+        // default — otherwise the check could stat the wrong directory
+        // entirely and still print a path that looks right.
+        let check = data_dir_permissions_check("/srv/rpi-data", Ok("rpi-agent 750".into()));
+        assert!(check.passed);
+        assert!(
+            check.detail.contains("/srv/rpi-data"),
+            "detail must name the configured data dir: {}",
+            check.detail
+        );
+    }
+
+    #[tokio::test]
+    async fn diagnostics_stats_the_configured_data_dir_not_a_hardcoded_default() {
+        // Regression guard: the probe must stat whatever `data_dir` it was
+        // built with, so a project running against a custom data dir gets a
+        // real permissions check instead of one that silently inspects
+        // /var/lib/rpi (which may not even be the directory in use).
+        let mut responses = std::collections::HashMap::new();
+        responses.insert(
+            "stat -c %U %a /srv/rpi-data".to_string(),
+            Ok("rpi-agent 750".to_string()),
+        );
+        let mut repo = MockProjectRepository::new();
+        repo.expect_list().returning(|| Ok(vec![]));
+        let mut disk = MockDiskProbe::new();
+        disk.expect_used_percent().returning(|| Ok(10));
+        let probe = HostSystemProbe::new(
+            Arc::new(ScriptedRunner(responses)),
+            Arc::new(disk),
+            Arc::new(repo),
+            "0.0.0".into(),
+            "/srv/rpi-data".into(),
+            85,
+            false,
+            false,
+            None,
+            0,
+        );
+        let report = probe.diagnostics().await;
+        let check = report
+            .checks
+            .iter()
+            .find(|c| c.name == "data dir permissions")
+            .expect("data dir permissions check present");
+        assert!(check.passed, "expected pass: {check:?}");
+        assert!(check.detail.contains("/srv/rpi-data"));
     }
 }

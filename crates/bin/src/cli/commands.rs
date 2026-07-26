@@ -204,9 +204,21 @@ pub async fn secrets_send(
     if is_env {
         compat.gate(crate::compat::Feature::Environments)?;
     }
+    let file_mode = match &rpitoml.secrets.file_mode {
+        Some(text) => Some(
+            pi_domain::secretmode::parse(text)
+                .map_err(|e| anyhow::anyhow!("rpi.toml [secrets].file_mode: {e}"))?,
+        ),
+        None => None,
+    };
+    if file_mode.is_some() {
+        compat.gate(crate::compat::Feature::SecretModes)?;
+    }
 
     let (n, m) = (vars.len(), files.len());
-    let resp = api.send_secrets(&project_name, vars, files, apply).await?;
+    let resp = api
+        .send_secrets(&project_name, vars, files, file_mode, apply)
+        .await?;
     output::success(format!(
         "saved {n} key(s) and {m} file(s) for project '{project_name}'"
     ));
@@ -335,6 +347,9 @@ pub async fn secrets_ls(
         output::info(format!("no secrets stored for project '{project_name}'"));
         return Ok(());
     }
+    if let Some(mode) = file_mode_to_print(&resp) {
+        output::info(format!("file mode: {mode:04o}"));
+    }
     if !resp.keys.is_empty() {
         output::heading("env keys:");
         for key in &resp.keys {
@@ -348,6 +363,20 @@ pub async fn secrets_ls(
         }
     }
     Ok(())
+}
+
+/// The `file mode` reported by `rpi secrets ls` is `bundle.secret_file_mode()`
+/// — the mode applied to files listed in `[secrets].files`. A bundle with no
+/// files never writes anything at that mode (env vars always land in `.env`
+/// at `bundle.env_mode()`, `0600` by default), so printing it there would
+/// show an operator debugging permissions a number that describes nothing
+/// that exists on disk. Only print when there is at least one file it
+/// actually governs.
+fn file_mode_to_print(resp: &crate::proto::SecretsListResponse) -> Option<u32> {
+    if resp.files.is_empty() {
+        return None;
+    }
+    resp.file_mode
 }
 
 /// Same dotenv dialect as the agent's PUT validation (§10, plan Task 3):
@@ -876,6 +905,7 @@ mod tests {
         SecretsSection {
             env: env.map(str::to_string),
             files: files.iter().map(|s| s.to_string()).collect(),
+            file_mode: None,
         }
     }
 
@@ -1070,6 +1100,41 @@ mod tests {
             "lan http://192.168.1.50:8000".to_string()
         );
         assert_eq!(expose_cell("lan", None, 8000), "lan (ip n/a)".to_string());
+    }
+
+    fn secrets_list_response(
+        files: &[&str],
+        file_mode: Option<u32>,
+    ) -> crate::proto::SecretsListResponse {
+        crate::proto::SecretsListResponse {
+            keys: vec![],
+            files: files.iter().map(|s| s.to_string()).collect(),
+            file_mode,
+        }
+    }
+
+    #[test]
+    fn file_mode_to_print_is_none_for_a_bundle_with_no_files() {
+        // A bundle with only env vars never writes anything at
+        // `secret_file_mode()` — .env always lands at `env_mode()` — so
+        // printing that value here would mislead an operator debugging
+        // permissions.
+        let resp = secrets_list_response(&[], Some(0o644));
+        assert_eq!(file_mode_to_print(&resp), None);
+    }
+
+    #[test]
+    fn file_mode_to_print_is_some_when_the_bundle_has_files() {
+        let resp = secrets_list_response(&["certs/server.pem"], Some(0o640));
+        assert_eq!(file_mode_to_print(&resp), Some(0o640));
+    }
+
+    #[test]
+    fn file_mode_to_print_passes_through_a_legacy_agent_with_no_mode() {
+        // Agents older than 0.26.0 never send `file_mode` at all; the CLI
+        // must not fabricate one even when files are present.
+        let resp = secrets_list_response(&["certs/server.pem"], None);
+        assert_eq!(file_mode_to_print(&resp), None);
     }
 
     #[test]

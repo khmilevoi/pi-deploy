@@ -41,7 +41,7 @@
 - **No open ports** — the CLI tunnels over your existing SSH access; the agent listens on a Unix socket only.
 - **Staged pipeline view** — `fetch → build → start → health → route → gc`, each stage collapsing into a timed `✓ build (48.3s)` summary.
 - **Private repos without friction** — a deploy-key preflight verifies repo access before the pipeline and registers a read-only deploy key through your local `gh` (the token never leaves your machine, the private key never leaves the Pi). Without `gh` it prints the key and continues by itself once you add it — even picking up a `gh auth login` you run mid-wait.
-- **Encrypted secrets** — `.env` plus arbitrary secret files, sent encrypted, stored age-encrypted on the agent, written `0600` into the checkout at deploy time.
+- **Encrypted secrets** — `.env` plus arbitrary secret files, sent encrypted, stored age-encrypted on the agent, written into the checkout at deploy time (`.env` `0600`, secret files `0644` by default, both overridable with `[secrets].file_mode`).
 - **Cloudflare Tunnel ingress** — one command installs `cloudflared`, creates or adopts the tunnel, and manages DNS entirely through the Cloudflare API. Hand-built tunnels are adopted without a rewrite or downtime.
 - **Stable ports & health checks** — the agent allocates a stable host port per project, writes a Compose override, and probes HTTP (or TCP) before declaring success.
 - **Latest-wins deploy queue** — a newer deploy supersedes the one in flight; `rpi deploy --cancel` aborts.
@@ -283,6 +283,7 @@ env = ".env"                    # optional, default ".env"
 files = [                       # optional; recreated at the same paths on the Pi
   "certs/server.pem",
 ]
+# file_mode = "0640"            # optional override; default: 0644 for files, 0600 for .env
 
 [timeouts]                      # optional per-project overrides
 fetch = "3m"
@@ -296,7 +297,8 @@ For a worker, bot, or internal service that needs no public HTTP ingress, simply
 Field notes:
 
 - `healthcheck.path` is probed through the allocated host port; without a path the agent uses a TCP probe.
-- `secrets.files` are sent encrypted, stored age-encrypted on the agent, and written `0600` into the checkout on every deploy. Paths are relative with forward slashes; `..` is rejected.
+- `secrets.files` are sent encrypted, stored age-encrypted on the agent, and written `0644` (readable beyond the agent's own account, because a container running as its image's own uid needs to read a bind-mounted secret) into the checkout on every deploy; `secrets.env`'s `.env` file stays `0600`. Paths are relative with forward slashes; `..` is rejected.
+- `secrets.file_mode` overrides both of the modes above with one value — accepted forms are `"0644"`/`"644"` (owner read, optionally write; group/other read only; no execute or setuid/setgid/sticky bits). It requires an agent `>= 0.26.0` (the `secret-modes` capability) and, since the mode travels with the bundle, only takes effect on the next `rpi secrets send` — a `rpi deploy` that reuses an already-stored bundle keeps whatever mode that bundle was sent with.
 - `expose = "lan"` binds the host port on `0.0.0.0`. On a host with a public IPv4 that means the public internet, and Docker bypasses host firewalls (UFW/iptables) for published ports — use it only on trusted networks or behind an external firewall.
 
 ### `[commands]` — admin commands (optional)
@@ -387,6 +389,8 @@ rpi secrets ls            # list stored env keys and file paths (never values)
 ```
 
 The CLI reads the local env file and `[secrets].files`, sends them encrypted, and the agent stores an age-encrypted bundle in `/var/lib/rpi/secrets`. During `rpi deploy` the agent writes them into the project workdir before running Docker Compose.
+
+By default `.env` is written `0600` and every file from `[secrets].files` is written `0644` — deliberately wider, because a container that consumes a bind-mounted secret usually runs as its own image's uid, not the agent's, and Docker has no way to `chown`/`chmod` a `file:`-sourced Compose secret on its own. Set `[secrets].file_mode` (see the sample above) to use one mode for both instead; it requires an agent `>= 0.26.0`. **The mode travels with the bundle**, so changing `file_mode` only takes effect the next time you actually send it — `rpi secrets send` (or `--apply`) — not on a plain `rpi deploy`, which just reuses whatever bundle (and mode) is already stored.
 
 ## Private Git Repositories
 
@@ -510,8 +514,8 @@ sudo useradd --system --no-create-home --shell /usr/sbin/nologin rpi-agent || tr
 sudo usermod -aG docker rpi-agent
 sudo usermod -aG rpi-agent "$USER"   # tunnel access to the socket; re-login after
 
-sudo mkdir -p /var/lib/rpi /etc/rpi
-sudo chown -R rpi-agent:rpi-agent /var/lib/rpi
+sudo install -d -m 0750 -o rpi-agent -g rpi-agent /var/lib/rpi
+sudo mkdir -p /etc/rpi
 ```
 
 Create `/etc/rpi/agent.toml`:

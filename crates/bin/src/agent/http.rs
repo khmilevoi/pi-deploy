@@ -748,6 +748,7 @@ async fn send_env_handler(
     let bundle = SecretsBundle {
         vars: req.vars,
         files: std::collections::BTreeMap::new(),
+        file_mode: None,
     };
     let saved = state
         .send_secrets
@@ -821,9 +822,14 @@ async fn send_secrets_handler(
         }
         files.insert(path.clone(), bytes);
     }
+    if let Some(mode) = req.file_mode {
+        pi_domain::secretmode::validate(mode)
+            .map_err(|e| ApiError(DomainError::Invalid(format!("[secrets].file_mode: {e}"))))?;
+    }
     let bundle = SecretsBundle {
         vars: req.vars,
         files,
+        file_mode: req.file_mode,
     };
     let saved = state
         .send_secrets
@@ -850,6 +856,7 @@ async fn list_secrets_handler(
     Ok(Json(SecretsListResponse {
         keys: stored.keys,
         files: stored.files,
+        file_mode: Some(stored.file_mode),
     }))
 }
 
@@ -1136,6 +1143,7 @@ mod tests {
             disk,
             projects.clone(),
             env!("CARGO_PKG_VERSION").to_string(),
+            dir.to_string_lossy().into_owned(),
             85,
             false,
             false,
@@ -1923,6 +1931,42 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["keys"], serde_json::json!(["DB_PASSWORD"]));
         assert_eq!(json["files"], serde_json::json!(["certs/server.pem"]));
+    }
+
+    #[tokio::test]
+    async fn secrets_send_rejects_an_invalid_file_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = router(state_with(
+            dir.path(),
+            Arc::new(ok_source()),
+            Arc::new(ok_runtime()),
+        ));
+        let body = serde_json::json!({
+            "vars": { "DB_PASSWORD": "hunter2-long" },
+            "files": {},
+            "file_mode": 0o755,
+            "apply": false
+        });
+        let (status, _) = request(app, put_json("/v1/projects/rateme/secrets", &body)).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn secrets_send_accepts_a_valid_file_mode() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = router(state_with(
+            dir.path(),
+            Arc::new(ok_source()),
+            Arc::new(ok_runtime()),
+        ));
+        let body = serde_json::json!({
+            "vars": { "DB_PASSWORD": "hunter2-long" },
+            "files": {},
+            "file_mode": 0o640,
+            "apply": false
+        });
+        let (status, json) = request(app, put_json("/v1/projects/rateme/secrets", &body)).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
     }
 
     #[tokio::test]

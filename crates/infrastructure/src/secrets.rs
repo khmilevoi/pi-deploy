@@ -24,6 +24,10 @@ struct StoredBundle {
     vars: BTreeMap<String, String>,
     #[serde(default)]
     files: BTreeMap<String, String>,
+    /// Absent in bundles written before 0.26.0 — those load as `None` and get
+    /// the defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    file_mode: Option<u32>,
 }
 
 /// age-encrypted bundles at <data_dir>/secrets/<project>.secrets.age (legacy
@@ -103,6 +107,7 @@ impl SecretStore for EncryptedFileStore {
                     )
                 })
                 .collect(),
+            file_mode: bundle.file_mode,
         };
         let plaintext = serde_json::to_vec(&stored).map_err(secrets_err)?;
         let ciphertext =
@@ -110,7 +115,7 @@ impl SecretStore for EncryptedFileStore {
         let path = self.bundle_path(project)?;
         let legacy = self.legacy_path(project)?;
         tokio::task::spawn_blocking(move || {
-            fsutil::write_private_atomic(&path, &ciphertext).map_err(secrets_err)?;
+            fsutil::write_private_atomic(&path, &ciphertext, 0o600).map_err(secrets_err)?;
             match fs::remove_file(&legacy) {
                 Ok(()) => Ok(()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
@@ -137,6 +142,7 @@ impl SecretStore for EncryptedFileStore {
                 Ok(SecretsBundle {
                     vars: stored.vars,
                     files,
+                    file_mode: stored.file_mode,
                 })
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -335,6 +341,28 @@ mod tests {
             store.identity.to_public().to_string(),
             identity.to_public().to_string()
         );
+    }
+
+    #[tokio::test]
+    async fn file_mode_survives_a_save_load_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EncryptedFileStore::open(dir.path()).unwrap();
+        let mut b = bundle();
+        b.file_mode = Some(0o640);
+        store.save("rateme", &b).await.unwrap();
+        let loaded = store.load("rateme").await.unwrap();
+        assert_eq!(loaded.file_mode, Some(0o640));
+    }
+
+    #[tokio::test]
+    async fn a_bundle_stored_before_modes_existed_loads_with_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = EncryptedFileStore::open(dir.path()).unwrap();
+        store.save("rateme", &bundle()).await.unwrap();
+        let loaded = store.load("rateme").await.unwrap();
+        assert_eq!(loaded.file_mode, None);
+        assert_eq!(loaded.secret_file_mode(), 0o644);
+        assert_eq!(loaded.env_mode(), 0o600);
     }
 
     #[cfg(unix)]

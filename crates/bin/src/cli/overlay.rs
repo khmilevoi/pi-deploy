@@ -147,6 +147,7 @@ pub struct OverlayHealthcheck {
 pub struct OverlaySecrets {
     pub env: Option<String>,
     pub files: Option<Vec<String>>,
+    pub file_mode: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -387,6 +388,9 @@ pub fn apply_overlay(base: &mut RpiToml, overlay: RpiTomlOverlay) {
         }
         if let Some(files) = s.files {
             base.secrets.files = files;
+        }
+        if let Some(mode) = s.file_mode {
+            base.secrets.file_mode = reset_or(mode);
         }
     }
     if let Some(commands) = overlay.commands {
@@ -655,6 +659,15 @@ seed = "node seed.js"
         let o = overlay("[secrets]\nfiles = [\"c.pem\"]\n");
         apply_overlay(&mut base, o);
         assert_eq!(base.secrets.files, vec!["c.pem".to_string()]);
+    }
+
+    #[test]
+    fn overlay_sets_and_resets_secrets_file_mode() {
+        let mut base = crate::cli::rpitoml::RpiToml::parse(BASE).unwrap();
+        apply_overlay(&mut base, overlay("[secrets]\nfile_mode = \"0640\"\n"));
+        assert_eq!(base.secrets.file_mode.as_deref(), Some("0640"));
+        apply_overlay(&mut base, overlay("[secrets]\nfile_mode = \"\"\n"));
+        assert_eq!(base.secrets.file_mode, None);
     }
 
     #[test]

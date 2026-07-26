@@ -1,7 +1,8 @@
 //! Atomic, owner-only file writes shared by adapters that persist sensitive
 //! data (secret key/bundles, workdir `.env`): files are born `0600` (§10,
-//! §17) and replaced via temp + rename so readers never observe a partial
-//! write or a permission window.
+//! §17) and widened to the caller's requested mode only once their contents
+//! are on disk, then replaced via temp + rename so readers never observe a
+//! partial write or a permission window.
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{ErrorKind, Write};
@@ -64,14 +65,63 @@ pub(crate) fn write_private_exclusive(path: &Path, contents: &[u8]) -> std::io::
     }
 }
 
-/// Replaces `path` with fresh `0600` contents atomically (temp + rename).
-pub(crate) fn write_private_atomic(path: &Path, contents: &[u8]) -> std::io::Result<()> {
+/// Replaces `path` atomically (temp + rename) with `contents` at `mode`.
+///
+/// The temp file is born `0600` and only widened once its contents are on
+/// disk, so no reader can ever observe a partially written file at the final
+/// mode. `set_permissions` rather than `OpenOptions::mode` because the latter
+/// is masked by the process umask, and the result must not depend on what the
+/// unit happens to set.
+pub(crate) fn write_private_atomic(path: &Path, contents: &[u8], mode: u32) -> std::io::Result<()> {
     let dir = parent_dir(path)?;
     let prefix = temp_prefix(path, "private");
     let temp_path = write_temp_private(dir, &prefix, contents)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        if let Err(e) = fs::set_permissions(&temp_path, fs::Permissions::from_mode(mode)) {
+            let _ = fs::remove_file(&temp_path);
+            return Err(e);
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
     if let Err(e) = fs::rename(&temp_path, path) {
         let _ = fs::remove_file(&temp_path);
         return Err(e);
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    // Both tests below are unix-only, so this import is unused (and would
+    // warn under `-D warnings`) on non-unix targets without the same gate.
+    #[cfg(unix)]
+    use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn writes_with_the_requested_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        write_private_atomic(&path, b"x", 0o644).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o644);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn replacing_a_wider_file_narrows_it_to_the_requested_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f");
+        std::fs::write(&path, b"old").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o666)).unwrap();
+        write_private_atomic(&path, b"new", 0o600).unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(std::fs::read(&path).unwrap(), b"new");
+    }
 }

@@ -153,6 +153,9 @@ pub struct SecretsSendRequest {
     /// Relative path (forward slashes) -> base64-encoded contents.
     #[serde(default)]
     pub files: BTreeMap<String, String>,
+    /// `[secrets].file_mode`, already parsed. Absent -> agent defaults.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_mode: Option<u32>,
     #[serde(default)]
     pub apply: bool,
 }
@@ -168,6 +171,10 @@ pub struct SecretsSendResponse {
 pub struct SecretsListResponse {
     pub keys: Vec<String>,
     pub files: Vec<String>,
+    /// Absent from agents older than 0.26.0 — the CLI then prints no mode
+    /// line rather than guessing a value that host never wrote.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_mode: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
