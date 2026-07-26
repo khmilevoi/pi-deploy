@@ -41,6 +41,11 @@ pub async fn deploy(
         compat.gate(crate::compat::Feature::Environments)?;
     }
 
+    // Degradable: an old agent still deploys, it just injects no RPI_*.
+    // A hard gate would break working deploys over a dependency the
+    // configuration can no longer even express, since RPI_* are runtime-only.
+    let _ = compat.gate(crate::compat::Feature::RuntimeVars)?;
+
     if compat.gate(crate::compat::Feature::SourceCheck)? {
         crate::cli::sourcekey::preflight(
             &crate::cli::sourcekey::GhCli,
