@@ -51,6 +51,8 @@ pub struct ProjectDto {
     pub timeouts: Option<TimeoutsDto>,
     #[serde(default)]
     pub commands: BTreeMap<String, CommandSpec>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub secret_groups: Vec<String>,
 }
 
 impl From<ProjectDto> for ProjectConfig {
@@ -89,6 +91,7 @@ impl From<ProjectDto> for ProjectConfig {
             command_timeout_secs,
             // The handler fills this in from the request's `environment` block.
             environment: None,
+            secret_groups: dto.secret_groups,
         }
     }
 }
@@ -116,6 +119,7 @@ impl From<&ProjectConfig> for ProjectDto {
                 command_secs: config.command_timeout_secs,
             }),
             commands: config.commands.clone(),
+            secret_groups: config.secret_groups.clone(),
         }
     }
 }
@@ -145,7 +149,12 @@ pub struct EnvKeysResponse {
 /// Secrets bundle limits, enforced by the CLI before upload and re-checked
 /// by the agent (secrets spec §2.7). Decoded byte sizes.
 pub const MAX_SECRET_FILE_BYTES: usize = 1024 * 1024;
-pub const MAX_SECRETS_BUNDLE_BYTES: usize = 8 * 1024 * 1024;
+
+/// The 8 MiB total, re-exported under the name this module has always used.
+/// The definition lives in `pi_domain::secretgroup`, so the ceiling on a
+/// payload accepted here is the same number that bounds a stored group and a
+/// merged set — one constant, not three that could drift.
+pub use pi_domain::secretgroup::MAX_SECRET_BUNDLE_BYTES as MAX_SECRETS_BUNDLE_BYTES;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecretsSendRequest {
@@ -156,6 +165,11 @@ pub struct SecretsSendRequest {
     /// `[secrets].file_mode`, already parsed. Absent -> agent defaults.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_mode: Option<u32>,
+    /// Write only if the stored revision equals this. Absent means an
+    /// unconditional write — which is what every CLI before 0.27.0 sends, so
+    /// the guard is opt-in on this path and never breaks an old client.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
     #[serde(default)]
     pub apply: bool,
 }
@@ -165,6 +179,8 @@ pub struct SecretsSendResponse {
     pub saved_keys: usize,
     pub saved_files: usize,
     pub applied: bool,
+    #[serde(default)]
+    pub revision: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -175,6 +191,84 @@ pub struct SecretsListResponse {
     /// line rather than guessing a value that host never wrote.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_mode: Option<u32>,
+    /// Absent from agents older than 0.27.0 — the CLI then prints the flat
+    /// list it always printed rather than inventing provenance.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layers: Vec<SecretLayerDto>,
+}
+
+/// One layer of the effective view (secret-groups spec: Attachment and
+/// layering). Names only — a layer never carries values.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretLayerDto {
+    pub label: String,
+    pub revision: u64,
+    pub vars: Vec<String>,
+    pub files: Vec<String>,
+}
+
+/// `PUT /v1/projects/{base}/secret-groups/{group}` (secret-groups spec).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretGroupPushRequest {
+    pub vars: BTreeMap<String, String>,
+    /// Relative path (forward slashes) -> base64-encoded contents.
+    #[serde(default)]
+    pub files: BTreeMap<String, String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_mode: Option<u32>,
+    /// Write only if the stored revision equals this. Absent means an
+    /// unconditional write (`--force`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_revision: Option<u64>,
+    /// Upsert instead of replacing the group wholesale.
+    #[serde(default)]
+    pub merge: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretGroupPushResponse {
+    pub revision: u64,
+    pub keys: usize,
+    pub files: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretFileHeadDto {
+    pub size: u64,
+    pub digest: String,
+}
+
+/// Metadata projection. Never contains a value.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretGroupHeadResponse {
+    pub revision: u64,
+    /// var name -> digest
+    pub vars: BTreeMap<String, String>,
+    pub files: BTreeMap<String, SecretFileHeadDto>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub file_mode: Option<u32>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretGroupSummaryDto {
+    pub name: String,
+    pub revision: u64,
+    pub keys: usize,
+    pub files: usize,
+    pub bytes: u64,
+    pub updated_at: i64,
+    pub attached_by: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretGroupsListResponse {
+    pub groups: Vec<SecretGroupSummaryDto>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretsApplyResponse {
+    pub keys: usize,
+    pub files: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -578,6 +672,7 @@ mod tests {
             healthcheck: None,
             timeouts: None,
             commands: BTreeMap::new(),
+            secret_groups: Vec::new(),
         }
         .into();
         config.healthcheck.path = Some("/health".into());
@@ -686,6 +781,7 @@ mod tests {
             commands: Default::default(),
             command_timeout_secs: Some(1800),
             environment: None,
+            secret_groups: Vec::new(),
         };
         config.commands.insert(
             "migrate".into(),
@@ -716,6 +812,7 @@ mod tests {
             commands: Default::default(),
             command_timeout_secs: None,
             environment: None,
+            secret_groups: Vec::new(),
         };
         config.commands.insert(
             "create-invite".into(),

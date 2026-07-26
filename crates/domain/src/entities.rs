@@ -272,6 +272,10 @@ pub struct ProjectConfig {
     /// Environment overlay metadata from the deploy request's `environment`
     /// block. `None` for plain (non-overlay) deploys.
     pub environment: Option<EnvironmentMeta>,
+    /// Declared secret groups, in attachment order (secret-groups spec).
+    /// Empty means only the deploy key's own bundle is injected — the
+    /// behavior of every version before groups existed.
+    pub secret_groups: Vec<String>,
 }
 
 /// Registered project: config + allocated host port (§4).

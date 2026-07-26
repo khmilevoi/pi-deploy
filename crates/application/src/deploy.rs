@@ -266,16 +266,26 @@ impl DeployProject {
         .await?;
         log.line(&format!("fetched {}", fetched.commit_sha));
 
-        // secrets spec §7: decrypt -> arm masking -> inject .env + secret files
-        let bundle = self.secrets.load(&config.name).await?;
+        // secret-groups spec: declared groups in order, then this deploy
+        // key's own bundle on top, then one merged injection.
+        let merged = crate::effective_secrets(self.secrets.as_ref(), config).await?;
+        // Arm on the merged bundle: a value contributed by any layer must be
+        // masked in container output, not only one that arrived in the push.
+        masker.arm(&merged.bundle);
+        let provenance: Vec<String> = merged
+            .revisions
+            .iter()
+            .map(|(label, r)| format!("{label}@r{r}"))
+            .collect();
+        let bundle = merged.bundle;
         if !bundle.is_empty() {
-            masker.arm(&bundle);
             self.secrets_writer.write(&fetched.workdir, &bundle).await?;
             log.line(&format!(
-                "secrets injected ({} keys, {} files, mode {:04o})",
+                "secrets injected ({} keys, {} files, mode {:04o}; groups: {})",
                 bundle.vars.len(),
                 bundle.files.len(),
-                bundle.secret_file_mode()
+                bundle.secret_file_mode(),
+                provenance.join(", ")
             ));
         }
 
@@ -499,10 +509,11 @@ mod tests {
         MockSecretStore, MockSecretsWriter, MockSource,
     };
     use pi_domain::entities::{
-        DeployRef, DeploymentStatus, ExposeMode, FetchedSource, HealthcheckConfig, Project,
-        ProjectConfig, SecretsBundle, StageTimeoutOverrides, StageTimeouts,
+        DeployRef, DeploymentStatus, EnvironmentMeta, ExposeMode, FetchedSource, HealthcheckConfig,
+        Project, ProjectConfig, SecretsBundle, StageTimeoutOverrides, StageTimeouts,
     };
     use pi_domain::error::DomainError;
+    use pi_domain::secretgroup::{GroupRef, SecretGroup};
     use std::{
         path::{Path, PathBuf},
         sync::{Arc, Mutex},
@@ -523,6 +534,7 @@ mod tests {
             commands: Default::default(),
             command_timeout_secs: None,
             environment: None,
+            secret_groups: Vec::new(),
         }
     }
 
@@ -621,7 +633,7 @@ mod tests {
         let stage_order = Arc::clone(&order);
         m.secrets.expect_load().times(1).returning(move |_| {
             stage_order.lock().unwrap().push("secrets");
-            Ok(SecretsBundle::default())
+            Ok(SecretGroup::default())
         });
         // empty bundle -> .env must NOT be written
         m.secrets_writer.expect_write().times(0);
@@ -827,7 +839,7 @@ mod tests {
         });
         m.secrets
             .expect_load()
-            .returning(|_| Ok(SecretsBundle::default()));
+            .returning(|_| Ok(SecretGroup::default()));
         m.secrets_writer.expect_write().times(0);
         m.runtime
             .expect_services()
@@ -873,7 +885,7 @@ mod tests {
         ok_pre_stages(&mut m);
         m.secrets
             .expect_load()
-            .returning(|_| Ok(SecretsBundle::default()));
+            .returning(|_| Ok(SecretGroup::default()));
         m.secrets_writer.expect_write().times(0);
         m.runtime.expect_build().returning(|_, _| Ok(()));
         m.runtime.expect_up().returning(|_, _| Ok(()));
@@ -914,7 +926,7 @@ mod tests {
         ok_pre_stages(&mut m);
         m.secrets
             .expect_load()
-            .returning(|_| Ok(SecretsBundle::default()));
+            .returning(|_| Ok(SecretGroup::default()));
         m.secrets_writer.expect_write().times(0);
         m.runtime.expect_build().returning(|_, _| Ok(()));
         m.runtime.expect_up().returning(|_, _| Ok(()));
@@ -953,7 +965,7 @@ mod tests {
         ok_pre_stages(&mut m);
         m.secrets
             .expect_load()
-            .returning(|_| Ok(SecretsBundle::default()));
+            .returning(|_| Ok(SecretGroup::default()));
         m.secrets_writer.expect_write().times(0);
         m.runtime.expect_build().returning(|_, _| Ok(()));
         m.runtime.expect_up().returning(|_, _| Ok(()));
@@ -1047,7 +1059,7 @@ mod tests {
         });
         m.secrets
             .expect_load()
-            .returning(|_| Ok(SecretsBundle::default()));
+            .returning(|_| Ok(SecretGroup::default()));
         m.secrets_writer.expect_write().times(0);
         m.runtime
             .expect_services()
@@ -1102,6 +1114,34 @@ mod tests {
         b.files
             .insert("certs/server.pem".into(), b"PEM-BODY".to_vec());
         b
+    }
+
+    fn config_with_groups(groups: Vec<String>) -> ProjectConfig {
+        ProjectConfig {
+            secret_groups: groups,
+            ..sample_config()
+        }
+    }
+
+    fn set_env_base(config: &mut ProjectConfig, base: &str) {
+        config.environment = Some(EnvironmentMeta {
+            env: "branch".into(),
+            base: base.into(),
+            slug: Some("x".into()),
+            ttl_secs: None,
+            on_create: None,
+        });
+    }
+
+    fn group_with(vars: &[(&str, &str)]) -> SecretGroup {
+        let mut objects = SecretsBundle::default();
+        for (k, v) in vars {
+            objects.vars.insert((*k).into(), (*v).into());
+        }
+        SecretGroup {
+            objects,
+            revision: 1,
+        }
     }
 
     fn ok_pre_stages(m: &mut Mocks) {
@@ -1227,7 +1267,12 @@ mod tests {
     async fn stored_bundle_is_written_to_workdir_and_masked_in_logs() {
         let mut m = mocks();
         ok_pre_stages(&mut m);
-        m.secrets.expect_load().returning(|_| Ok(secret_bundle()));
+        m.secrets.expect_load().returning(|_| {
+            Ok(SecretGroup {
+                objects: secret_bundle(),
+                revision: 1,
+            })
+        });
         m.secrets_writer
             .expect_write()
             .withf(|wd, b| {
@@ -1262,9 +1307,13 @@ mod tests {
             .unwrap();
 
         assert_eq!(result.status, DeploymentStatus::Success);
-        assert!(result
-            .log_tail
-            .contains("secrets injected (1 keys, 1 files, mode 0644)"));
+        assert!(
+            result
+                .log_tail
+                .contains("secrets injected (1 keys, 1 files, mode 0644; groups: key@r1)"),
+            "tail: {}",
+            result.log_tail
+        );
         assert!(
             result.log_tail.contains("***DB_PASSWORD***"),
             "tail: {}",
@@ -1288,7 +1337,7 @@ mod tests {
         ok_pre_stages(&mut m);
         m.secrets
             .expect_load()
-            .returning(|_| Ok(SecretsBundle::default()));
+            .returning(|_| Ok(SecretGroup::default()));
         m.secrets_writer.expect_write().times(0);
         m.runtime.expect_build().returning(|_, _| Ok(()));
         m.runtime.expect_up().returning(|_, _| Ok(()));
@@ -1323,7 +1372,7 @@ mod tests {
         ok_pre_stages(&mut m);
         m.secrets
             .expect_load()
-            .returning(|_| Ok(SecretsBundle::default()));
+            .returning(|_| Ok(SecretGroup::default()));
         m.secrets_writer.expect_write().times(0);
         m.runtime.expect_build().returning(|_, _| Ok(()));
         m.runtime.expect_up().returning(|_, _| Ok(()));
@@ -1371,7 +1420,7 @@ mod tests {
         });
         m.secrets
             .expect_load()
-            .returning(|_| Ok(SecretsBundle::default()));
+            .returning(|_| Ok(SecretGroup::default()));
         m.runtime
             .expect_services()
             .returning(|_| Ok(vec!["web".into()]));
@@ -1642,7 +1691,7 @@ mod tests {
         });
         m.secrets
             .expect_load()
-            .returning(|_| Ok(SecretsBundle::default()));
+            .returning(|_| Ok(SecretGroup::default()));
         m.secrets_writer.expect_write().times(0);
         // CountingRuntime resolves `services` itself; only the override path
         // still comes from a mock here.
@@ -1721,7 +1770,7 @@ mod tests {
         ok_pre_stages(&mut m);
         m.secrets
             .expect_load()
-            .returning(|_| Ok(SecretsBundle::default()));
+            .returning(|_| Ok(SecretGroup::default()));
         m.secrets_writer.expect_write().times(0);
         m.runtime.expect_build().returning(|_, _| Ok(()));
         m.runtime.expect_up().returning(|_, _| Ok(()));
@@ -1761,7 +1810,7 @@ mod tests {
         ok_pre_stages(&mut m);
         m.secrets
             .expect_load()
-            .returning(|_| Ok(SecretsBundle::default()));
+            .returning(|_| Ok(SecretGroup::default()));
         m.runtime
             .expect_build()
             .returning(|_, _| Err(DomainError::Runtime("compose build exited with 1".into())));
@@ -1792,7 +1841,7 @@ mod tests {
         ok_pre_stages(&mut m);
         m.secrets
             .expect_load()
-            .returning(|_| Ok(SecretsBundle::default()));
+            .returning(|_| Ok(SecretGroup::default()));
         m.runtime.expect_build().returning(|_, _| Ok(()));
         m.runtime.expect_up().returning(|_, _| Ok(()));
         m.runtime.expect_ps().returning(|_| Ok(vec![]));
@@ -1828,7 +1877,7 @@ mod tests {
         ok_pre_stages(&mut m);
         m.secrets
             .expect_load()
-            .returning(|_| Ok(SecretsBundle::default()));
+            .returning(|_| Ok(SecretGroup::default()));
         m.runtime.expect_build().returning(|_, _| Ok(()));
         m.runtime.expect_up().returning(|_, _| Ok(()));
         m.runtime.expect_ps().returning(|_| Ok(vec![]));
@@ -1869,7 +1918,7 @@ mod tests {
         ok_pre_stages(&mut m);
         m.secrets
             .expect_load()
-            .returning(|_| Ok(SecretsBundle::default()));
+            .returning(|_| Ok(SecretGroup::default()));
         m.runtime.expect_build().returning(|_, _| Ok(()));
         m.runtime.expect_up().returning(|_, _| Ok(()));
         m.runtime.expect_ps().returning(|_| Ok(vec![]));
@@ -1945,7 +1994,7 @@ mod tests {
         });
         m.secrets
             .expect_load()
-            .returning(|_| Ok(SecretsBundle::default()));
+            .returning(|_| Ok(SecretGroup::default()));
         m.secrets_writer.expect_write().times(0);
         m.runtime
             .expect_services()
@@ -2017,7 +2066,7 @@ mod tests {
         });
         m.secrets
             .expect_load()
-            .returning(|_| Ok(SecretsBundle::default()));
+            .returning(|_| Ok(SecretGroup::default()));
         m.secrets_writer.expect_write().times(0);
         m.runtime
             .expect_services()
@@ -2077,7 +2126,7 @@ mod tests {
         });
         m.secrets
             .expect_load()
-            .returning(|_| Ok(SecretsBundle::default()));
+            .returning(|_| Ok(SecretGroup::default()));
         m.secrets_writer.expect_write().times(0);
         m.runtime
             .expect_services()
@@ -2138,7 +2187,7 @@ mod tests {
             .returning(|_, _, _| Ok(()));
         m.secrets
             .expect_load()
-            .returning(|_| Ok(SecretsBundle::default()));
+            .returning(|_| Ok(SecretGroup::default()));
         m.secrets_writer.expect_write().times(0);
         m.runtime.expect_build().returning(|_, _| Ok(()));
         m.runtime.expect_up().returning(|_, _| Ok(()));
@@ -2183,7 +2232,7 @@ mod tests {
         });
         m.secrets
             .expect_load()
-            .returning(|_| Ok(SecretsBundle::default()));
+            .returning(|_| Ok(SecretGroup::default()));
         m.overrides
             .expect_path()
             .returning(|p| PathBuf::from("/ov").join(p));
@@ -2240,7 +2289,7 @@ mod tests {
         ok_pre_stages_without_override(&mut m);
         m.secrets
             .expect_load()
-            .returning(|_| Ok(SecretsBundle::default()));
+            .returning(|_| Ok(SecretGroup::default()));
         m.runtime
             .expect_services()
             .returning(|_| Err(DomainError::Runtime("compose config: no such file".into())));
@@ -2288,7 +2337,7 @@ mod tests {
         });
         m.secrets
             .expect_load()
-            .returning(|_| Ok(SecretsBundle::default()));
+            .returning(|_| Ok(SecretGroup::default()));
         m.overrides
             .expect_path()
             .returning(|p| PathBuf::from("/ov").join(p));
@@ -2320,5 +2369,159 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn declared_groups_are_injected_in_order_under_the_key_bundle() {
+        let mut m = mocks();
+        ok_pre_stages(&mut m);
+        let mut config = config_with_groups(vec!["common".into(), "preview".into()]);
+        config.name = "myapp--branch--x".into();
+        config.hostname = None;
+        set_env_base(&mut config, "myapp");
+
+        m.secrets.expect_load().returning(|r| match r {
+            GroupRef::Named { base, name } if base == "myapp" && name == "common" => {
+                Ok(group_with(&[("A", "from-common"), ("B", "from-common")]))
+            }
+            GroupRef::Named { base, name } if base == "myapp" && name == "preview" => {
+                Ok(group_with(&[("B", "from-preview")]))
+            }
+            GroupRef::Key(key) if key == "myapp--branch--x" => Ok(group_with(&[("B", "from-key")])),
+            other => panic!("unexpected load({other:?})"),
+        });
+        m.secrets_writer
+            .expect_write()
+            .withf(|_, b| b.vars["A"] == "from-common" && b.vars["B"] == "from-key")
+            .times(1)
+            .returning(|_, _| Ok(()));
+        m.runtime.expect_build().returning(|_, _| Ok(()));
+        m.runtime.expect_up().returning(|_, _| Ok(()));
+        m.runtime.expect_ps().returning(|_| Ok(vec![]));
+        m.health.expect_check().returning(|_, _, _| Ok(()));
+
+        let deploy = build(m);
+        let sink = CollectSink::new();
+        deploy
+            .execute(
+                "dep-groups-order".into(),
+                config,
+                DeployRef::Branch("main".into()),
+                sink.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let lines = sink.lines.lock().unwrap();
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("groups: common@r1, preview@r1, key@r1")),
+            "provenance must be in the log: {lines:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_missing_declared_group_fails_the_deploy_at_the_secrets_stage() {
+        let mut m = mocks();
+        ok_pre_stages(&mut m);
+        let mut config = config_with_groups(vec!["preview".into()]);
+        config.hostname = None;
+        set_env_base(&mut config, "myapp");
+        m.secrets
+            .expect_load()
+            .returning(|_| Ok(SecretGroup::default()));
+        m.secrets_writer.expect_write().times(0);
+        m.runtime.expect_build().times(0);
+
+        let deploy = build(m);
+        let err = deploy
+            .execute(
+                "dep-missing-group".into(),
+                config,
+                DeployRef::Branch("main".into()),
+                CollectSink::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, DomainError::NotFound(_)), "got: {err}");
+        assert!(err.to_string().contains("preview"), "got: {err}");
+    }
+
+    #[tokio::test]
+    async fn masking_is_armed_on_values_that_came_from_a_group() {
+        let mut m = mocks();
+        ok_pre_stages(&mut m);
+        let mut config = config_with_groups(vec!["preview".into()]);
+        config.hostname = None;
+        set_env_base(&mut config, "myapp");
+        m.secrets.expect_load().returning(|r| match r {
+            GroupRef::Named { .. } => Ok(group_with(&[("DB_PASSWORD", "group-secret-value")])),
+            GroupRef::Key(_) => Ok(SecretGroup::default()),
+        });
+        m.secrets_writer.expect_write().returning(|_, _| Ok(()));
+        m.runtime.expect_build().returning(|_, _| Ok(()));
+        m.runtime.expect_up().returning(|_, log| {
+            log.line("starting with group-secret-value");
+            Ok(())
+        });
+        m.runtime.expect_ps().returning(|_| Ok(vec![]));
+        m.health.expect_check().returning(|_, _, _| Ok(()));
+
+        let deploy = build(m);
+        let sink = CollectSink::new();
+        deploy
+            .execute(
+                "dep-mask-group".into(),
+                config,
+                DeployRef::Branch("main".into()),
+                sink.clone(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+
+        let lines = sink.lines.lock().unwrap();
+        assert!(
+            !lines.iter().any(|l| l.contains("group-secret-value")),
+            "a group's value leaked into container output: {lines:?}"
+        );
+        assert!(lines.iter().any(|l| l.contains("***DB_PASSWORD***")));
+    }
+
+    #[tokio::test]
+    async fn a_base_project_resolves_groups_under_its_own_name() {
+        let mut m = mocks();
+        ok_pre_stages(&mut m);
+        let mut config = config_with_groups(vec!["common".into()]);
+        config.name = "myapp".into();
+        config.environment = None;
+        config.hostname = None;
+        m.secrets.expect_load().returning(|r| match r {
+            GroupRef::Named { base, .. } if base == "myapp" => Ok(group_with(&[("A", "1")])),
+            GroupRef::Key(_) => Ok(SecretGroup::default()),
+            other => panic!("unexpected load({other:?})"),
+        });
+        m.secrets_writer.expect_write().returning(|_, _| Ok(()));
+        m.runtime.expect_build().returning(|_, _| Ok(()));
+        m.runtime.expect_up().returning(|_, _| Ok(()));
+        m.runtime.expect_ps().returning(|_| Ok(vec![]));
+        m.health.expect_check().returning(|_, _, _| Ok(()));
+
+        let deploy = build(m);
+        let result = deploy
+            .execute(
+                "dep-base-group".into(),
+                config,
+                DeployRef::Branch("main".into()),
+                CollectSink::new(),
+                CancellationToken::new(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(result.status, DeploymentStatus::Success);
     }
 }

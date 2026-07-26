@@ -10,7 +10,7 @@ use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 
 use crate::sqlite::{storage_err, Db};
 
-const SELECT: &str = "SELECT name, repo, branch, compose_path, service, container_port, hostname, host_port, created_at, expose, commands, command_timeout_secs, env_name, env_base, env_slug, env_ttl_secs, env_on_create, env_on_create_done, last_success_at, last_commit_sha FROM projects";
+const SELECT: &str = "SELECT name, repo, branch, compose_path, service, container_port, hostname, host_port, created_at, expose, commands, command_timeout_secs, env_name, env_base, env_slug, env_ttl_secs, env_on_create, env_on_create_done, last_success_at, last_commit_sha, secret_groups FROM projects";
 
 pub struct SqliteProjectRepo {
     db: Db,
@@ -54,6 +54,7 @@ fn row_to_project(row: &rusqlite::Row<'_>) -> Result<Project, rusqlite::Error> {
             commands: serde_json::from_str(&row.get::<_, String>(10)?).unwrap_or_default(),
             command_timeout_secs: row.get(11)?,
             environment,
+            secret_groups: serde_json::from_str(&row.get::<_, String>(20)?).unwrap_or_default(),
         },
         host_port: row.get(7)?,
         created_at: row.get(8)?,
@@ -123,9 +124,11 @@ impl ProjectRepository for SqliteProjectRepo {
                     ),
                     None => (None, None, None, None, None),
                 };
+                let secret_groups = serde_json::to_string(&config.secret_groups)
+                    .unwrap_or_else(|_| "[]".into());
                 if exists.is_some() {
                     tx.execute(
-                        "UPDATE projects SET repo=?2, branch=?3, compose_path=?4, service=?5, container_port=?6, hostname=?7, expose=?8, commands=?9, command_timeout_secs=?10, env_name=?11, env_base=?12, env_slug=?13, env_ttl_secs=?14, env_on_create=?15 WHERE name=?1",
+                        "UPDATE projects SET repo=?2, branch=?3, compose_path=?4, service=?5, container_port=?6, hostname=?7, expose=?8, commands=?9, command_timeout_secs=?10, env_name=?11, env_base=?12, env_slug=?13, env_ttl_secs=?14, env_on_create=?15, secret_groups=?16 WHERE name=?1",
                         params![
                             &config.name,
                             &config.repo,
@@ -143,14 +146,15 @@ impl ProjectRepository for SqliteProjectRepo {
                             env_slug,
                             env_ttl_secs,
                             env_on_create,
+                            secret_groups,
                         ],
                     )
                     .map_err(storage_err)?;
                 } else {
                     let port = allocate_port(&tx, min, max)?;
                     tx.execute(
-                        "INSERT INTO projects (name, repo, branch, compose_path, service, container_port, hostname, host_port, created_at, expose, commands, command_timeout_secs, env_name, env_base, env_slug, env_ttl_secs, env_on_create)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, unixepoch(), ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+                        "INSERT INTO projects (name, repo, branch, compose_path, service, container_port, hostname, host_port, created_at, expose, commands, command_timeout_secs, env_name, env_base, env_slug, env_ttl_secs, env_on_create, secret_groups)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, unixepoch(), ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
                         params![
                             &config.name,
                             &config.repo,
@@ -169,6 +173,7 @@ impl ProjectRepository for SqliteProjectRepo {
                             env_slug,
                             env_ttl_secs,
                             env_on_create,
+                            secret_groups,
                         ],
                     )
                     .map_err(storage_err)?;
@@ -327,6 +332,7 @@ mod tests {
             commands: Default::default(),
             command_timeout_secs: None,
             environment: None,
+            secret_groups: Vec::new(),
         }
     }
 
@@ -561,5 +567,82 @@ mod tests {
         let mine = repo.list_environments(Some("myapp")).await.unwrap();
         assert_eq!(mine.len(), 1);
         assert_eq!(mine[0].config.name, "myapp--test");
+    }
+
+    #[tokio::test]
+    async fn secret_groups_round_trip_and_default_to_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = repo(&dir, 8000, 8999);
+        let mut config = cfg("a");
+        config.secret_groups = vec!["common".into(), "preview".into()];
+        repo.upsert(&config).await.unwrap();
+        let loaded = repo.get("a").await.unwrap().unwrap();
+        assert_eq!(
+            loaded.config.secret_groups,
+            vec!["common".to_string(), "preview".to_string()]
+        );
+
+        // Replacing the list wholesale is how an overlay detaches groups.
+        config.secret_groups.clear();
+        repo.upsert(&config).await.unwrap();
+        assert!(repo
+            .get("a")
+            .await
+            .unwrap()
+            .unwrap()
+            .config
+            .secret_groups
+            .is_empty());
+    }
+
+    /// `last_commit_sha` and `secret_groups` are the last two columns of
+    /// `SELECT`, added by two different features at adjacent indices. Reading
+    /// either from the other's index still type-checks (both decode from a
+    /// column), so only distinct values on the same row can catch a swap.
+    #[tokio::test]
+    async fn the_two_last_columns_do_not_cross_over() {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = repo(&dir, 8000, 8999);
+        let mut config = cfg("a");
+        config.secret_groups = vec!["common".into()];
+        repo.upsert(&config).await.unwrap();
+        repo.mark_deploy_success("a", 7, Some("deadbeef"))
+            .await
+            .unwrap();
+
+        let p = repo.get("a").await.unwrap().unwrap();
+        assert_eq!(p.last_commit_sha.as_deref(), Some("deadbeef"));
+        assert_eq!(p.config.secret_groups, vec!["common".to_string()]);
+
+        // A re-upsert rewrites the groups without touching the sha: the two
+        // columns must still be independent after the UPDATE path, not only
+        // after the INSERT one.
+        config.secret_groups = vec!["preview".into()];
+        repo.upsert(&config).await.unwrap();
+        let p = repo.get("a").await.unwrap().unwrap();
+        assert_eq!(p.last_commit_sha.as_deref(), Some("deadbeef"));
+        assert_eq!(p.config.secret_groups, vec!["preview".to_string()]);
+        assert_eq!(p.last_success_at, Some(7));
+    }
+
+    #[tokio::test]
+    async fn a_row_written_before_the_column_existed_reads_as_no_groups() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = Db::open(&dir.path().join("state.db")).unwrap();
+        db.call(|c| {
+            c.execute(
+                "INSERT INTO projects (name, repo, branch, compose_path, service, container_port, host_port, created_at)
+                 VALUES ('legacy', 'r', 'main', 'docker-compose.yml', 'web', 3000, 8000, 1)",
+                [],
+            )
+            .map_err(storage_err)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let repo = SqliteProjectRepo::new(db, 8000, 8999);
+        let loaded = repo.get("legacy").await.unwrap().unwrap();
+        assert!(loaded.config.secret_groups.is_empty());
     }
 }

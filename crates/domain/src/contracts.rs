@@ -12,6 +12,7 @@ use crate::entities::{
     ServiceState, ServiceStats, StageEvent, StatsReport,
 };
 use crate::error::DomainError;
+use crate::secretgroup::{GroupHead, GroupRef, GroupSummary, SecretGroup};
 
 /// Receiver for line-by-line deployment logs + terminal event.
 /// Implementations: SSE hub of the agent, TailSink in application, stubs in tests.
@@ -200,14 +201,34 @@ pub trait OverrideStore: Send + Sync {
     async fn remove(&self, project: &str) -> Result<(), DomainError>;
 }
 
-/// Store/retrieve the project SecretsBundle, encrypted at rest (§6, §10).
+/// The agent's encrypted vault, addressed by group (secret-groups spec: Data
+/// model). Implementations are the single source of truth for a group's
+/// contents; values never leave the agent except into a project's own
+/// workdir at deploy time.
 #[cfg_attr(feature = "mocks", automock)]
 #[async_trait]
 pub trait SecretStore: Send + Sync {
-    async fn save(&self, project: &str, bundle: &SecretsBundle) -> Result<(), DomainError>;
-    /// Empty bundle when nothing is stored for the project.
-    async fn load(&self, project: &str) -> Result<SecretsBundle, DomainError>;
-    async fn remove(&self, project: &str) -> Result<(), DomainError>;
+    /// Empty bundle at revision 0 when the group does not exist.
+    async fn load(&self, r: &GroupRef) -> Result<SecretGroup, DomainError>;
+    /// Metadata only — never values.
+    async fn head(&self, r: &GroupRef) -> Result<GroupHead, DomainError>;
+    /// `expected: Some(n)` writes only when the current revision is exactly
+    /// `n` (a first write passes `Some(0)`); a mismatch is
+    /// `DomainError::Conflict`. `expected: None` is the unconditional write
+    /// behind `--force`. Returns the new revision, which is always the
+    /// current one plus one — a forced write must not reset the counter.
+    async fn save(
+        &self,
+        r: &GroupRef,
+        objects: &SecretsBundle,
+        expected: Option<u64>,
+    ) -> Result<u64, DomainError>;
+    async fn remove(&self, r: &GroupRef) -> Result<(), DomainError>;
+    /// Declared groups of one base project. Empty when the base has none.
+    async fn list(&self, base: &str) -> Result<Vec<GroupSummary>, DomainError>;
+    /// Drops every declared group of a base project (`rpi rm`). A base with
+    /// no groups is not an error.
+    async fn remove_base(&self, base: &str) -> Result<(), DomainError>;
 }
 
 /// Writes the decrypted bundle into the project workdir: `.env` from vars

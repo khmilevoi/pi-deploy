@@ -60,6 +60,7 @@ fn migrations() -> Migrations<'static> {
         "#,
         ),
         M::up("ALTER TABLE projects ADD COLUMN last_commit_sha TEXT;"),
+        M::up("ALTER TABLE projects ADD COLUMN secret_groups TEXT NOT NULL DEFAULT '[]';"),
     ])
 }
 

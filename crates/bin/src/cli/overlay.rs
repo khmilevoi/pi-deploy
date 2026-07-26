@@ -117,6 +117,7 @@ pub struct OverlaySecrets {
     pub env: Option<String>,
     pub files: Option<Vec<String>>,
     pub file_mode: Option<String>,
+    pub groups: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -326,6 +327,9 @@ pub fn apply_overlay(base: &mut RpiToml, overlay: RpiTomlOverlay) {
         if let Some(mode) = s.file_mode {
             base.secrets.file_mode = reset_or(mode);
         }
+        if let Some(groups) = s.groups {
+            base.secrets.groups = groups;
+        }
     }
     if let Some(commands) = overlay.commands {
         base.commands = Some(commands);
@@ -460,6 +464,20 @@ pub fn resolve_with(
             branch_is_computed = has_branch_ref(&refs);
         }
         all_refs.extend(refs);
+    }
+
+    // Group names are attachment identity, not free text: each one must name a
+    // group that already exists on the agent under the base project, and the
+    // CLI never gets to see whether it does. A computed name would silently
+    // attach the wrong group (or fail the deploy far from the typo), so the
+    // list stays static — the same reason `[project].name` does.
+    if let Some((path, _)) = all_refs
+        .iter()
+        .find(|(path, _)| path == "secrets.groups" || path.starts_with("secrets.groups."))
+    {
+        anyhow::bail!(
+            "{path}: ${{...}} is not allowed in [secrets].groups (group names must be static)"
+        );
     }
 
     for key in user.keys() {
@@ -1281,5 +1299,44 @@ seed = "node seed.js"
         let parsed = toml::from_str::<toml::Value>(&text).unwrap();
         // Verify the control character was preserved in round-trip
         assert_eq!(parsed["base"].as_str().unwrap(), "my\u{0007}app");
+    }
+
+    #[test]
+    fn overlay_groups_replace_wholesale_and_empty_list_detaches() {
+        let mut base = crate::cli::rpitoml::RpiToml::parse(
+            &BASE.replace("[secrets]", "[secrets]\ngroups = [\"common\"]"),
+        )
+        .unwrap();
+        apply_overlay(&mut base, overlay("[secrets]\ngroups = [\"preview\"]\n"));
+        assert_eq!(
+            base.secrets.groups,
+            vec!["preview".to_string()],
+            "arrays replace, never concatenate"
+        );
+
+        apply_overlay(&mut base, overlay("[secrets]\ngroups = []\n"));
+        assert!(
+            base.secrets.groups.is_empty(),
+            "an explicit empty list detaches every group"
+        );
+    }
+
+    #[test]
+    fn interpolation_in_groups_is_rejected() {
+        // In an overlay...
+        let err = resolve_from(
+            BASE,
+            Some(("test", "[secrets]\ngroups = [\"${BRANCH_NAME}\"]\n")),
+            &["BRANCH_NAME=feature/login".into()],
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("secrets.groups"), "got: {err}");
+
+        // ...and in the base file, where the substitution engine is just as
+        // happy to interpolate every other field.
+        let base = BASE.replace("[secrets]", "[secrets]\ngroups = [\"${git.branch}\"]");
+        let err = resolve_from(&base, None, &[]).unwrap_err().to_string();
+        assert!(err.contains("secrets.groups"), "got: {err}");
     }
 }

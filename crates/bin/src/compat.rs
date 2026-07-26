@@ -29,6 +29,7 @@ pub enum Feature {
     Environments,
     SecretModes,
     RuntimeVars,
+    SecretGroups,
 }
 
 impl Feature {
@@ -40,6 +41,7 @@ impl Feature {
         Feature::Environments,
         Feature::SecretModes,
         Feature::RuntimeVars,
+        Feature::SecretGroups,
     ];
 
     /// The string this feature advertises in the `/v1/version` handshake.
@@ -52,6 +54,7 @@ impl Feature {
             Feature::Environments => "environments",
             Feature::SecretModes => "secret-modes",
             Feature::RuntimeVars => "runtime-vars",
+            Feature::SecretGroups => "secret-groups",
         }
     }
 
@@ -65,6 +68,7 @@ impl Feature {
             Feature::Environments => "environments",
             Feature::SecretModes => "secret file modes",
             Feature::RuntimeVars => "runtime variables",
+            Feature::SecretGroups => "secret groups",
         }
     }
 
@@ -77,6 +81,7 @@ impl Feature {
             Feature::Environments => Policy::Required,
             Feature::SecretModes => Policy::Required,
             Feature::RuntimeVars => Policy::Degradable,
+            Feature::SecretGroups => Policy::Required,
         }
     }
 
@@ -91,6 +96,7 @@ impl Feature {
             Feature::Environments => "0.24.0",
             Feature::SecretModes => "0.26.0",
             Feature::RuntimeVars => "0.27.0",
+            Feature::SecretGroups => "0.27.0",
         }
     }
 
@@ -339,6 +345,13 @@ mod tests {
         assert_eq!(Feature::SecretModes.capability(), "secret-modes");
         assert_eq!(Feature::SecretModes.since(), "0.26.0");
         assert!(matches!(Feature::SecretModes.policy(), Policy::Required));
+    }
+
+    #[test]
+    fn secret_groups_feature_is_gated_from_0_27_0() {
+        assert_eq!(Feature::SecretGroups.since(), "0.27.0");
+        assert_eq!(Feature::SecretGroups.capability(), "secret-groups");
+        assert!(Feature::ALL.contains(&Feature::SecretGroups));
     }
 
     #[test]

@@ -60,6 +60,30 @@ pub fn router(state: AppState) -> Router {
             "/v1/projects/{name}/secrets",
             put(send_secrets_handler).get(list_secrets_handler),
         )
+        .route(
+            "/v1/projects/{base}/secret-groups",
+            get(list_secret_groups_handler),
+        )
+        .route(
+            "/v1/projects/{base}/secret-groups/{group}",
+            put(push_secret_group_handler)
+                .get(head_secret_group_handler)
+                .delete(delete_secret_group_handler),
+        )
+        // Per-key counterparts, on the deploy-key path rather than the group
+        // path: the head is what `rpi secrets diff` compares against when no
+        // `--group` is given, and the apply is what `--apply` triggers after a
+        // push (the existing `PUT .../secrets` cannot serve it — it rejects an
+        // empty payload, and re-uploading the whole bundle just to restart is
+        // the wrong shape).
+        .route(
+            "/v1/projects/{name}/secrets/head",
+            get(head_key_secrets_handler),
+        )
+        .route(
+            "/v1/projects/{name}/secrets/apply",
+            post(apply_key_secrets_handler),
+        )
         .route("/v1/projects/{name}/source/check", post(source_check))
         .route("/v1/environments", get(list_environments_handler))
         .route(
@@ -155,6 +179,15 @@ async fn create_deployment(
                 "command '{cmd_name}' service must not be empty"
             ))));
         }
+    }
+    // Same shared rule, and the same message, the group routes apply
+    // (`valid_group_path`) and the `rpi.toml` parser applies locally — checked
+    // here, alongside every other name in the request, so a junk name is
+    // rejected before `projects.upsert` puts it in the registry rather than
+    // surfacing later from the store with different wording.
+    for group in &config.secret_groups {
+        pi_domain::secretgroup::validate_group_name(group)
+            .map_err(|e| ApiError(DomainError::Invalid(e)))?;
     }
     let env_meta: Option<EnvironmentMeta> = req.environment.map(Into::into);
     match &env_meta {
@@ -752,7 +785,7 @@ async fn send_env_handler(
     };
     let saved = state
         .send_secrets
-        .execute(&name, bundle, req.apply, Arc::new(TracingSink))
+        .execute(&name, bundle, None, req.apply, Arc::new(TracingSink))
         .await
         .map_err(ApiError)?;
     Ok(Json(EnvSendResponse {
@@ -774,17 +807,15 @@ async fn env_keys_handler(
     Ok(Json(EnvKeysResponse { keys: stored.keys }))
 }
 
-async fn send_secrets_handler(
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-    Json(req): Json<SecretsSendRequest>,
-) -> Result<Json<SecretsSendResponse>, ApiError> {
-    if !is_valid_name(&name) {
-        return Err(ApiError(DomainError::Invalid(
-            "project name must match ^[a-z0-9][a-z0-9_-]*$".into(),
-        )));
-    }
-    for (key, value) in &req.vars {
+/// Validates and decodes an incoming secrets payload: env keys, no newlines
+/// in values, per-file and total size ceilings, and `file_mode`. Shared by
+/// the per-key and group write paths so anything one accepts the other does.
+fn decode_secret_payload(
+    vars: std::collections::BTreeMap<String, String>,
+    files: &std::collections::BTreeMap<String, String>,
+    file_mode: Option<u32>,
+) -> Result<SecretsBundle, ApiError> {
+    for (key, value) in &vars {
         if !pi_infrastructure::dotenv::is_valid_key(key) {
             return Err(ApiError(DomainError::Invalid(format!(
                 "invalid env key '{key}'"
@@ -796,9 +827,9 @@ async fn send_secrets_handler(
             ))));
         }
     }
-    let mut files = std::collections::BTreeMap::new();
+    let mut decoded = std::collections::BTreeMap::new();
     let mut total: usize = 0;
-    for (path, b64) in &req.files {
+    for (path, b64) in files {
         pi_infrastructure::secretpath::validate_rel_path(path)
             .map_err(|e| ApiError(DomainError::Invalid(format!("secret file '{path}': {e}"))))?;
         let bytes = base64::engine::general_purpose::STANDARD
@@ -820,26 +851,66 @@ async fn send_secrets_handler(
                 "secret files exceed 8 MiB total".into(),
             )));
         }
-        files.insert(path.clone(), bytes);
+        decoded.insert(path.clone(), bytes);
     }
-    if let Some(mode) = req.file_mode {
+    if let Some(mode) = file_mode {
         pi_domain::secretmode::validate(mode)
             .map_err(|e| ApiError(DomainError::Invalid(format!("[secrets].file_mode: {e}"))))?;
     }
-    let bundle = SecretsBundle {
-        vars: req.vars,
-        files,
-        file_mode: req.file_mode,
-    };
+    Ok(SecretsBundle {
+        vars,
+        files: decoded,
+        file_mode,
+    })
+}
+
+/// Both path segments of a group route: the base is a project name, the group
+/// name follows the shared `validate_group_name` rule so the agent's message
+/// matches the CLI's exactly.
+fn valid_group_path(base: &str, group: &str) -> Result<(), ApiError> {
+    if !is_valid_name(base) {
+        return Err(ApiError(DomainError::Invalid(
+            "project name must match ^[a-z0-9][a-z0-9_-]*$".into(),
+        )));
+    }
+    pi_domain::secretgroup::validate_group_name(group)
+        .map_err(|e| ApiError(DomainError::Invalid(e)))
+}
+
+async fn send_secrets_handler(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Json(req): Json<SecretsSendRequest>,
+) -> Result<Json<SecretsSendResponse>, ApiError> {
+    if !is_valid_name(&name) {
+        return Err(ApiError(DomainError::Invalid(
+            "project name must match ^[a-z0-9][a-z0-9_-]*$".into(),
+        )));
+    }
+    let bundle = decode_secret_payload(req.vars, &req.files, req.file_mode)?;
     let saved = state
         .send_secrets
-        .execute(&name, bundle, req.apply, Arc::new(TracingSink))
+        .execute(
+            &name,
+            bundle,
+            req.expected_revision,
+            false,
+            Arc::new(TracingSink),
+        )
         .await
         .map_err(ApiError)?;
+    if req.apply {
+        state
+            .apply_secrets
+            .execute(&name, Arc::new(TracingSink))
+            .await
+            .map_err(ApiError)?;
+    }
     Ok(Json(SecretsSendResponse {
         saved_keys: saved.keys,
         saved_files: saved.files,
-        applied: saved.applied,
+        applied: req.apply,
+        revision: saved.revision,
     }))
 }
 
@@ -857,7 +928,170 @@ async fn list_secrets_handler(
         keys: stored.keys,
         files: stored.files,
         file_mode: Some(stored.file_mode),
+        layers: stored
+            .layers
+            .into_iter()
+            .map(
+                |(label, revision, vars, files)| crate::proto::SecretLayerDto {
+                    label,
+                    revision,
+                    vars,
+                    files,
+                },
+            )
+            .collect(),
     }))
+}
+
+async fn push_secret_group_handler(
+    State(state): State<AppState>,
+    Path((base, group)): Path<(String, String)>,
+    Json(req): Json<crate::proto::SecretGroupPushRequest>,
+) -> Result<Json<crate::proto::SecretGroupPushResponse>, ApiError> {
+    valid_group_path(&base, &group)?;
+    let bundle = decode_secret_payload(req.vars, &req.files, req.file_mode)?;
+    let (keys, files) = (bundle.vars.len(), bundle.files.len());
+    let revision = state
+        .push_secret_group
+        .execute(&base, &group, bundle, req.expected_revision, req.merge)
+        .await
+        .map_err(ApiError)?;
+    Ok(Json(crate::proto::SecretGroupPushResponse {
+        revision,
+        keys,
+        files,
+    }))
+}
+
+async fn head_secret_group_handler(
+    State(state): State<AppState>,
+    Path((base, group)): Path<(String, String)>,
+) -> Result<Json<crate::proto::SecretGroupHeadResponse>, ApiError> {
+    valid_group_path(&base, &group)?;
+    let head = state
+        .show_secret_group
+        .execute(&base, &group)
+        .await
+        .map_err(ApiError)?;
+    Ok(Json(crate::proto::SecretGroupHeadResponse {
+        revision: head.revision,
+        vars: head.vars,
+        files: head
+            .files
+            .into_iter()
+            .map(|(p, f)| {
+                (
+                    p,
+                    crate::proto::SecretFileHeadDto {
+                        size: f.size,
+                        digest: f.digest,
+                    },
+                )
+            })
+            .collect(),
+        file_mode: head.file_mode,
+    }))
+}
+
+async fn list_secret_groups_handler(
+    State(state): State<AppState>,
+    Path(base): Path<String>,
+) -> Result<Json<crate::proto::SecretGroupsListResponse>, ApiError> {
+    if !is_valid_name(&base) {
+        return Err(ApiError(DomainError::Invalid(
+            "project name must match ^[a-z0-9][a-z0-9_-]*$".into(),
+        )));
+    }
+    let listed = state
+        .list_secret_groups
+        .execute(&base)
+        .await
+        .map_err(ApiError)?;
+    Ok(Json(crate::proto::SecretGroupsListResponse {
+        groups: listed
+            .into_iter()
+            .map(|g| crate::proto::SecretGroupSummaryDto {
+                name: g.summary.name,
+                revision: g.summary.revision,
+                keys: g.summary.keys,
+                files: g.summary.files,
+                bytes: g.summary.bytes,
+                updated_at: g.summary.updated_at,
+                attached_by: g.attached_by,
+            })
+            .collect(),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct GroupDeleteQuery {
+    #[serde(default)]
+    force: bool,
+}
+
+async fn delete_secret_group_handler(
+    State(state): State<AppState>,
+    Path((base, group)): Path<(String, String)>,
+    Query(q): Query<GroupDeleteQuery>,
+) -> Result<Json<serde_json::Value>, ApiError> {
+    valid_group_path(&base, &group)?;
+    state
+        .remove_secret_group
+        .execute(&base, &group, q.force)
+        .await
+        .map_err(ApiError)?;
+    Ok(Json(serde_json::json!({ "removed": group })))
+}
+
+async fn head_key_secrets_handler(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<crate::proto::SecretGroupHeadResponse>, ApiError> {
+    if !is_valid_name(&name) {
+        return Err(ApiError(DomainError::Invalid(
+            "project name must match ^[a-z0-9][a-z0-9_-]*$".into(),
+        )));
+    }
+    let head = state
+        .head_key_secrets
+        .execute(&name)
+        .await
+        .map_err(ApiError)?;
+    Ok(Json(crate::proto::SecretGroupHeadResponse {
+        revision: head.revision,
+        vars: head.vars,
+        files: head
+            .files
+            .into_iter()
+            .map(|(p, f)| {
+                (
+                    p,
+                    crate::proto::SecretFileHeadDto {
+                        size: f.size,
+                        digest: f.digest,
+                    },
+                )
+            })
+            .collect(),
+        file_mode: head.file_mode,
+    }))
+}
+
+async fn apply_key_secrets_handler(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+) -> Result<Json<crate::proto::SecretsApplyResponse>, ApiError> {
+    if !is_valid_name(&name) {
+        return Err(ApiError(DomainError::Invalid(
+            "project name must match ^[a-z0-9][a-z0-9_-]*$".into(),
+        )));
+    }
+    let (keys, files) = state
+        .apply_secrets
+        .execute(&name, Arc::new(TracingSink))
+        .await
+        .map_err(ApiError)?;
+    Ok(Json(crate::proto::SecretsApplyResponse { keys, files }))
 }
 
 #[derive(Debug, Deserialize)]
@@ -962,7 +1196,10 @@ mod tests {
     use pi_application::list::ListProjects;
     use pi_application::logs::StreamLogs;
     use pi_application::remove::RemoveProject;
-    use pi_application::secrets::{ListSecrets, SendSecrets};
+    use pi_application::secretgroups::{
+        ListSecretGroups, PushSecretGroup, RemoveSecretGroup, ShowSecretGroup,
+    };
+    use pi_application::secrets::{ApplySecrets, HeadKeySecrets, ListSecrets, SendSecrets};
     use pi_application::stats::GetStats;
     use pi_domain::contracts::{
         ContainerRuntime, LogSink, MockContainerRuntime, MockDiskProbe, MockProjectRepository,
@@ -1157,15 +1394,21 @@ mod tests {
         let diagnostics = RunDiagnostics::new(probe.clone());
         let agent_status = AgentStatus::new(probe, projects.clone(), Arc::clone(&history));
         let projects_repo: Arc<dyn ProjectRepository> = projects.clone();
-        let send_secrets = SendSecrets::new(
+        let apply_secrets = ApplySecrets::new(
             secrets.clone(),
-            projects,
+            projects.clone(),
             source.clone(),
             FsSecretsWriter::new(),
-            overrides,
-            runtime,
+            overrides.clone(),
+            Arc::clone(&runtime),
         );
-        let list_secrets = ListSecrets::new(secrets);
+        let push_secret_group = PushSecretGroup::new(secrets.clone());
+        let show_secret_group = ShowSecretGroup::new(secrets.clone());
+        let list_secret_groups = ListSecretGroups::new(secrets.clone(), projects.clone());
+        let remove_secret_group = RemoveSecretGroup::new(secrets.clone(), projects.clone());
+        let head_key_secrets = HeadKeySecrets::new(secrets.clone());
+        let send_secrets = SendSecrets::new(secrets.clone(), Arc::clone(&apply_secrets));
+        let list_secrets = ListSecrets::new(secrets, projects);
         AppState {
             scheduler,
             list,
@@ -1175,6 +1418,12 @@ mod tests {
             source,
             send_secrets,
             list_secrets,
+            head_key_secrets,
+            apply_secrets,
+            push_secret_group,
+            show_secret_group,
+            list_secret_groups,
+            remove_secret_group,
             gc,
             stream_logs,
             stats,
@@ -1226,6 +1475,7 @@ mod tests {
                 commands: Default::default(),
                 command_timeout_secs: None,
                 environment,
+                secret_groups: Vec::new(),
             },
             host_port: 8000,
             created_at: 0,
@@ -1266,6 +1516,18 @@ mod tests {
         );
         state.remove = remove;
         state
+    }
+
+    /// `state_with` already wires the four secret-group use-cases and the
+    /// per-key head/apply pair onto a real `EncryptedFileStore` and
+    /// `SqliteProjectRepo` — this is just a named, routed entry point for the
+    /// secret-group HTTP tests.
+    fn state_with_secret_groups(dir: &std::path::Path) -> Router {
+        router(state_with(
+            dir,
+            Arc::new(ok_source()),
+            Arc::new(ok_runtime()),
+        ))
     }
 
     fn deploy_body_with_environment(
@@ -2022,6 +2284,312 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn secret_group_push_then_head_roundtrip_hides_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = state_with_secret_groups(dir.path());
+        let body = serde_json::json!({
+            "vars": { "DB_PASSWORD": "super-secret-value" },
+            "expected_revision": 0
+        });
+        let (status, json) = request(
+            app.clone(),
+            put_json("/v1/projects/myapp/secret-groups/preview", &body),
+        )
+        .await;
+        assert_eq!(status, 200, "{json:?}");
+        assert_eq!(json["revision"], 1);
+
+        let (status, json) = request(
+            app.clone(),
+            get_req("/v1/projects/myapp/secret-groups/preview"),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(json["revision"], 1);
+        assert!(json["vars"]["DB_PASSWORD"].is_string());
+        let rendered = json.to_string();
+        assert!(
+            !rendered.contains("super-secret-value"),
+            "value leaked: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn secret_group_push_with_a_stale_revision_is_409() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = state_with_secret_groups(dir.path());
+        let body = serde_json::json!({ "vars": { "A": "1" }, "expected_revision": 0 });
+        let (status, _) = request(
+            app.clone(),
+            put_json("/v1/projects/myapp/secret-groups/preview", &body),
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        let (status, json) = request(
+            app.clone(),
+            put_json("/v1/projects/myapp/secret-groups/preview", &body),
+        )
+        .await;
+        assert_eq!(status, 409, "{json:?}");
+        assert!(
+            json["error"].as_str().unwrap().contains("revision"),
+            "{json:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn secret_group_list_is_scoped_to_one_base_project() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = state_with_secret_groups(dir.path());
+        for (base, group) in [("myapp", "preview"), ("other", "preview")] {
+            let body = serde_json::json!({ "vars": { "A": "1" }, "expected_revision": 0 });
+            let (status, _) = request(
+                app.clone(),
+                put_json(&format!("/v1/projects/{base}/secret-groups/{group}"), &body),
+            )
+            .await;
+            assert_eq!(status, 200);
+        }
+
+        let (status, json) =
+            request(app.clone(), get_req("/v1/projects/myapp/secret-groups")).await;
+        assert_eq!(status, 200);
+        let groups = json["groups"].as_array().unwrap();
+        assert_eq!(groups.len(), 1);
+        assert_eq!(groups[0]["name"], "preview");
+        assert_eq!(groups[0]["attached_by"].as_array().unwrap().len(), 0);
+    }
+
+    /// Both reads and deletes of a name that was never pushed are 404. Delete
+    /// used to answer 200, which made a typo indistinguishable from a real
+    /// deletion — the CLI cheerfully printed "removed secret group
+    /// 'base/typo'" while the actual group sat untouched.
+    #[tokio::test]
+    async fn head_and_delete_of_an_absent_group_are_both_404() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = state_with_secret_groups(dir.path());
+        let (status, _) = request(
+            app.clone(),
+            get_req("/v1/projects/myapp/secret-groups/ghost"),
+        )
+        .await;
+        assert_eq!(status, 404);
+
+        for uri in [
+            "/v1/projects/myapp/secret-groups/ghost",
+            "/v1/projects/myapp/secret-groups/ghost?force=true",
+        ] {
+            let (status, json) = request(app.clone(), delete_req(uri)).await;
+            assert_eq!(status, 404, "{uri}: {json}");
+            assert!(json["error"].as_str().unwrap().contains("ghost"), "{json}");
+        }
+    }
+
+    /// The real deletion still works and is reported as such.
+    #[tokio::test]
+    async fn deleting_an_existing_group_removes_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = state_with_secret_groups(dir.path());
+        let body = serde_json::json!({ "vars": { "A": "1" }, "expected_revision": 0 });
+        let (status, _) = request(
+            app.clone(),
+            put_json("/v1/projects/myapp/secret-groups/common", &body),
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        let (status, json) = request(
+            app.clone(),
+            delete_req("/v1/projects/myapp/secret-groups/common"),
+        )
+        .await;
+        assert_eq!(status, 200, "{json}");
+        assert_eq!(json["removed"], "common");
+
+        let (status, _) = request(app, get_req("/v1/projects/myapp/secret-groups/common")).await;
+        assert_eq!(status, 404, "it is really gone");
+    }
+
+    #[tokio::test]
+    async fn secret_group_push_rejects_an_invalid_group_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = state_with_secret_groups(dir.path());
+        let body = serde_json::json!({ "vars": { "A": "1" }, "expected_revision": 0 });
+        let (status, json) = request(
+            app,
+            put_json("/v1/projects/myapp/secret-groups/Bad_Name", &body),
+        )
+        .await;
+        assert_eq!(status, 400, "{json:?}");
+        assert!(
+            json["error"]
+                .as_str()
+                .unwrap()
+                .contains("^[a-z][a-z0-9-]*$"),
+            "the message must match the CLI's: {json:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn head_key_secrets_route_reports_digests_not_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = state_with_secret_groups(dir.path());
+        let body = serde_json::json!({
+            "vars": { "DB_PASSWORD": "super-secret-value" },
+            "apply": false
+        });
+        let (status, _) = request(app.clone(), put_json("/v1/projects/myapp/secrets", &body)).await;
+        assert_eq!(status, 200);
+
+        let (status, json) = request(app, get_req("/v1/projects/myapp/secrets/head")).await;
+        assert_eq!(status, 200, "{json:?}");
+        assert_eq!(json["revision"], 1);
+        assert!(json["vars"]["DB_PASSWORD"].is_string());
+        let rendered = json.to_string();
+        assert!(
+            !rendered.contains("super-secret-value"),
+            "value leaked: {rendered}"
+        );
+    }
+
+    #[tokio::test]
+    async fn per_key_secrets_put_honours_expected_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = state_with_secret_groups(dir.path());
+        let body = serde_json::json!({ "vars": { "A": "1" }, "expected_revision": 0 });
+        let (status, json) =
+            request(app.clone(), put_json("/v1/projects/rateme/secrets", &body)).await;
+        assert_eq!(status, 200, "{json:?}");
+        assert_eq!(json["revision"], 1);
+
+        let (status, json) = request(app, put_json("/v1/projects/rateme/secrets", &body)).await;
+        assert_eq!(status, 409, "{json:?}");
+    }
+
+    #[tokio::test]
+    async fn per_key_secrets_put_without_expected_revision_still_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = state_with_secret_groups(dir.path());
+        let body = serde_json::json!({ "vars": { "A": "1" } });
+        for _ in 0..2 {
+            let (status, _) =
+                request(app.clone(), put_json("/v1/projects/rateme/secrets", &body)).await;
+            assert_eq!(
+                status, 200,
+                "an old CLI that sends no expected_revision must keep working"
+            );
+        }
+    }
+
+    /// A real workdir + a custom `Source` so `ApplySecrets` can actually
+    /// write `.env` and the test can read it back — the merged content on
+    /// disk is the only way to prove groups + key bundle were really merged,
+    /// not just that the route returned 200.
+    fn state_with_writable_workdir(dir: &std::path::Path) -> (AppState, std::path::PathBuf) {
+        let workdir = dir.join("wd");
+        std::fs::create_dir_all(&workdir).unwrap();
+        let mut source = MockSource::new();
+        let wd = workdir.clone();
+        source.expect_workdir().returning(move |_| wd.clone());
+        let state = state_with(dir, Arc::new(source), Arc::new(ok_runtime()));
+        (state, workdir)
+    }
+
+    #[tokio::test]
+    async fn secrets_apply_flag_injects_the_merged_layered_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, workdir) = state_with_writable_workdir(dir.path());
+        let mut config = project_with_environment("myapp", None).config;
+        config.secret_groups = vec!["common".into()];
+        state.projects.upsert(&config).await.unwrap();
+        let app = router(state);
+
+        let group_body =
+            serde_json::json!({ "vars": { "SHARED": "shared-value" }, "expected_revision": 0 });
+        let (status, _) = request(
+            app.clone(),
+            put_json("/v1/projects/myapp/secret-groups/common", &group_body),
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        let key_body = serde_json::json!({ "vars": { "OWN": "own-value" }, "apply": true });
+        let (status, json) = request(app, put_json("/v1/projects/myapp/secrets", &key_body)).await;
+        assert_eq!(status, 200, "{json:?}");
+        assert_eq!(json["applied"], true);
+
+        let env = std::fs::read_to_string(workdir.join(".env")).unwrap();
+        assert!(env.contains("SHARED=shared-value"), "{env}");
+        assert!(env.contains("OWN=own-value"), "{env}");
+    }
+
+    #[tokio::test]
+    async fn secrets_apply_route_reapplies_the_merged_layered_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, workdir) = state_with_writable_workdir(dir.path());
+        let mut config = project_with_environment("myapp", None).config;
+        config.secret_groups = vec!["common".into()];
+        state.projects.upsert(&config).await.unwrap();
+        let app = router(state);
+
+        let group_body =
+            serde_json::json!({ "vars": { "SHARED": "shared-value" }, "expected_revision": 0 });
+        let (status, _) = request(
+            app.clone(),
+            put_json("/v1/projects/myapp/secret-groups/common", &group_body),
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        // stored, not applied yet
+        let key_body = serde_json::json!({ "vars": { "OWN": "own-value" }, "apply": false });
+        let (status, _) = request(
+            app.clone(),
+            put_json("/v1/projects/myapp/secrets", &key_body),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(
+            !workdir.join(".env").exists(),
+            "nothing should be written without apply"
+        );
+
+        let (status, json) = request(app, post_empty("/v1/projects/myapp/secrets/apply")).await;
+        assert_eq!(status, 200, "{json:?}");
+        assert_eq!(json["keys"], 2);
+        assert_eq!(json["files"], 0);
+
+        let env = std::fs::read_to_string(workdir.join(".env")).unwrap();
+        assert!(env.contains("SHARED=shared-value"), "{env}");
+        assert!(env.contains("OWN=own-value"), "{env}");
+    }
+
+    #[tokio::test]
+    async fn secrets_apply_fails_when_a_declared_group_has_no_secrets() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with(dir.path(), Arc::new(ok_source()), Arc::new(ok_runtime()));
+        let mut config = project_with_environment("myapp", None).config;
+        config.secret_groups = vec!["missing".into()];
+        state.projects.upsert(&config).await.unwrap();
+        let app = router(state);
+
+        let body = serde_json::json!({ "vars": { "OWN": "own-value-long-enough" }, "apply": true });
+        let (status, json) =
+            request(app.clone(), put_json("/v1/projects/myapp/secrets", &body)).await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{json:?}");
+        assert!(
+            json["error"].as_str().unwrap().contains("missing"),
+            "{json:?}"
+        );
+
+        // the bundle was still saved before the failed apply
+        let (status, json) = request(app, get_req("/v1/projects/myapp/secrets")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(json["keys"], serde_json::json!(["OWN"]));
+    }
+
+    #[tokio::test]
     async fn secrets_ls_for_unknown_project_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         let app = router(state_with(
@@ -2033,6 +2601,76 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(json["keys"], serde_json::json!([]));
         assert_eq!(json["files"], serde_json::json!([]));
+    }
+
+    #[tokio::test]
+    async fn effective_secrets_list_reports_layers_without_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let app = state_with_secret_groups(dir.path());
+        let body = serde_json::json!({
+            "vars": { "SHARED": "group-value" },
+            "expected_revision": 0
+        });
+        let (status, _) = request(
+            app.clone(),
+            put_json("/v1/projects/myapp/secret-groups/common", &body),
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        let (status, json) = request(app, get_req("/v1/projects/myapp/secrets")).await;
+        assert_eq!(status, 200);
+        let labels: Vec<&str> = json["layers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|l| l["label"].as_str().unwrap())
+            .collect();
+        assert_eq!(labels, vec!["key"], "no groups declared yet -> key only");
+        assert!(!json.to_string().contains("group-value"));
+    }
+
+    /// The counterpart to `effective_secrets_list_reports_layers_without_values`:
+    /// once "common" is *declared* by a registered project, GET .../secrets
+    /// must report both layers, in deploy order, each with its own raw
+    /// membership (not just the merged winner).
+    #[tokio::test]
+    async fn effective_secrets_list_reports_a_declared_group_layer_in_deploy_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with(dir.path(), Arc::new(ok_source()), Arc::new(ok_runtime()));
+        let mut config = project_with_environment("myapp", None).config;
+        config.secret_groups = vec!["common".into()];
+        state.projects.upsert(&config).await.unwrap();
+        let app = router(state);
+
+        let group_body =
+            serde_json::json!({ "vars": { "SHARED": "shared-value" }, "expected_revision": 0 });
+        let (status, _) = request(
+            app.clone(),
+            put_json("/v1/projects/myapp/secret-groups/common", &group_body),
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        let key_body = serde_json::json!({ "vars": { "OWN": "own-value" } });
+        let (status, _) = request(
+            app.clone(),
+            put_json("/v1/projects/myapp/secrets", &key_body),
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        let (status, json) = request(app, get_req("/v1/projects/myapp/secrets")).await;
+        assert_eq!(status, 200, "{json:?}");
+        assert_eq!(json["keys"], serde_json::json!(["OWN", "SHARED"]));
+        let layers = json["layers"].as_array().unwrap();
+        assert_eq!(layers.len(), 2);
+        assert_eq!(layers[0]["label"], "common");
+        assert_eq!(layers[0]["vars"], serde_json::json!(["SHARED"]));
+        assert_eq!(layers[1]["label"], "key");
+        assert_eq!(layers[1]["vars"], serde_json::json!(["OWN"]));
+        assert!(!json.to_string().contains("shared-value"));
+        assert!(!json.to_string().contains("own-value"));
     }
 
     // The plan's brief text for this test asserts the OLD `/env` routes are
@@ -2058,6 +2696,43 @@ mod tests {
         assert_eq!(status, StatusCode::OK, "{json}");
         let (status, json) = request(app, get_req("/v1/projects/rateme/env")).await;
         assert_eq!(status, StatusCode::OK, "{json}");
+    }
+
+    /// The legacy `/env` route passes `apply` straight into `SendSecrets`, so
+    /// an *old* CLI running `rpi env send --apply` reaches the apply path
+    /// without going through `send_secrets_handler`'s explicit `ApplySecrets`
+    /// call. It must still write the merged, layered set — writing only the
+    /// request's bundle would blow the running container's group values away
+    /// until its next deploy.
+    #[tokio::test]
+    async fn legacy_env_apply_writes_the_merged_layered_set() {
+        let dir = tempfile::tempdir().unwrap();
+        let (state, workdir) = state_with_writable_workdir(dir.path());
+        let mut config = project_with_environment("myapp", None).config;
+        config.secret_groups = vec!["common".into()];
+        state.projects.upsert(&config).await.unwrap();
+        let app = router(state);
+
+        let group_body =
+            serde_json::json!({ "vars": { "SHARED": "shared-value" }, "expected_revision": 0 });
+        let (status, _) = request(
+            app.clone(),
+            put_json("/v1/projects/myapp/secret-groups/common", &group_body),
+        )
+        .await;
+        assert_eq!(status, 200);
+
+        let env_body = serde_json::json!({ "vars": { "OWN": "own-value" }, "apply": true });
+        let (status, json) = request(app, put_json("/v1/projects/myapp/env", &env_body)).await;
+        assert_eq!(status, StatusCode::OK, "{json}");
+        assert_eq!(json["applied"], true);
+
+        let env = std::fs::read_to_string(workdir.join(".env")).unwrap();
+        assert!(
+            env.contains("SHARED=shared-value"),
+            "the group layer was dropped: {env}"
+        );
+        assert!(env.contains("OWN=own-value"), "{env}");
     }
 
     fn deploy_body_with_commands(name: &str) -> serde_json::Value {
@@ -2229,6 +2904,39 @@ mod tests {
         body["project"]["commands"] = serde_json::json!({ "x": [] });
         let (status, _) = request(app, post_json("/v1/deployments", &body)).await;
         assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    /// `secret_groups` travels in `ProjectDto` like every other project field
+    /// and must be validated like every other name in it — with the same
+    /// shared rule and the same message the group routes use — *before*
+    /// `projects.upsert` writes the junk name into the registry.
+    #[tokio::test]
+    async fn deploy_rejects_invalid_secret_group_names_before_registering() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = state_with(dir.path(), Arc::new(ok_source()), Arc::new(ok_runtime()));
+        let projects = Arc::clone(&state.projects);
+        let app = router(state);
+
+        for bad in ["Bad_Name", "../escape", "1st"] {
+            let mut body = deploy_body("rateme");
+            body["project"]["secret_groups"] = serde_json::json!([bad]);
+            let (status, json) = request(app.clone(), post_json("/v1/deployments", &body)).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{bad}: {json}");
+            let msg = json["error"].as_str().unwrap();
+            assert!(
+                msg.contains("^[a-z][a-z0-9-]*$"),
+                "the message must match the group routes' and the CLI's: {msg}"
+            );
+        }
+        assert!(
+            projects.get("rateme").await.unwrap().is_none(),
+            "a rejected deploy must not leave the project in the registry"
+        );
+
+        let mut body = deploy_body("rateme");
+        body["project"]["secret_groups"] = serde_json::json!(["common", "db-creds"]);
+        let (status, json) = request(app, post_json("/v1/deployments", &body)).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{json}");
     }
 
     #[tokio::test]

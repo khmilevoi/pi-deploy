@@ -15,7 +15,10 @@ use pi_application::list::ListProjects;
 use pi_application::logs::StreamLogs;
 use pi_application::remove::RemoveProject;
 use pi_application::scheduler::{DeployRunner, DeployScheduler};
-use pi_application::secrets::{ListSecrets, SendSecrets};
+use pi_application::secretgroups::{
+    ListSecretGroups, PushSecretGroup, RemoveSecretGroup, ShowSecretGroup,
+};
+use pi_application::secrets::{ApplySecrets, HeadKeySecrets, ListSecrets, SendSecrets};
 use pi_application::stats::GetStats;
 use pi_domain::contracts::{
     DeploymentHistory, HostMetricsStore, HostNetwork, IdGen, Ingress, ProjectRepository, Source,
@@ -52,6 +55,18 @@ pub struct AppState {
     pub source: Arc<dyn Source>,
     pub send_secrets: Arc<SendSecrets>,
     pub list_secrets: Arc<ListSecrets>,
+    /// Deploy-key metadata head (secret-groups spec) — never a value, so the
+    /// HTTP layer never needs to touch the store directly.
+    pub head_key_secrets: Arc<HeadKeySecrets>,
+    /// Re-injects a deploy key's merged (groups + own) secrets and runs
+    /// `up -d`. Shared by `send_secrets_handler`'s `--apply` branch and
+    /// `apply_key_secrets_handler` — one implementation, not two.
+    pub apply_secrets: Arc<ApplySecrets>,
+    /// Group CRUD (secret-groups spec): `/v1/projects/{base}/secret-groups`.
+    pub push_secret_group: Arc<PushSecretGroup>,
+    pub show_secret_group: Arc<ShowSecretGroup>,
+    pub list_secret_groups: Arc<ListSecretGroups>,
+    pub remove_secret_group: Arc<RemoveSecretGroup>,
     pub gc: Arc<RunGc>,
     pub stream_logs: Arc<StreamLogs>,
     pub stats: Arc<GetStats>,
@@ -224,15 +239,21 @@ pub fn build_state(
     let diagnostics = RunDiagnostics::new(probe.clone());
     let agent_status = AgentStatus::new(probe, projects.clone(), Arc::clone(&history));
     let projects_repo: Arc<dyn ProjectRepository> = projects.clone();
-    let send_secrets = SendSecrets::new(
+    let apply_secrets = ApplySecrets::new(
         secrets.clone(),
-        projects,
+        projects.clone(),
         source.clone(),
-        secrets_writer,
-        overrides,
-        runtime,
+        secrets_writer.clone(),
+        overrides.clone(),
+        runtime.clone(),
     );
-    let list_secrets = ListSecrets::new(secrets);
+    let push_secret_group = PushSecretGroup::new(secrets.clone());
+    let show_secret_group = ShowSecretGroup::new(secrets.clone());
+    let list_secret_groups = ListSecretGroups::new(secrets.clone(), projects.clone());
+    let remove_secret_group = RemoveSecretGroup::new(secrets.clone(), projects.clone());
+    let head_key_secrets = HeadKeySecrets::new(secrets.clone());
+    let send_secrets = SendSecrets::new(secrets.clone(), Arc::clone(&apply_secrets));
+    let list_secrets = ListSecrets::new(secrets, projects);
 
     Ok((
         AppState {
@@ -244,6 +265,12 @@ pub fn build_state(
             source: source as Arc<dyn Source>,
             send_secrets,
             list_secrets,
+            head_key_secrets,
+            apply_secrets,
+            push_secret_group,
+            show_secret_group,
+            list_secret_groups,
+            remove_secret_group,
             gc,
             stream_logs,
             stats,

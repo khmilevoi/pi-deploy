@@ -29,7 +29,8 @@ sequenceDiagram
         Agent-->>CLI: 404 JSON error
         CLI-->>Op: print error, exit non-zero
     else project exists
-        Log->>Log: arm secret-masking filter
+        Log->>Log: resolve this project's secret layers (declared groups, then its own bundle)
+        Log->>Log: arm secret-masking filter on the merged set
         Log->>Svc: read the container's own log output, tail or follow
         loop lines available
             Svc-->>Log: log line
@@ -228,9 +229,15 @@ sequenceDiagram
 ## Source anchors
 
 - `crates/application/src/logs.rs` — the `StreamLogs` use case behind
-  `rpi logs`: confirms the project exists, arms the secret-masking filter,
-  then asks the container runtime for the tail (and optional follow) of
-  that project's log output.
+  `rpi logs`: confirms the project exists, resolves the same secret layer
+  stack a deploy would (every group named in `[secrets].groups`, then the
+  deploy key's own bundle) and arms the secret-masking filter on the
+  *merged* result, then asks the container runtime for the tail (and
+  optional follow) of that project's log output. Arming on the key's own
+  bundle alone would silently stop masking any value an operator moved into
+  a shared group; resolving those layers here is read-only and tolerant of a
+  declared-but-empty group, unlike the deploy-time resolution
+  (`flows/secrets.md` items 5–6).
 - `crates/application/src/tail.rs` — a generic last-N-lines buffer. It is
   not on the `rpi logs`/`stats`/`doctor` request paths directly; it is what
   lets a finished `rpi deploy` run's log tail be replayed later (see

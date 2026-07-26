@@ -13,6 +13,31 @@ use crate::duration::parse_duration_secs;
 use crate::output;
 use crate::proto::{DeployRequest, DiagnosticCheckDto};
 
+/// Every optional agent feature a deploy request *uses*, gated at the point
+/// of use like `SecretModes` on `[secrets].file_mode` and `SourceCheck` on
+/// the preflight.
+///
+/// `secret_groups` in particular must be gated rather than trusted to fail
+/// server-side: it travels inside `ProjectDto`, which is not
+/// `deny_unknown_fields`, so an agent older than 0.27.0 simply *ignores* the
+/// field. The deploy then succeeds, the `.env` is built from the deploy key's
+/// own bundle alone — empty, on a fresh preview — and the application starts
+/// with no configuration at all. The `require_non_empty` guard that would
+/// catch this lives on the new agent, which never sees the request.
+fn gate_deploy_features(
+    compat: &crate::compat::CompatSession,
+    env_selected: bool,
+    secret_groups: &[String],
+) -> anyhow::Result<()> {
+    if env_selected {
+        compat.gate(crate::compat::Feature::Environments)?;
+    }
+    if !secret_groups.is_empty() {
+        compat.gate(crate::compat::Feature::SecretGroups)?;
+    }
+    Ok(())
+}
+
 pub async fn deploy(
     git_ref: Option<String>,
     no_gh_key: bool,
@@ -37,9 +62,7 @@ pub async fn deploy(
         compat.agent_api()
     ));
 
-    if env_selection.is_some() {
-        compat.gate(crate::compat::Feature::Environments)?;
-    }
+    gate_deploy_features(&compat, env_selection.is_some(), &project.secret_groups)?;
 
     // Degradable: an old agent still deploys, it just injects no RPI_*.
     // A hard gate would break working deploys over a dependency the
@@ -185,20 +208,149 @@ pub async fn deploy_cancel(
     Ok(())
 }
 
-pub async fn secrets_send(
+/// Base project that owns a group. With `--env` the resolved
+/// `project.name` is the derived deploy key (`myapp--branch--login`), so a
+/// group addressed by it would land under a directory no project owns — the
+/// base always comes from the environment selection.
+pub fn resolve_base(resolved: &crate::cli::overlay::Resolved) -> String {
+    match &resolved.env {
+        Some(env) => env.base.clone(),
+        None => resolved.rpitoml.project.name.clone(),
+    }
+}
+
+/// What a push would change, by name. Values never appear here — the remote
+/// side only ever gave us digests.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct NameDiff {
+    pub added: Vec<String>,
+    pub changed: Vec<String>,
+    pub removed: Vec<String>,
+    pub unchanged: usize,
+}
+
+impl NameDiff {
+    /// Forward contract (secret-groups spec, plan Task 9): lets a future
+    /// caller short-circuit on "nothing to do" without re-deriving it from
+    /// the three vectors; `secrets_push`/`secrets_diff` render unconditionally.
+    #[allow(dead_code)]
+    pub fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.changed.is_empty() && self.removed.is_empty()
+    }
+
+    pub fn render(&self) -> String {
+        let mut parts = Vec::new();
+        for (label, names) in [
+            ("+", &self.added),
+            ("~", &self.changed),
+            ("-", &self.removed),
+        ] {
+            for name in names {
+                parts.push(format!("{label}{name}"));
+            }
+        }
+        if parts.is_empty() {
+            return format!("no changes ({} unchanged)", self.unchanged);
+        }
+        format!("{} ({} unchanged)", parts.join(" "), self.unchanged)
+    }
+}
+
+/// Compares local values against remote digests. `remote` maps name ->
+/// digest, so the comparison is digest-to-digest and no local value is sent
+/// anywhere to make it.
+pub fn diff_vars(local: &BTreeMap<String, String>, remote: &BTreeMap<String, String>) -> NameDiff {
+    let mut d = NameDiff::default();
+    for (name, value) in local {
+        match remote.get(name) {
+            None => d.added.push(name.clone()),
+            Some(digest) if *digest != pi_domain::secretgroup::digest(value.as_bytes()) => {
+                d.changed.push(name.clone())
+            }
+            Some(_) => d.unchanged += 1,
+        }
+    }
+    for name in remote.keys() {
+        if !local.contains_key(name) {
+            d.removed.push(name.clone());
+        }
+    }
+    d
+}
+
+/// Same comparison for files: local bytes are already base64 here (that is
+/// what `collect_secrets` produces), so decode before digesting.
+pub fn diff_files(
+    local: &BTreeMap<String, String>,
+    remote: &BTreeMap<String, crate::proto::SecretFileHeadDto>,
+) -> NameDiff {
+    let mut d = NameDiff::default();
+    for (path, b64) in local {
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(b64)
+            .unwrap_or_default();
+        match remote.get(path) {
+            None => d.added.push(path.clone()),
+            Some(head) if head.digest != pi_domain::secretgroup::digest(&bytes) => {
+                d.changed.push(path.clone())
+            }
+            Some(_) => d.unchanged += 1,
+        }
+    }
+    for path in remote.keys() {
+        if !local.contains_key(path) {
+            d.removed.push(path.clone());
+        }
+    }
+    d
+}
+
+/// One rule and one message for every place a group name arrives from the
+/// command line — `--group` on `push`/`ls`/`diff` and the positional name of
+/// `secrets group rm`. It is the same `validate_group_name` the agent applies
+/// to the path segment and the `rpi.toml` parser applies to `[secrets].groups`,
+/// so nothing this accepts is rejected there or vice versa.
+///
+/// Checking locally is not redundant with the agent's check: the name goes
+/// into a `format!`-built URL, and `Url` normalizes `..` before the request is
+/// sent, so `--group '../secrets'` would silently become a request to a
+/// different route whose response the client then fails to parse. The agent
+/// stays safe either way; the point here is a legible message instead of a
+/// nonsense one.
+fn validate_group_arg(name: &str) -> anyhow::Result<()> {
+    pi_domain::secretgroup::validate_group_name(name)
+        .map_err(|e| anyhow::anyhow!("group name: {e}"))
+}
+
+/// `rpi secrets push`. Without `--group` this targets the deploy key's own
+/// bundle and behaves exactly like the pre-groups `rpi secrets send`.
+pub async fn secrets_push(
+    group: Option<String>,
+    merge: bool,
+    force: bool,
     apply: bool,
     env: Option<String>,
     vars: Vec<String>,
     connect: ConnectOpts,
 ) -> anyhow::Result<()> {
+    if let Some(group) = &group {
+        validate_group_arg(group)?;
+    }
     let resolved = crate::cli::overlay::resolve(env.as_deref(), &vars)?;
     let is_env = resolved.env.is_some();
-    let rpitoml = resolved.rpitoml;
-    let project_name = rpitoml.project.name.clone();
-    let (vars, files) = collect_secrets(Path::new("."), &rpitoml.secrets)?;
-    if vars.is_empty() && files.is_empty() {
+    let base = resolve_base(&resolved);
+    let project_name = resolved.rpitoml.project.name.clone();
+    let (vars_map, files) = collect_secrets(Path::new("."), &resolved.rpitoml.secrets)?;
+    if vars_map.is_empty() && files.is_empty() {
         anyhow::bail!("no secrets to send: env file has no variables and [secrets].files is empty");
     }
+    let file_mode = match &resolved.rpitoml.secrets.file_mode {
+        Some(text) => Some(
+            pi_domain::secretmode::parse(text)
+                .map_err(|e| anyhow::anyhow!("rpi.toml [secrets].file_mode: {e}"))?,
+        ),
+        None => None,
+    };
 
     let AgentConn {
         tunnel: _tunnel,
@@ -209,28 +361,203 @@ pub async fn secrets_send(
     if is_env {
         compat.gate(crate::compat::Feature::Environments)?;
     }
-    let file_mode = match &rpitoml.secrets.file_mode {
-        Some(text) => Some(
-            pi_domain::secretmode::parse(text)
-                .map_err(|e| anyhow::anyhow!("rpi.toml [secrets].file_mode: {e}"))?,
-        ),
-        None => None,
-    };
     if file_mode.is_some() {
         compat.gate(crate::compat::Feature::SecretModes)?;
     }
 
-    let (n, m) = (vars.len(), files.len());
-    let resp = api
-        .send_secrets(&project_name, vars, files, file_mode, apply)
-        .await?;
-    output::success(format!(
-        "saved {n} key(s) and {m} file(s) for project '{project_name}'"
-    ));
-    if resp.applied {
-        output::success("secrets applied to running containers");
+    match group {
+        Some(group) => {
+            compat.gate(crate::compat::Feature::SecretGroups)?;
+            let head = api.head_secret_group(&base, &group).await.ok();
+            let expected = if force {
+                None
+            } else {
+                Some(head.as_ref().map(|h| h.revision).unwrap_or(0))
+            };
+            if let Some(head) = &head {
+                let vd = diff_vars(&vars_map, &head.vars);
+                let fd = diff_files(&files, &head.files);
+                output::info(format!("env keys: {}", vd.render()));
+                output::info(format!("files: {}", fd.render()));
+            }
+            let resp = api
+                .push_secret_group(
+                    &base,
+                    &group,
+                    &crate::proto::SecretGroupPushRequest {
+                        vars: vars_map,
+                        files,
+                        file_mode,
+                        expected_revision: expected,
+                        merge,
+                    },
+                )
+                .await?;
+            output::success(format!(
+                "group '{base}/{group}' now at revision {} ({} key(s), {} file(s))",
+                resp.revision, resp.keys, resp.files
+            ));
+            if apply {
+                apply_to_resolved_project(&api, &project_name, &base, &group).await?;
+            }
+        }
+        None => {
+            // Distinguish "this agent predates secret groups" (the route
+            // doesn't exist, so don't even try the lookup — send an
+            // unconditional write like every pre-0.27.0 CLI always has) from
+            // "the lookup itself failed" (a transient network/server error,
+            // which must surface via `?` rather than silently downgrading to
+            // an unconditional write).
+            let supports_revisions = compat.supports(crate::compat::Feature::SecretGroups);
+            if !supports_revisions {
+                output::warn(
+                    "this agent predates secret groups: the overwrite guard is unavailable, \
+                     so a concurrent change on the agent will be replaced silently",
+                );
+            }
+            let expected = if should_look_up_key_revision(supports_revisions, force) {
+                Some(api.head_key_secrets(&project_name).await?.revision)
+            } else {
+                None
+            };
+            let (n, m) = (vars_map.len(), files.len());
+            let resp = api
+                .send_secrets(&project_name, vars_map, files, file_mode, expected, apply)
+                .await?;
+            // An agent that predates secret groups never populates
+            // `SecretsSendResponse.revision` — it deserializes as the serde
+            // default `0`, which is not the agent's real state and must
+            // never be printed as if it were (that agent has no revision
+            // concept at all, `--force` or not).
+            output::success(render_key_secrets_saved(
+                &project_name,
+                n,
+                m,
+                supports_revisions.then_some(resp.revision),
+            ));
+            if resp.applied {
+                output::success("secrets applied to running containers");
+            }
+        }
     }
     Ok(())
+}
+
+/// Whether `rpi secrets push` (no `--group`) should look up the deploy key's
+/// current revision before writing. Skipped both when the agent predates
+/// secret groups (the lookup route doesn't exist there) and when `--force`
+/// asks for an unconditional write regardless of what is currently
+/// stored — in either case there is nothing to compare against, so the
+/// write goes out with `expected_revision: None`.
+fn should_look_up_key_revision(supports_revisions: bool, force: bool) -> bool {
+    supports_revisions && !force
+}
+
+/// `rpi secrets push` (no `--group`) success line. `revision` is `None`
+/// exactly when the agent predates secret groups (Task 11): that agent's
+/// `SecretsSendResponse` never carries a real revision, so
+/// `SecretsSendResponse.revision` decodes as the serde default `0` — a
+/// number that must never be printed as if it reflected the agent's actual
+/// state. When the agent does support secret groups, `revision` is shown
+/// whether or not `--force` was used, because the store always returns the
+/// write's real new revision regardless of whether it was guarded.
+pub(crate) fn render_key_secrets_saved(
+    project: &str,
+    keys: usize,
+    files: usize,
+    revision: Option<u64>,
+) -> String {
+    match revision {
+        Some(r) => format!(
+            "saved {keys} key(s) and {files} file(s) for project '{project}' (revision {r})"
+        ),
+        None => format!("saved {keys} key(s) and {files} file(s) for project '{project}'"),
+    }
+}
+
+/// `--apply` after a group push: apply to the project the current config
+/// resolves to, and name the others that declare the group as untouched. A
+/// fan-out that restarts every attached environment from one command is too
+/// abrupt a default.
+async fn apply_to_resolved_project(
+    api: &crate::cli::api::ApiClient,
+    project: &str,
+    base: &str,
+    group: &str,
+) -> anyhow::Result<()> {
+    let listed = api.list_secret_groups(base).await?;
+    let others: Vec<String> = listed
+        .groups
+        .iter()
+        .filter(|g| g.name == group)
+        .flat_map(|g| g.attached_by.iter().cloned())
+        .filter(|k| k != project)
+        .collect();
+    api.apply_key_secrets(project).await?;
+    output::success(format!("applied to '{project}'"));
+    if !others.is_empty() {
+        output::info(format!(
+            "also declared by (not applied): {}",
+            others.join(", ")
+        ));
+    }
+    Ok(())
+}
+
+/// `rpi secrets diff` — local sources against the agent, by digest.
+pub async fn secrets_diff(
+    group: Option<String>,
+    env: Option<String>,
+    vars: Vec<String>,
+    connect: ConnectOpts,
+) -> anyhow::Result<()> {
+    if let Some(group) = &group {
+        validate_group_arg(group)?;
+    }
+    let resolved = crate::cli::overlay::resolve(env.as_deref(), &vars)?;
+    let base = resolve_base(&resolved);
+    let project_name = resolved.rpitoml.project.name.clone();
+    let (vars_map, files) = collect_secrets(Path::new("."), &resolved.rpitoml.secrets)?;
+
+    let AgentConn {
+        tunnel: _tunnel,
+        api,
+        compat,
+    } = crate::cli::connect::connect_agent(connect).await?;
+    compat.gate(crate::compat::Feature::SecretGroups)?;
+
+    let (label, head) = match &group {
+        Some(group) => (
+            format!("group '{base}/{group}'"),
+            api.head_secret_group(&base, group).await?,
+        ),
+        None => (
+            format!("project '{project_name}'"),
+            api.head_key_secrets(&project_name).await?,
+        ),
+    };
+    output::heading(format!("{label} at revision {}", head.revision));
+    output::info(format!(
+        "env keys: {}",
+        diff_vars(&vars_map, &head.vars).render()
+    ));
+    output::info(format!(
+        "files: {}",
+        diff_files(&files, &head.files).render()
+    ));
+    Ok(())
+}
+
+/// Deprecated alias kept so existing scripts keep working; `push` without
+/// `--group` is the same operation.
+pub async fn secrets_send(
+    apply: bool,
+    env: Option<String>,
+    vars: Vec<String>,
+    connect: ConnectOpts,
+) -> anyhow::Result<()> {
+    output::warn("`rpi secrets send` is deprecated; use `rpi secrets push`");
+    secrets_push(None, false, false, apply, env, vars, connect).await
 }
 
 /// Assemble the outgoing bundle per secrets spec §3: an explicitly configured
@@ -336,13 +663,171 @@ pub async fn gc(connect: ConnectOpts) -> anyhow::Result<()> {
     Ok(())
 }
 
-pub async fn secrets_ls(
+/// Rows of the effective `rpi secrets ls`: object name, the layer that
+/// supplied the winning value, and whether it shadows an earlier layer.
+/// Later layers win, so the last layer mentioning a name owns it.
+pub fn effective_rows(resp: &crate::proto::SecretsListResponse) -> Vec<(String, String, bool)> {
+    let mut winner: BTreeMap<String, (String, bool)> = BTreeMap::new();
+    for layer in &resp.layers {
+        for name in layer.vars.iter().chain(layer.files.iter()) {
+            let shadows = winner.contains_key(name);
+            winner.insert(name.clone(), (layer.label.clone(), shadows));
+        }
+    }
+    winner
+        .into_iter()
+        .map(|(name, (label, shadows))| (name, label, shadows))
+        .collect()
+}
+
+/// `rpi secrets ls --group`: a group's head — revision, names, digests,
+/// sizes. Never a value (secrets spec: metadata projection).
+pub(crate) fn render_group_head(
+    label: &str,
+    head: &crate::proto::SecretGroupHeadResponse,
+) -> String {
+    let mut out = format!("group '{label}' at revision {}:\n", head.revision);
+    if head.vars.is_empty() && head.files.is_empty() {
+        out.push_str("  (empty)\n");
+        return out;
+    }
+    if !head.vars.is_empty() {
+        out.push_str("env keys:\n");
+        for (name, digest) in &head.vars {
+            out.push_str(&format!("  {name}  {digest}\n"));
+        }
+    }
+    if !head.files.is_empty() {
+        out.push_str("files:\n");
+        for (path, meta) in &head.files {
+            out.push_str(&format!("  {path}  {} B  {}\n", meta.size, meta.digest));
+        }
+    }
+    out
+}
+
+pub async fn secrets_group_ls(
     env: Option<String>,
     vars: Vec<String>,
     connect: ConnectOpts,
 ) -> anyhow::Result<()> {
     let resolved = crate::cli::overlay::resolve(env.as_deref(), &vars)?;
+    let base = resolve_base(&resolved);
+    let AgentConn {
+        tunnel: _tunnel,
+        api,
+        compat,
+    } = crate::cli::connect::connect_agent(connect).await?;
+    compat.gate(crate::compat::Feature::SecretGroups)?;
+
+    let listed = api.list_secret_groups(&base).await?;
+    if listed.groups.is_empty() {
+        output::info(format!("no secret groups for project '{base}'"));
+        return Ok(());
+    }
+    output::heading(format!("secret groups of '{base}':"));
+    for g in &listed.groups {
+        let attached = if g.attached_by.is_empty() {
+            "-".to_string()
+        } else {
+            g.attached_by.join(", ")
+        };
+        println!(
+            "  {}  r{}  {} key(s), {} file(s), {} B  attached: {attached}",
+            g.name, g.revision, g.keys, g.files, g.bytes
+        );
+    }
+    Ok(())
+}
+
+/// Confirmation text for `rpi secrets group rm`. Deleting a group destroys
+/// age-encrypted secrets that several environments may share, so the prompt
+/// names the revision being destroyed and everyone who still declares the
+/// group — the blast radius is wider than `rpi rm` of a single project, whose
+/// prompt already names both.
+///
+/// `revision` is `None` when the group lookup didn't come back (see
+/// `rm_confirmation_text` for the same best-effort pattern): the clause is
+/// dropped rather than guessed at.
+pub(crate) fn group_rm_confirmation_text(
+    base: &str,
+    name: &str,
+    revision: Option<u64>,
+    attached_by: &[String],
+) -> String {
+    let mut text = format!("this permanently deletes secret group '{base}/{name}'");
+    if let Some(revision) = revision {
+        text.push_str(&format!(" at revision {revision}"));
+    }
+    text.push_str("; its values cannot be recovered");
+    if !attached_by.is_empty() {
+        text.push_str(&format!(
+            "\nprojects that declare it and would fail their next deploy: {}",
+            attached_by.join(", ")
+        ));
+    }
+    text
+}
+
+pub async fn secrets_group_rm(
+    name: String,
+    force: bool,
+    yes: bool,
+    env: Option<String>,
+    vars: Vec<String>,
+    connect: ConnectOpts,
+) -> anyhow::Result<()> {
+    validate_group_arg(&name)?;
+    let resolved = crate::cli::overlay::resolve(env.as_deref(), &vars)?;
+    let base = resolve_base(&resolved);
+    let AgentConn {
+        tunnel: _tunnel,
+        api,
+        compat,
+    } = crate::cli::connect::connect_agent(connect).await?;
+    compat.gate(crate::compat::Feature::SecretGroups)?;
+
+    if !yes {
+        // Best-effort, like `rm`'s: the listing is only there to make the
+        // prompt specific, so a lookup that fails drops its clauses instead
+        // of failing the command.
+        let listed = api.list_secret_groups(&base).await.ok();
+        let row = listed
+            .as_ref()
+            .and_then(|resp| resp.groups.iter().find(|g| g.name == name));
+        output::warn(group_rm_confirmation_text(
+            &base,
+            &name,
+            row.map(|g| g.revision),
+            row.map(|g| g.attached_by.as_slice()).unwrap_or(&[]),
+        ));
+        eprint!("type the group name to confirm: ");
+        use std::io::Write;
+        std::io::stderr().flush()?;
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input)?;
+        if input.trim() != name {
+            anyhow::bail!("confirmation failed: expected '{name}'");
+        }
+    }
+
+    api.delete_secret_group(&base, &name, force).await?;
+    output::success(format!("removed secret group '{base}/{name}'"));
+    Ok(())
+}
+
+pub async fn secrets_ls(
+    group: Option<String>,
+    env: Option<String>,
+    vars: Vec<String>,
+    connect: ConnectOpts,
+) -> anyhow::Result<()> {
+    if let Some(group) = &group {
+        validate_group_arg(group)?;
+    }
+    let resolved = crate::cli::overlay::resolve(env.as_deref(), &vars)?;
     let is_env = resolved.env.is_some();
+    let base = resolve_base(&resolved);
     let rpitoml = resolved.rpitoml;
     let project_name = rpitoml.project.name.clone();
 
@@ -356,6 +841,13 @@ pub async fn secrets_ls(
         compat.gate(crate::compat::Feature::Environments)?;
     }
 
+    if let Some(group) = group {
+        compat.gate(crate::compat::Feature::SecretGroups)?;
+        let head = api.head_secret_group(&base, &group).await?;
+        print!("{}", render_group_head(&format!("{base}/{group}"), &head));
+        return Ok(());
+    }
+
     let resp = api.list_secrets(&project_name).await?;
     if resp.keys.is_empty() && resp.files.is_empty() {
         output::info(format!("no secrets stored for project '{project_name}'"));
@@ -364,17 +856,32 @@ pub async fn secrets_ls(
     if let Some(mode) = file_mode_to_print(&resp) {
         output::info(format!("file mode: {mode:04o}"));
     }
-    if !resp.keys.is_empty() {
-        output::heading("env keys:");
-        for key in &resp.keys {
-            println!("  {key}");
+    if resp.layers.is_empty() {
+        // Pre-0.27.0 agent: no provenance to show, print the flat list this
+        // command has always printed.
+        if !resp.keys.is_empty() {
+            output::heading("env keys:");
+            for key in &resp.keys {
+                println!("  {key}");
+            }
         }
+        if !resp.files.is_empty() {
+            output::heading("files:");
+            for file in &resp.files {
+                println!("  {file}");
+            }
+        }
+        return Ok(());
     }
-    if !resp.files.is_empty() {
-        output::heading("files:");
-        for file in &resp.files {
-            println!("  {file}");
-        }
+
+    output::heading(format!("effective secrets for '{project_name}':"));
+    for (name, label, shadows) in effective_rows(&resp) {
+        let suffix = if shadows {
+            " (overrides earlier layer)"
+        } else {
+            ""
+        };
+        println!("  {name}  <- {label}{suffix}");
     }
     Ok(())
 }
@@ -606,16 +1113,65 @@ pub async fn command(
     Ok(())
 }
 
+/// Confirmation text for `rpi rm`. Groups and still-registered environments
+/// are named because deleting a base project takes its groups with it, and
+/// any environment left behind will fail its next deploy on the missing
+/// group — loud beats silent.
+pub fn rm_confirmation_text(
+    project: &str,
+    groups: usize,
+    environments: &[String],
+    with_volumes: bool,
+) -> String {
+    let mut text = format!(
+        "this removes containers{}, the ingress route, workdir, secrets, deploy key and history of '{project}'",
+        if with_volumes { " and volumes" } else { "" }
+    );
+    if groups > 0 {
+        text.push_str(&format!(", plus {groups} secret group(s)"));
+    }
+    if !environments.is_empty() {
+        text.push_str(&format!(
+            "\nenvironments that would lose those groups and fail their next deploy: {}",
+            environments.join(", ")
+        ));
+    }
+    text
+}
+
 pub async fn rm(
     project: String,
     volumes: bool,
     yes: bool,
     connect: ConnectOpts,
 ) -> anyhow::Result<()> {
+    let AgentConn {
+        tunnel: _tunnel,
+        api,
+        compat: _compat,
+    } = crate::cli::connect::connect_agent(connect).await?;
+
     if !yes {
-        output::warn(format!(
-            "this removes containers{}, the ingress route, workdir, secrets, deploy key and history of '{project}'",
-            if volumes { ", VOLUMES (project data!)" } else { "" }
+        // Both lookups are best-effort: a pre-0.27.0 agent has no secret-groups
+        // endpoint, and the confirmation must not fail the command over it —
+        // it simply omits the group/environment clauses.
+        let groups = api
+            .list_secret_groups(&project)
+            .await
+            .ok()
+            .map(|resp| resp.groups.len())
+            .unwrap_or(0);
+        let environments: Vec<String> = api
+            .list_environments(Some(&project))
+            .await
+            .ok()
+            .map(|envs| envs.into_iter().map(|e| e.key).collect())
+            .unwrap_or_default();
+        output::warn(rm_confirmation_text(
+            &project,
+            groups,
+            &environments,
+            volumes,
         ));
         eprint!("type the project name to confirm: ");
         use std::io::Write;
@@ -627,11 +1183,6 @@ pub async fn rm(
         }
     }
 
-    let AgentConn {
-        tunnel: _tunnel,
-        api,
-        compat: _compat,
-    } = crate::cli::connect::connect_agent(connect).await?;
     let resp = api.remove_project(&project, volumes).await?;
     output::success(format!(
         "project '{}' removed{}",
@@ -952,11 +1503,182 @@ mod tests {
     use super::*;
     use crate::cli::rpitoml::SecretsSection;
 
+    /// The old-agent decision from Task 11's review: skip the lookup (and so
+    /// send `expected_revision: None`) exactly when the agent predates
+    /// secret groups or `--force` was passed; look it up otherwise.
+    #[test]
+    fn key_revision_lookup_is_skipped_for_old_agents_and_force() {
+        assert!(
+            !should_look_up_key_revision(false, false),
+            "old agent, no --force: no lookup route exists"
+        );
+        assert!(
+            !should_look_up_key_revision(false, true),
+            "old agent with --force: still no lookup route"
+        );
+        assert!(
+            !should_look_up_key_revision(true, true),
+            "--force: unconditional write, nothing to compare against"
+        );
+        assert!(
+            should_look_up_key_revision(true, false),
+            "normal case: must guard against a concurrent change"
+        );
+    }
+
+    /// The bug the Task 11 review caught: printing `(revision 0)` against an
+    /// agent that predates secret groups, because
+    /// `SecretsSendResponse.revision` decodes as the serde default `0` for a
+    /// response that never carried the field. `render_key_secrets_saved`
+    /// must omit the suffix entirely rather than print that fabricated `0`.
+    #[test]
+    fn key_secrets_saved_hides_the_revision_for_an_agent_that_never_sent_one() {
+        let text = render_key_secrets_saved("myapp", 2, 1, None);
+        assert_eq!(text, "saved 2 key(s) and 1 file(s) for project 'myapp'");
+        assert!(!text.contains("revision"), "got: {text}");
+    }
+
+    #[test]
+    fn key_secrets_saved_shows_the_revision_when_the_agent_reports_one() {
+        let text = render_key_secrets_saved("myapp", 2, 1, Some(5));
+        assert_eq!(
+            text,
+            "saved 2 key(s) and 1 file(s) for project 'myapp' (revision 5)"
+        );
+    }
+
+    fn session(agent_version: &str, features: &[&str]) -> crate::compat::CompatSession {
+        crate::compat::CompatSession::with_sink(
+            "0.27.0",
+            &crate::proto::VersionInfo {
+                version: agent_version.to_string(),
+                api: "v1".to_string(),
+                features: Some(features.iter().map(|s| s.to_string()).collect()),
+            },
+            Box::new(|_| {}),
+        )
+    }
+
+    /// `secret_groups` rides inside `ProjectDto`, which is not
+    /// `deny_unknown_fields`: a pre-0.27.0 agent ignores the field, deploys
+    /// happily, and starts the application with an empty `.env`. Gating at
+    /// the point of use is the only thing that catches it, because the guard
+    /// that would is on the agent that never sees the request.
+    #[test]
+    fn deploy_gates_secret_groups_only_when_the_config_declares_some() {
+        let old = session("0.26.0", &["secrets", "environments"]);
+        let err = gate_deploy_features(&old, false, &["shared".to_string()])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("secret groups"), "{err}");
+        assert!(err.contains(">= 0.27.0"), "{err}");
+        assert!(err.contains("update the agent on the Pi"), "{err}");
+
+        assert!(
+            gate_deploy_features(&old, false, &[]).is_ok(),
+            "a project that declares no groups must keep deploying to an old agent"
+        );
+    }
+
+    #[test]
+    fn deploy_still_gates_environments_and_passes_on_a_current_agent() {
+        let old = session("0.23.0", &["secrets"]);
+        assert!(gate_deploy_features(&old, true, &[]).is_err());
+
+        let current = session("0.27.0", &["secrets", "environments", "secret-groups"]);
+        assert!(gate_deploy_features(&current, true, &["shared".to_string()]).is_ok());
+    }
+
+    /// One rule and one message wherever a group name comes off the command
+    /// line. `../secrets` matters specifically: `Url` normalizes `..`, so an
+    /// unvalidated name would turn `GET .../secret-groups/../secrets` into a
+    /// request to a completely different route and produce a nonsense parse
+    /// error instead of "that is not a group name".
+    #[test]
+    fn group_arg_validation_shares_one_rule_and_one_message() {
+        for bad in ["../secrets", "Preview", "a/b", "under_score", ""] {
+            let err = validate_group_arg(bad).unwrap_err().to_string();
+            assert!(err.starts_with("group name:"), "{bad:?}: {err}");
+        }
+        let err = validate_group_arg("../secrets").unwrap_err().to_string();
+        assert!(
+            err.contains("^[a-z][a-z0-9-]*$"),
+            "the message must match the agent's: {err}"
+        );
+        for ok in ["preview", "db-creds", "a1"] {
+            assert!(validate_group_arg(ok).is_ok(), "{ok}");
+        }
+    }
+
+    #[test]
+    fn group_rm_confirmation_names_the_revision_and_who_attaches_it() {
+        let text = group_rm_confirmation_text(
+            "myapp",
+            "shared",
+            Some(4),
+            &["myapp--preview".into(), "myapp--staging".into()],
+        );
+        assert!(text.contains("myapp/shared"), "got: {text}");
+        assert!(text.contains("revision 4"), "got: {text}");
+        assert!(text.contains("cannot be recovered"), "got: {text}");
+        assert!(text.contains("myapp--preview"), "got: {text}");
+        assert!(text.contains("myapp--staging"), "got: {text}");
+    }
+
+    /// Same best-effort shape as `rm_confirmation_text`: a lookup that didn't
+    /// come back drops its clause instead of inventing a revision or implying
+    /// nobody attaches the group.
+    #[test]
+    fn group_rm_confirmation_drops_clauses_it_could_not_look_up() {
+        let text = group_rm_confirmation_text("myapp", "shared", None, &[]);
+        assert!(text.contains("myapp/shared"), "got: {text}");
+        assert!(!text.contains("revision"), "got: {text}");
+        assert!(!text.contains("declare it"), "got: {text}");
+    }
+
+    #[test]
+    fn rm_confirmation_names_groups_and_affected_environments() {
+        let text = rm_confirmation_text("myapp", 2, &["myapp--test".into()], true);
+        assert!(text.contains("2 secret group(s)"), "got: {text}");
+        assert!(text.contains("myapp--test"), "got: {text}");
+
+        let plain = rm_confirmation_text("myapp", 0, &[], false);
+        assert!(!plain.contains("secret group"), "got: {plain}");
+        assert!(!plain.contains("environment"), "got: {plain}");
+    }
+
+    /// Minimal `rpi.toml` text, mirroring `cli::overlay::tests::BASE`.
+    const SAMPLE_BASE: &str = r#"
+schema = 1
+
+[project]
+name = "myapp"
+
+[source]
+repo = "git@github.com:acme/myapp.git"
+branch = "main"
+
+[ingress]
+hostname = "app.example.com"
+service = "web"
+port = 3000
+
+[healthcheck]
+path = "/health"
+
+[secrets]
+env = ".env"
+
+[commands]
+seed = "node seed.js"
+"#;
+
     fn section(env: Option<&str>, files: &[&str]) -> SecretsSection {
         SecretsSection {
             env: env.map(str::to_string),
             files: files.iter().map(|s| s.to_string()).collect(),
             file_mode: None,
+            groups: vec![],
         }
     }
 
@@ -1268,7 +1990,85 @@ port = 3000
             keys: vec![],
             files: files.iter().map(|s| s.to_string()).collect(),
             file_mode,
+            layers: vec![],
         }
+    }
+
+    #[test]
+    fn effective_view_marks_shadowed_entries_and_names_the_winning_layer() {
+        let resp = crate::proto::SecretsListResponse {
+            keys: vec!["A".into(), "B".into()],
+            files: vec!["certs/server.pem".into()],
+            file_mode: Some(0o640),
+            layers: vec![
+                crate::proto::SecretLayerDto {
+                    label: "common".into(),
+                    revision: 3,
+                    vars: vec!["A".into(), "B".into()],
+                    files: vec![],
+                },
+                crate::proto::SecretLayerDto {
+                    label: "key".into(),
+                    revision: 2,
+                    vars: vec!["B".into()],
+                    files: vec!["certs/server.pem".into()],
+                },
+            ],
+        };
+
+        let rows = effective_rows(&resp);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0], ("A".to_string(), "common".to_string(), false));
+        assert_eq!(
+            rows[1],
+            ("B".to_string(), "key".to_string(), true),
+            "B is supplied by key and shadows common"
+        );
+        assert_eq!(
+            rows[2],
+            ("certs/server.pem".to_string(), "key".to_string(), false)
+        );
+    }
+
+    #[test]
+    fn render_group_head_lists_names_digests_and_sizes_never_values() {
+        let mut vars = BTreeMap::new();
+        vars.insert("DB_PASSWORD".to_string(), "deadbeefcafebabe".to_string());
+        let mut files = BTreeMap::new();
+        files.insert(
+            "certs/server.pem".to_string(),
+            crate::proto::SecretFileHeadDto {
+                size: 512,
+                digest: "0123456789abcdef".to_string(),
+            },
+        );
+        let head = crate::proto::SecretGroupHeadResponse {
+            revision: 4,
+            vars,
+            files,
+            file_mode: Some(0o640),
+        };
+
+        let rendered = render_group_head("myapp/preview", &head);
+        assert!(rendered.contains("myapp/preview"), "{rendered}");
+        assert!(rendered.contains("revision 4"), "{rendered}");
+        assert!(rendered.contains("DB_PASSWORD"), "{rendered}");
+        assert!(rendered.contains("deadbeefcafebabe"), "{rendered}");
+        assert!(rendered.contains("certs/server.pem"), "{rendered}");
+        assert!(rendered.contains("512 B"), "{rendered}");
+        assert!(rendered.contains("0123456789abcdef"), "{rendered}");
+    }
+
+    #[test]
+    fn render_group_head_marks_an_empty_group() {
+        let head = crate::proto::SecretGroupHeadResponse {
+            revision: 0,
+            vars: BTreeMap::new(),
+            files: BTreeMap::new(),
+            file_mode: None,
+        };
+        let rendered = render_group_head("myapp/preview", &head);
+        assert!(rendered.contains("(empty)"), "{rendered}");
     }
 
     #[test]
@@ -1338,5 +2138,58 @@ port = 3000
                 "create-invite  ->  node x.cjs  [service: server]"
             );
         }
+    }
+
+    #[test]
+    fn base_comes_from_the_environment_not_the_derived_key() {
+        // With --env the resolved project name is the derived key; addressing
+        // a group under that key would point at a directory no project owns.
+        let resolved = crate::cli::overlay::resolve_from(
+            SAMPLE_BASE,
+            Some((
+                "branch",
+                "[ingress]\nhostname = \"x.example.com\"\n\n[secrets]\ngroups = [\"preview\"]\n",
+            )),
+            &[],
+        )
+        .unwrap();
+        assert_eq!(resolved.rpitoml.project.name, "myapp--branch");
+        assert_eq!(resolve_base(&resolved), "myapp");
+
+        let plain = crate::cli::overlay::resolve_from(SAMPLE_BASE, None, &[]).unwrap();
+        assert_eq!(resolve_base(&plain), "myapp");
+    }
+
+    #[test]
+    fn diff_summary_reports_added_changed_and_removed_by_name_only() {
+        let local = {
+            let mut m = BTreeMap::new();
+            m.insert("KEEP".to_string(), "same".to_string());
+            m.insert("CHANGED".to_string(), "new-value".to_string());
+            m.insert("ADDED".to_string(), "fresh".to_string());
+            m
+        };
+        let remote = {
+            let mut m = BTreeMap::new();
+            m.insert("KEEP".to_string(), digest_of("same"));
+            m.insert("CHANGED".to_string(), digest_of("old-value"));
+            m.insert("REMOVED".to_string(), digest_of("gone"));
+            m
+        };
+
+        let d = diff_vars(&local, &remote);
+        assert_eq!(d.added, vec!["ADDED".to_string()]);
+        assert_eq!(d.changed, vec!["CHANGED".to_string()]);
+        assert_eq!(d.removed, vec!["REMOVED".to_string()]);
+        assert_eq!(d.unchanged, 1);
+
+        let rendered = d.render();
+        for value in ["same", "new-value", "old-value", "gone", "fresh"] {
+            assert!(!rendered.contains(value), "a value leaked: {rendered}");
+        }
+    }
+
+    fn digest_of(value: &str) -> String {
+        pi_domain::secretgroup::digest(value.as_bytes())
     }
 }

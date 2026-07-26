@@ -24,7 +24,7 @@ flowchart TD
         db["state.db — projects, deploy history, applied migrations"]
         co["Repo checkouts — one working directory per project"]
         ov["Compose overrides — one file per project"]
-        sec["Secrets vault — age-encrypted bundle per project, plus one agent key"]
+        sec["Secrets vault — age-encrypted bundle per project, plus per named group, plus one agent key"]
     end
     logs["/var/log/rpi — agent + deploy logs (owned by rpi-agent)"]
     sockdir["/run/rpi — runtime dir, group rpi-agent"]
@@ -107,10 +107,13 @@ flowchart TD
 
 6. **Secrets sit at rest encrypted, inside the data directory, separate from
    where they get used.** The agent keeps its own encrypted secrets vault
-   inside the data directory: one encrypted bundle per project, plus a
-   single key (generated the first time the agent ever starts) that every
-   bundle is encrypted against. Nothing about a project's secrets is ever
-   stored in plain text there.
+   inside the data directory: one encrypted bundle per project
+   (`secrets/<project>.secrets.age`), one more per named secret group,
+   nested under the base project that owns it
+   (`secrets/groups/<base>/<group>.age`), plus a single key (generated the
+   first time the agent ever starts) that every bundle — project or group —
+   is encrypted against. Nothing about a project's secrets is ever stored in
+   plain text there.
 
 7. **Secrets are only ever written to plain disk at deploy time, narrowly.**
    When a project deploys, its current secrets are decrypted and written
@@ -219,7 +222,9 @@ flowchart TD
   writes (separate from `agent setup`'s own direct legacy-rename check,
   which runs before a ledger handle exists and so never updates the ledger).
 - `crates/infrastructure/src/secrets.rs` — the encrypted secrets vault
-  itself: bundle-per-project layout and first-start identity key.
+  itself: bundle-per-project layout (`secrets/<project>.secrets.age`),
+  bundle-per-named-group layout nested under its base project
+  (`secrets/groups/<base>/<group>.age`), and the first-start identity key.
 - `crates/infrastructure/src/secretsfile.rs` — writes a project's decrypted
   secrets into its checkout at deploy time (its variables plus any declared
   files), validating paths and refusing to follow a symlink, and replacing

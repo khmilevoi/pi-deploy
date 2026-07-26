@@ -1,6 +1,6 @@
 ---
 name: rpi-cli
-description: Use when operating, installing, testing, or troubleshooting the rpi deploy CLI, including rpi deploy, rpi ls, rpi secrets send, rpi secrets ls, rpi command, rpi logs, rpi stats, rpi start/stop/restart/rm, rpi status, rpi doctor, rpi gc, rpi agent run, rpi setup, rpi init, rpi agent setup, rpi upgrade, rpi agent update, install.sh, SSH profiles, PI_SERVER, PI_AGENT_URL, local dev agents, CLI-to-agent connection failures, rpi config show and its [runtime] block, rpi env ls/destroy/reset-data (including --full-key), --env/--vars environment overlays, configuration variables, and the RPI_* runtime variables injected into containers.
+description: Use when operating, installing, testing, or troubleshooting the rpi deploy CLI, including rpi deploy, rpi ls, rpi secrets push, rpi secrets send (deprecated alias), rpi secrets ls, rpi secrets diff, rpi secrets group ls/rm, rpi command, rpi logs, rpi stats, rpi start/stop/restart/rm, rpi status, rpi doctor, rpi gc, rpi agent run, rpi setup, rpi init, rpi agent setup, rpi upgrade, rpi agent update, install.sh, SSH profiles, PI_SERVER, PI_AGENT_URL, local dev agents, CLI-to-agent connection failures, rpi config show and its [runtime] block, rpi env ls/destroy/reset-data (including --full-key), --env/--vars environment overlays, configuration variables, the RPI_* runtime variables injected into containers, and secret groups ([secrets].groups).
 ---
 
 # Rpi CLI
@@ -32,9 +32,12 @@ Primary references in this repo:
 | Remove an environment's volumes; next deploy re-runs `on_create` | `rpi env reset-data <env> [--vars ...] [--yes]` |
 | Same, by key, with no config file | `rpi env reset-data --full-key <key> [--yes]` |
 | List projects | `rpi ls` or `rpi ps` |
-| Send secrets bundle (env + files) | `rpi secrets send [--env <env>] [--vars ...]` |
-| Send secrets bundle and restart running stack | `rpi secrets send --apply` |
-| List stored secret keys | `rpi secrets ls [--env <env>] [--vars ...]` |
+| Push secrets to a group, or this project's own bundle | `rpi secrets push [--group <name>] [--merge] [--force] [--apply] [--env <env>] [--vars ...]` |
+| Push secrets and restart the running stack | `rpi secrets push --apply` (`rpi secrets send` is a deprecated alias, no `--group`) |
+| List the effective merged secrets, or one group's head | `rpi secrets ls [--group <name>] [--env <env>] [--vars ...]` |
+| Compare local secret sources against the agent by digest | `rpi secrets diff [--group <name>] [--env <env>] [--vars ...]` |
+| List this project's secret groups and who attaches them | `rpi secrets group ls [--env <env>] [--vars ...]` |
+| Delete a secret group | `rpi secrets group rm <name> [--force] [--yes] [--env <env>] [--vars ...]` |
 | Stream container logs | `rpi logs <project> [-f] [--tail N]` |
 | Live CPU/memory/disk metrics | `rpi stats [project]` |
 | Start / stop / restart project containers | `rpi start\|stop\|restart <project>` |
@@ -201,6 +204,58 @@ rpi env destroy --full-key myapp--branch--feature-login   # by key, reads no con
   duration format, default one hour) and tears down any whose TTL has
   elapsed since its last successful deploy. See
   `docs/architecture/flows/environments.md` for the full flow.
+
+## Secret Groups
+
+A secret group is a named, reusable set of secrets owned by a project's
+*base* namespace and attached declaratively via `[secrets].groups` in
+`rpi.toml` (see the `rpi-toml` skill for the field). Pushing a group once and
+declaring it from every branch preview's overlay means a new branch never
+needs its own secrets upload:
+
+```bash
+rpi secrets push --group shared              # create or replace the group wholesale
+rpi secrets push --group shared --merge      # upsert onto what is already stored
+rpi secrets push --group shared --force      # overwrite unconditionally, skip the revision guard
+rpi secrets group ls                         # this project's groups, revision, size, who attaches each
+rpi secrets ls --group shared                # one group's head: names, digests, sizes, no merging
+rpi secrets diff --group shared              # what a push would change, by digest, never a value
+rpi secrets group rm shared                  # delete; prompts for the group name
+rpi secrets group rm shared --force --yes    # --force: delete though a project declares it; --yes: skip the prompt
+```
+
+- `rpi secrets push` (no `--group`) targets this deploy key's own bundle and
+  behaves exactly like the pre-groups `rpi secrets send`, which remains a
+  deprecated alias for it with no `--group` support.
+- At deploy time the agent resolves every declared group in order, then this
+  deploy key's own bundle on top, and merges them per object (later layer
+  wins by variable name/file path). A declared group that is missing or
+  empty fails the deploy naming the group and the `rpi secrets push --group
+  <name>` command that fixes it.
+- Every push (group or key) is a conditional write guarded by a revision
+  counter: unless `--force`, the CLI reads the target's current revision
+  first and sends it as the expected revision; a write whose expectation is
+  stale is rejected with an HTTP 409 telling the caller to re-run and see
+  the diff, or pass `--force`. No command or endpoint ever returns a secret
+  value — only names, paths, sizes, revisions and digests, whether listing,
+  diffing, or reporting a push's result.
+- `rpi secrets group rm` destroys encrypted secrets several environments may
+  share, so unless `--yes` is passed it prints the group's revision and
+  everyone who still declares it, then asks for the group name to be typed
+  back — the same shape as `rpi rm`. `--force` and `--yes` are separate
+  flags on purpose: `--force` only waives the "a project still declares it"
+  guard, and must not double as confirmation. Deleting a name that was never
+  pushed is a 404, so a typo is distinguishable from a real deletion.
+- `rpi rm <project>` on a base project drops its groups along with it;
+  `rpi env destroy` and the TTL reaper never do — an environment borrows its
+  base's groups, it doesn't own them.
+- Requires an agent `>= 0.27.0` (the `secret-groups` capability); an older
+  agent gets an upgrade message instead of a raw connection error. That
+  includes `rpi deploy`: a project whose `[secrets].groups` is non-empty is
+  gated too, because an agent that predates groups would silently ignore the
+  field and start the application with a group-less (often empty) `.env`. See
+  `docs/architecture/flows/secrets.md` for the full layering, conditional-
+  write, and teardown-ownership rules.
 
 ## Secrets File Mode
 

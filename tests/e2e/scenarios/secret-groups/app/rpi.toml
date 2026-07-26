@@ -1,0 +1,32 @@
+schema = 1
+
+[project]
+name = "e2e-fixture"
+
+[source]
+repo = "git://git-fixture/fixture.git"
+branch = "main"
+
+[build]
+compose = "compose.yaml"
+
+[ingress]
+service = "web"
+port = 8080
+
+[healthcheck]
+path = "/health"
+expect = "200"
+timeout = "30s"
+
+# The base project: this is the group's owner. It is never deployed itself in
+# this scenario -- only environments derived from it are -- but the group
+# lives under its name regardless.
+[secrets]
+env = ".env.shared"
+groups = ["shared"]
+
+[commands]
+# Prints the value injected by the "shared" group, so the scenario can assert
+# on it through `rpi command` instead of reading the workdir directly.
+print-token = "sh -c 'echo $SHARED_TOKEN'"

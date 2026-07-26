@@ -42,6 +42,7 @@ files = [                        # optional; recreated at the same paths on the 
   "certs/server.pem",
 ]
 # file_mode = "0640"             # optional; default 0644 for files, 0600 for .env
+# groups = ["shared"]            # optional; named secret sets attached from the base project
 ```
 
 Worker, bot, or internal service without public HTTP ingress:
@@ -79,6 +80,7 @@ port = 3000
 | `secrets.env` | no | `".env"` | Local env file read by `rpi secrets send`. |
 | `secrets.files` | no | none | Optional list of local secret file paths (certs, keys), forward-slash relative, `..` rejected; recreated verbatim on the Pi on every deploy. |
 | `secrets.file_mode` | no | none | `^0?[0-7]{3}$` (e.g. `"0640"`/`"640"`); owner read required, owner write optional, group/other read optional, nothing else. Overrides both the `0644` default for `secrets.files` and the `0600` default for `.env` at once — a container consuming a bind-mounted secret usually isn't the agent's uid, so the file mode is what decides whether it can read it. Requires an agent `>= 0.26.0` (`secret-modes` capability); the mode travels with the bundle, so it takes effect on the next `rpi secrets send`, not a `rpi deploy` that reuses an already-stored bundle. |
+| `secrets.groups` | no | none | Ordered array of secret-group names attached from this project's base namespace, e.g. `["common", "preview"]`. Each name must match `^[a-z][a-z0-9-]*$`, max 40 characters. Applied in declared order at deploy time, then this deploy key's own bundle on top — a later layer replaces an earlier one per variable/file, and `file_mode` comes from the last layer that set one. An overlay's `groups` field replaces the base's list wholesale, same as `secrets.files`; `groups = []` in an overlay detaches every group. A declared group that is missing or empty fails the deploy naming the group and the `rpi secrets push --group <name>` command to fix it. Requires an agent `>= 0.27.0` (`secret-groups` capability). See `rpi-cli`'s secrets section for the `rpi secrets push --group`/`group ls`/`group rm` commands that manage groups, and `docs/architecture/flows/secrets.md` for the full layering and conditional-write rules. |
 | `commands.<name>` | no | none | String (shell-word split, quotes only) or argv array. Name: `[a-z0-9][a-z0-9_-]*`. Registered at deploy, run via `rpi command`. |
 | `timeouts.command` | no | `"600s"` | Budget for one `rpi command` run. |
 
@@ -242,15 +244,18 @@ Rules:
   field-wise (an overlay field present overwrites the base value; absent
   leaves the base value untouched); nested tables (`[ingress]`,
   `[healthcheck]`, `[timeouts]`, `[secrets]`) merge field-wise the same way;
-  `[commands]` and array fields (`secrets.files`) replace **wholesale** — an
-  overlay `[commands]` table drops every base command not repeated in it; an
-  explicit empty string (`""`) on an optional field (e.g. `ingress.hostname`,
-  `secrets.env`, `secrets.file_mode`) resets it to unset rather than being
-  ignored.
+  `[commands]` and array fields (`secrets.files`, `secrets.groups`) replace
+  **wholesale** — an overlay `[commands]` table drops every base command not
+  repeated in it, and an overlay `groups = []` detaches every group the base
+  declared; an explicit empty string (`""`) on an optional field (e.g.
+  `ingress.hostname`, `secrets.env`, `secrets.file_mode`) resets it to unset
+  rather than being ignored.
 - **Variables** work the same in an overlay as in the base file (see the
   Variables section above); `${env.name}` and `${env.slug}` are available
   only when `--env` selected an environment. `--vars` is *not* tied to
-  `--env` — it works against the base `rpi.toml` alone.
+  `--env` — it works against the base `rpi.toml` alone. The one exception is
+  `[secrets].groups`, which refuses a `${...}` reference in either file — a
+  group name is attachment identity and must be static.
 - **Key derivation**: the deployed `project.name` is always CLI-derived, never
   read from the overlay — `<base>--<env>`, or `<base>--<env>--<slug>` when
   either file references `${env.slug}`. The suffix hangs on that one
