@@ -45,6 +45,7 @@ impl ControlLifecycle {
             workdir,
             compose_file,
             override_file,
+            env: Default::default(),
         };
         self.runtime.lifecycle(&stack, action, log).await
     }

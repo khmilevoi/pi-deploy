@@ -291,6 +291,7 @@ impl DeployProject {
             workdir: fetched.workdir.clone(),
             compose_file: fetched.workdir.join(&config.compose_path),
             override_file,
+            env: Default::default(),
         };
         {
             let _build_slot = self
@@ -1464,6 +1465,13 @@ mod tests {
             &self,
             _project_name: &str,
         ) -> Result<Vec<pi_domain::entities::ServiceState>, DomainError> {
+            Ok(vec![])
+        }
+
+        async fn services(
+            &self,
+            _: &pi_domain::entities::ComposeStack,
+        ) -> Result<Vec<String>, DomainError> {
             Ok(vec![])
         }
 

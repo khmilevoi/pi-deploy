@@ -59,6 +59,10 @@ pub trait ContainerRuntime: Send + Sync {
     async fn build(&self, stack: &ComposeStack, log: Arc<dyn LogSink>) -> Result<(), DomainError>;
     async fn up(&self, stack: &ComposeStack, log: Arc<dyn LogSink>) -> Result<(), DomainError>;
     async fn ps(&self, project_name: &str) -> Result<Vec<ServiceState>, DomainError>;
+    /// Service names of the stack, from the compose file plus the
+    /// repository's own override — deliberately excluding the generated
+    /// override, which is what the caller is about to write.
+    async fn services(&self, stack: &ComposeStack) -> Result<Vec<String>, DomainError>;
     /// `docker image prune -f` — dangling images only; build cache stays (§8.1).
     async fn prune_images(&self, log: Arc<dyn LogSink>) -> Result<(), DomainError>;
     /// `docker builder prune -f` with an age filter — frees build cache when

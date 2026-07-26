@@ -459,6 +459,11 @@ pub struct ComposeStack {
     pub workdir: PathBuf,
     pub compose_file: PathBuf,
     pub override_file: PathBuf,
+    /// `RPI_*` runtime variables. Exported into the environment of every
+    /// `docker compose` invocation for this stack, so `${RPI_*}` interpolates
+    /// inside the project's own compose file, and passed as `-e` flags on
+    /// `exec`. Empty for call paths that do not need them.
+    pub env: BTreeMap<String, String>,
 }
 
 /// Live container metrics of one compose service (`rpi stats`, v0.4 design §4).

@@ -72,6 +72,7 @@ impl RemoveProject {
                 workdir,
                 compose_file,
                 override_file: self.overrides.path(project),
+                env: Default::default(),
             };
             self.runtime
                 .down(&stack, remove_volumes, Arc::clone(&log))

@@ -71,6 +71,7 @@ impl RunCommand {
             workdir,
             compose_file,
             override_file,
+            env: Default::default(),
         };
         let secs = registered
             .config
@@ -291,6 +292,9 @@ mod tests {
                 _: &str,
             ) -> Result<Vec<pi_domain::entities::ServiceState>, DomainError> {
                 unimplemented!()
+            }
+            async fn services(&self, _: &ComposeStack) -> Result<Vec<String>, DomainError> {
+                Ok(vec![])
             }
             async fn prune_images(&self, _: Arc<dyn LogSink>) -> Result<(), DomainError> {
                 unimplemented!()

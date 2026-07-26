@@ -126,6 +126,7 @@ impl ResetEnvironmentData {
                 workdir,
                 compose_file,
                 override_file: self.overrides.path(key),
+                env: Default::default(),
             };
             self.runtime.down(&stack, true, Arc::clone(&log)).await?;
         }

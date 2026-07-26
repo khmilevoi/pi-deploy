@@ -103,6 +103,7 @@ impl SendSecrets {
             workdir: workdir.clone(),
             compose_file: workdir.join(&config.compose_path),
             override_file,
+            env: Default::default(),
         };
         self.runtime.up(&stack, log).await?;
         Ok(SecretsSaved {
