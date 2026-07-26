@@ -5,7 +5,7 @@ description: Use when cutting, publishing, planning, or troubleshooting a releas
 
 # Releasing rpi-deploy
 
-Pushing a tag `vX.Y.Z` triggers `.github/workflows/release.yml`, which does everything downstream automatically: version checks → 3-target binary build → GitHub Release with SHA256SUMS and generated notes → npm publish (OIDC, no token). Your job is one correct commit plus one correct tag. Both real release mistakes in this repo's history were made *before* the tag: a version-sync miss (fix commit `492012d`) and a stale README status line — steps 2 and 3 exist because of them.
+Pushing a tag `vX.Y.Z` triggers `.github/workflows/release.yml`, which does everything downstream automatically: version checks → 3-target binary build → GitHub Release with SHA256SUMS and generated notes → npm publish (OIDC, no token). Your job is one correct commit plus one correct tag. Both real release mistakes in this repo's history were made *before* the tag: a version-sync miss (fix commit `492012d`) and a stale README `## Highlights` section — steps 2 and 3 exist because of them.
 
 The version lives in three files that must agree, plus the tag: `Cargo.toml` (`[workspace.package] version` — the only Cargo.toml to touch; crates inherit via `version.workspace = true`), `package.json`, and `Cargo.lock` (regenerated, never hand-edited). CI compares the tag byte-for-byte against `"v" + package.json version`.
 
@@ -65,23 +65,41 @@ survive a `feat:` commit, which is why preflight refuses one.
    already moved by the time the first install fails. The tarball must
    include `bin/`, the whitelisted `scripts/`, `crates/`, `Cargo.toml`,
    `Cargo.lock`.
-4. `rtk git commit -m "chore: release X.Y.Z"` with those three files, push.
-5. **Re-confirm the release commit is on `origin/master` before tagging**:
-   `git fetch origin master` first (a rejected push can leave the
-   remote-tracking ref stale, and a stale ref makes this check pass for the
-   wrong reason), then `git rev-parse HEAD` must equal
-   `git rev-parse origin/master`. Preflight
-   established this, but that was before the release commit existed. If a PR
-   merges to `master` mid-release, the step-4 push is rejected as
-   non-fast-forward, and the obvious reaction — `git pull --rebase`, push
-   again — puts the release commit on top of a commit preflight never
-   classified, which may well be a `feat:`. Tagging then ships unverified,
-   possibly minor-level code as a patch with the local gate skipped. The
-   same happens more quietly if the rejected push goes unnoticed:
-   `git push origin vX.Y.Z` carries the missing objects along with the tag,
-   and the workflow's `check` job only compares `package.json` against the
-   tag name — it never checks that the commit is on `master`. Not equal
-   means stop and start over from step 1, never `--force`.
+4. `rtk git commit -m "chore: release X.Y.Z"` with those three files, then
+   `rtk git push`. **If the push is rejected as non-fast-forward, go back to
+   step 1 and re-run preflight — do not `git pull --rebase` and push
+   again.** The rejection means a PR merged to `master` while you were
+   releasing, and rebasing puts the release commit on top of commits
+   preflight never classified, one of which may be a `feat:`; tagging then
+   ships unverified, possibly minor-level code as a patch with the local
+   gate skipped. Nothing later catches this — the step-5 check cannot (after
+   a rebase and a successful push the release commit genuinely *is* on
+   `origin/master`), and the workflow's `check` job only compares
+   `package.json` against the tag name. The rejected push is the signal;
+   act on it there. Going back means dropping the release commit first —
+   `rtk git fetch origin master && rtk git reset --hard origin/master` —
+   otherwise preflight refuses on `HEAD != origin/master`; nothing is lost,
+   the commit holds only the three files step 2 regenerates.
+5. **Confirm the commit you are about to tag is on `origin/master`**:
+   ```
+   rtk git fetch origin master
+   rtk git merge-base --is-ancestor HEAD origin/master
+   ```
+   The fetch is only there to make the answer current: `origin/master` is a
+   local cache, and git advances it on a successful push but not on a
+   rejected one. `--is-ancestor` exits 0 when HEAD is contained in
+   `origin/master` — which is the property actually wanted, "the commit I am
+   tagging is on master". Non-zero means it is not: the push never landed,
+   and `rtk git push origin vX.Y.Z` would carry the missing objects to
+   GitHub as the tag's own payload, producing a released commit that is on
+   no branch. Ancestry rather than equality on purpose — someone else's PR
+   merging after your push moves `origin/master` ahead of you and leaves
+   your tag perfectly correct, so an equality check would refuse a good
+   release. Non-zero means stop: push the commit, or if the push was
+   rejected go back to step 1. Never `--force`. (Preflight's own
+   `HEAD == origin/master` answers a different question at a different
+   moment — before the bump you must be sitting exactly on `master` HEAD, or
+   the commit range it classifies is not the range you would release.)
 6. `rtk git tag -a vX.Y.Z -m "vX.Y.Z" && rtk git push origin vX.Y.Z` —
    immediately, without waiting for `ci` on the release commit. The release
    workflow's own `check` job re-runs versions and tests before `build` and
@@ -92,9 +110,18 @@ survive a `feat:` commit, which is why preflight refuses one.
    the tag — verifying before that reports the release as missing, which is
    noise, not a finding:
    ```
-   gh run watch "$(gh run list --workflow release --limit 1 --json databaseId --jq '.[0].databaseId')"
+   gh run watch "$(gh run list --workflow release --branch vX.Y.Z --limit 1 --json databaseId --jq '.[0].databaseId')"
    node scripts/release-verify.mjs X.Y.Z
    ```
+   `--branch vX.Y.Z` is not optional: a tag-triggered run reports the tag as
+   its `headBranch`, and without the filter the newest `release` run is
+   whichever one ran last — the previous release, or a
+   `gh workflow run release.yml` dry run — so
+   `gh run watch` returns "completed successfully" instantly and you walk
+   into a verify against a release that has not been built yet.
+   `release-verify.mjs` selects its run the same way, by `headBranch == tag`.
+   If the command prints nothing at all, GitHub has not registered the run
+   yet: wait a few seconds and repeat it.
 8. Release notes — required, same as any release, but short: one bullet per
    `fix:` commit stating the old and the new behaviour. See "Release notes"
    below.
@@ -160,18 +187,40 @@ What quick mode does **not** do, and why it is safe:
    node --test "scripts/**/*.test.*"   # postinstall + release tooling tests; CI runs these too
    npm pack --dry-run                   # tarball must include bin/, scripts/, crates/, Cargo.toml, Cargo.lock
    ```
-5. **Commit and push**: `chore: release X.Y.Z` with `Cargo.toml package.json Cargo.lock README.md` (+ any docs). Wait for the `ci` workflow to go green: `rtk gh run list --workflow ci --limit 1`.
+5. **Commit and push**: `chore: release X.Y.Z` with `Cargo.toml package.json Cargo.lock README.md` (+ any docs), then wait for the `ci` workflow to go green: `rtk gh run list --workflow ci --limit 1`.
+   **If the push is rejected as non-fast-forward, go back to step 0 — do not
+   `git pull --rebase` and push again.** The rejection means a PR merged to
+   `master` while you were preparing the release, so the commit range you
+   chose the bump from and ran the local gate against is no longer the range
+   you would be tagging: the new commits can turn your patch into a minor,
+   and nothing downstream re-reads them. Re-run preflight, re-check the
+   bump, and redo steps 2-4 on the new base. Step 7's ancestry check does
+   not cover this — after a rebase and a successful push the release commit
+   really is on `origin/master`. Drop the release commit before going back
+   (preflight and `bump-version.mjs` both refuse otherwise): `rtk git reset
+   --hard origin/master` when it holds only the three generated files, or
+   `rtk git reset --soft HEAD~1 && rtk git stash` first when it also carries
+   README or docs edits you want to keep — step 2 needs a clean tree, so
+   restore them after it.
 6. **Optional dry run** (recommended after toolchain/dependency changes): `gh workflow run release.yml --ref master` builds all 3 targets (Windows MSVC, x86_64/aarch64 musl) but skips release + publish.
-7. **Tag and push**: first re-confirm what you are tagging — `git fetch origin master`,
-   then `git rev-parse HEAD` must equal `git rev-parse origin/master`
-   (fetch first: a rejected push can leave the remote-tracking ref stale, and a
-   stale ref makes the comparison pass for the wrong reason).
-   A PR merging to `master` while the
-   release is in progress rejects the step-5 push, and recovering with
-   `git pull --rebase` silently moves the release commit on top of a commit
-   this checklist never reviewed; the workflow's `check` job compares
-   `package.json` against the tag name and never checks that the commit is on
-   `master`, so nothing downstream catches it. Then
+7. **Tag and push**: first confirm the commit you are about to tag is on `origin/master`:
+   ```
+   rtk git fetch origin master
+   rtk git merge-base --is-ancestor HEAD origin/master
+   ```
+   The fetch is only there to make the answer current — `origin/master` is a
+   local cache, advanced by a successful push and not by a rejected one.
+   `--is-ancestor` exits 0 when HEAD is contained in `origin/master`, which
+   is the property actually wanted. Non-zero means the release commit never
+   landed on the remote, and `rtk git push origin vX.Y.Z` would carry its
+   objects to GitHub as the tag's own payload — a released commit on no
+   branch, which the workflow's `check` job cannot catch because it only
+   compares `package.json` against the tag name. Ancestry rather than
+   equality on purpose: another PR merging after your push moves
+   `origin/master` ahead and leaves your tag perfectly correct, so an
+   equality check would refuse a good release. The case this check does
+   *not* cover — a rebase after a rejected push — is handled at step 5,
+   where the rejection happens. Then
    `rtk git tag -a vX.Y.Z -m "vX.Y.Z" && rtk git push origin vX.Y.Z`. Lowercase `v`,
    full three-part version — the check job rejects anything else.
 
@@ -187,11 +236,27 @@ version do not exist until the `release` and `npm-publish` jobs run, roughly
 not yet published, which is noise rather than a finding:
 
 ```
-gh run watch "$(gh run list --workflow release --limit 1 --json databaseId --jq '.[0].databaseId')"
+gh run watch "$(gh run list --workflow release --branch vX.Y.Z --limit 1 --json databaseId --jq '.[0].databaseId')"
 node scripts/release-verify.mjs X.Y.Z
 ```
 
+`--branch vX.Y.Z` selects the run this tag triggered — a tag-triggered run
+reports the tag as its `headBranch`, and `release-verify.mjs` finds its run
+the same way. Without the filter the newest `release` run is whichever ran
+last (the previous release, or a step-6 dry run), so `gh run watch` reports
+success instantly and the verify runs against a release that does not exist
+yet. An empty result means GitHub has not registered the run yet — wait a
+few seconds and repeat.
+
 It checks the release workflow's jobs, the release assets, the published npm version, and an `npx` smoke test, and exits non-zero if any of them is wrong — the workflow's jobs must all be green; let the script's own output say which. The job list is matrix-expanded: a real run reports six rows, three of them `build (…)` instances, for four required job names.
+
+Run too early it reports rather than crashes: a release the `release` job has
+not created yet becomes a failing `assets` check, the npx smoke test is
+reported as *not run* (a failing check, never a pass) instead of costing a
+docker pull to rediscover the same fact, and every check that could answer
+still prints. Only a broken environment — no `gh` or `docker` on PATH, an
+expired token, a stopped Docker daemon, no network — exits 2, and it prints
+the results it already had on the way out.
 
 The npx check runs inside a throwaway Docker container, never directly on the dev machine — a local machine can have a global `rpi-deploy` install or npx cache that shadows the version resolution and silently passes/fails against stale state instead of the real published package. The script also times the install and flags anything slower than ~90s, since that means npx fell back to a source build instead of the prebuilt binary.
 
@@ -207,7 +272,7 @@ The release is not done until the notes describe the changes — a green npm pub
 
 ## Landing page audit (minor and major releases, in subagents)
 
-The landing (`rpi-deploy-site`, live at https://rpi.iiskelo.com) once sat five releases stale — quick-start step 1 still printed `rpi 0.12.0` when v0.17.1 was current — because this step used to say "check whether this release changed anything the landing shows", and that check got answered from memory ("probably not") instead of by reading the page. Drift accumulates across releases, so the audit is unconditional **on every minor and major release**: run it even when this release "obviously" changed nothing user-visible — "obviously nothing" is the exact reasoning that let the landing sit stale before, and the drift you find is usually from earlier releases. Patch releases do not run this audit — quick mode's step 7 above covers them with `sync-version` alone, which guarantees version strings by construction but not feature text; that gap is deliberate and accumulates until the next minor or major runs the full audit.
+The landing (`rpi-deploy-site`, live at https://rpi.iiskelo.com) once sat five releases stale — quick-start step 1 still printed `rpi 0.12.0` when v0.17.1 was current — because this step used to say "check whether this release changed anything the landing shows", and that check got answered from memory ("probably not") instead of by reading the page. Drift accumulates across releases, so the audit is unconditional **on every minor and major release**: run it even when this release "obviously" changed nothing user-visible — "obviously nothing" is the exact reasoning that let the landing sit stale before, and the drift you find is usually from earlier releases. Patch releases do not run this audit — quick mode's landing step above covers them with `sync-version` alone, which guarantees version strings by construction but not feature text; that gap is deliberate and accumulates until the next minor or major runs the full audit.
 
 The audit brief lives in the site repo, not here — **read `docs/landing-audit.md` in `rpi-deploy-site` before doing any of this** (step 1 below gets you a local copy). It defines the four auditor lenses, the shared context each needs, and the report format; this section only covers the release-side mechanics.
 

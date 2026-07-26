@@ -73,7 +73,7 @@ no green `ci` run.
 | `node scripts/check-version.js` | kept | Instant, and guards exactly what quick mode changes — a version drift is one of the two mistakes this repo has actually made (`492012d`) |
 | README `## Highlights` section | not touched | A patch usually changes nothing it describes. When it does, `bump-version.mjs` runs first (it refuses a dirty tree), then the edit, then one commit of four files. Other docs are still updated when the fix changes documented behaviour |
 | Wait for `ci` green on the release commit before tagging | **tag immediately** | See below |
-| Re-confirm `HEAD == origin/master` before tagging | **kept, and new in both modes** | Preflight checks this before the bump, so it says nothing about the release commit. A PR merging mid-release rejects the push, and the natural `git pull --rebase` recovery tags a commit that was never classified. Not in `release-preflight.mjs`: it runs before the bump, which is the wrong moment |
+| Confirm the release commit is on `origin/master` before tagging | **kept, and new in both modes** | `git merge-base --is-ancestor HEAD origin/master`, not an equality: it answers "is the commit I am tagging on master", and stays true when someone else's PR moves `master` ahead after a correct push. It catches a push that never landed — tagging then ships the objects as tag payload, on no branch. It does **not** catch a rebase after a rejected push (the rebased commit really is on master); that case is caught at the push itself, where a non-fast-forward rejection sends the releaser back to step 1. Not in `release-preflight.mjs`: it runs before the bump, which is the wrong moment |
 | Post-release verification | kept, scripted (§3.4) | Cheap, and a script cannot answer from memory |
 | Release notes | kept, shorter | A patch whose notes do not say what was fixed is as useless as a minor's |
 | Four-auditor landing audit | replaced by scripted version sync (§3.3) | Numbers are the historical drift source and are now closed by construction |
@@ -225,13 +225,22 @@ One pass/fail over what is currently four separate one-liners:
   as a failing `assets` check with the other results still printed, never as
   a crash. Genuine `gh` failures (missing binary, expired token, HTTP
   401/403, network) stay fatal at exit 2;
-- `npm view rpi-deploy version` equals `X.Y.Z`;
+- `npm view rpi-deploy version` equals `X.Y.Z`. A registry miss (`E404`) is
+  reported the same way as an unpublished release; anything else is fatal;
 - `docker run --rm node:20-slim npx -y rpi-deploy@X.Y.Z --version` prints
   `rpi X.Y.Z`. The container is not optional: a local machine can have a
   global install or an npx cache that shadows the resolution and passes
   against stale state. Elapsed time is reported, and a run longer than
   ~90s is flagged — that means npx fell back to a cargo build instead of
-  the prebuilt binary.
+  the prebuilt binary. It is **not run at all** when the release or the npm
+  version is already known to be absent (`npm-publish` has `needs: release`,
+  so an unpublished release settles it), and that skip is reported as a
+  failing check, never as a pass — otherwise the pre-publish window costs a
+  docker pull to learn what the previous check already said.
+
+The results list is printed whatever happens, including on the way out to
+exit 2: a "not published yet" answer to any check must never hide the
+checks that did run.
 
 Exits non-zero on any failure.
 
@@ -240,15 +249,19 @@ Exits non-zero on any failure.
 1. `node scripts/release-preflight.mjs` → `quick: allowed (X.Y.Z)`.
 2. `node scripts/bump-version.mjs X.Y.Z`.
 3. `npm pack --dry-run` — kept; see §2.
-4. Commit `chore: release X.Y.Z`, push.
-5. `git fetch origin master`, then `git rev-parse HEAD` ==
-   `git rev-parse origin/master` — re-confirmed here, after the release
-   commit exists; see §2.
+4. Commit `chore: release X.Y.Z`, push. A non-fast-forward rejection sends
+   you back to step 1 — never `git pull --rebase` and push again; see §2.
+5. `git fetch origin master`, then
+   `git merge-base --is-ancestor HEAD origin/master` — the commit being
+   tagged is on `master`; see §2.
 6. `git tag -a vX.Y.Z -m "vX.Y.Z" && git push origin vX.Y.Z`.
 7. `gh run watch <run>`, then `node scripts/release-verify.mjs X.Y.Z`. The
-   wait is part of the step: the GitHub Release is created by the `release`
-   job minutes after the tag, so verifying immediately reports a release
-   that simply does not exist yet.
+   run is selected by the tag ref (`gh run list --branch vX.Y.Z`, the same
+   `headBranch == tag` rule the script uses) — unfiltered, the newest
+   `release` run is the previous release or a dry run, and the watch returns
+   success immediately. The wait is part of the step: the GitHub Release is
+   created by the `release` job minutes after the tag, so verifying
+   immediately reports a release that simply does not exist yet.
 8. Rewrite the release notes: a **What changed** section with one bullet
    per `fix:` commit in the range, each stating the old and the new
    behaviour. `gh release edit vX.Y.Z --notes-file notes.md`.

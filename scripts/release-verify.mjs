@@ -104,7 +104,27 @@ export function classifyReleaseViewFailure(text) {
   return RELEASE_NOT_FOUND.test(String(text ?? "")) ? "not-published" : "error";
 }
 
-export function releaseViewFailureText(err) {
+// The same split for the registry-facing calls (`npm view`, and the `npx`
+// inside the container). `npm-publish` has `needs: release` in the
+// workflow, so for the whole 5-10 minute window after the tag "the release
+// is not published" also means "the version is not on npm" — the registry
+// answers E404 (package or version absent) or ETARGET (package there, this
+// version not yet). Those are checks that have not passed yet and belong in
+// the printed results. Everything else — no `npm`/`docker` binary, a dead
+// Docker daemon, DNS or TLS failure, a proxy refusing the connection — is
+// the script unable to complete, and still exits 2. `ENOTFOUND` (DNS)
+// deliberately does not match: only a registry's own 404/no-such-version
+// wording counts.
+const NPM_VERSION_ABSENT = /\bE404\b|\bETARGET\b|\b404 Not Found\b|no matching version found|is not in this registry/i;
+
+export function classifyNpmFailure(text) {
+  return NPM_VERSION_ABSENT.test(String(text ?? "")) ? "not-published" : "error";
+}
+
+// execFileSync puts the captured stderr on the error and repeats it in the
+// message; read both so a classification never depends on which one the
+// caller's failure mode filled in.
+export function commandFailureText(err) {
   return [err?.stderr, err?.message].filter(Boolean).join("\n");
 }
 
@@ -139,16 +159,27 @@ function npmView(pkg) {
     : sh("npm", ["view", pkg, "version"]);
 }
 
-function main() {
-  const version = process.argv[2];
-  if (!version || !/^\d+\.\d+\.\d+$/.test(version)) {
-    console.error("usage: node scripts/release-verify.mjs <X.Y.Z>");
-    process.exit(2);
-  }
-  const tag = `v${version}`;
-  const root = path.resolve(fileURLToPath(import.meta.url), "..", "..");
-  const results = [];
+// Why the smoke test would be pointless right now, or null if it is worth
+// running. It costs a docker pull plus an install, and it can only answer
+// E404 while the version is absent from the registry — `npm-publish` has
+// `needs: release` in the workflow, so an unpublished release already
+// settles it. The npm-latest arm mirrors checkNpmVersion's own exact-match
+// rule: if the dist-tag is not this version, the "npm" check has already
+// failed and the smoke test adds a slow second opinion on the same fact.
+// A blocker never becomes a passing check — the caller reports it as FAIL,
+// because the check has not passed, it has not run.
+export function smokeBlocker({ releasePublished, npmLatest, version, tag }) {
+  if (!releasePublished) return `GitHub Release ${tag} is not published, and npm-publish runs only after it`;
+  if (npmLatest === null) return `the registry does not serve rpi-deploy at all yet`;
+  if (npmLatest !== version) return `npm latest is ${npmLatest}, not ${version}`;
+  return null;
+}
 
+// Every check appends its verdict here and the caller prints the lot, even
+// when a later check dies outright: an operator who ran this too early must
+// still see which checks did answer, and an operator hitting a genuine
+// infrastructure failure must still see the ones that ran before it.
+function runChecks(results, { version, tag, root }) {
   const runs = JSON.parse(
     sh("gh", ["run", "list", "--workflow", "release", "--limit", "20", "--json", "databaseId,headBranch"], { cwd: root }),
   );
@@ -166,10 +197,18 @@ function main() {
   }
 
   let assets = null;
+  let releasePublished = true;
   try {
-    assets = JSON.parse(sh("gh", ["release", "view", tag, "--json", "assets"], { cwd: root })).assets.map((a) => a.name);
+    // stderr is captured rather than echoed: during the normal post-tag
+    // window this call prints a bare "release not found", which would land
+    // above the results and read as a crash. The text is still on the error
+    // for classification, and for a genuine failure it reaches the operator
+    // through the exit-2 message.
+    const opts = { cwd: root, stdio: ["ignore", "pipe", "pipe"] };
+    assets = JSON.parse(sh("gh", ["release", "view", tag, "--json", "assets"], opts)).assets.map((a) => a.name);
   } catch (err) {
-    if (classifyReleaseViewFailure(releaseViewFailureText(err)) !== "not-published") throw err;
+    if (classifyReleaseViewFailure(commandFailureText(err)) !== "not-published") throw err;
+    releasePublished = false;
     results.push({
       label: "assets",
       ok: false,
@@ -188,15 +227,75 @@ function main() {
     });
   }
 
-  results.push({ label: "npm", ...checkNpmVersion(npmView("rpi-deploy"), version) });
+  let npmLatest = null;
+  try {
+    npmLatest = npmView("rpi-deploy");
+  } catch (err) {
+    if (classifyNpmFailure(commandFailureText(err)) !== "not-published") throw err;
+    results.push({
+      label: "npm",
+      ok: false,
+      reason: `the registry has no rpi-deploy yet — the npm-publish job runs after release; wait for the workflow and re-run`,
+    });
+  }
+  if (npmLatest !== null) results.push({ label: "npm", ...checkNpmVersion(npmLatest, version) });
 
-  const started = Date.now();
-  const stdout = sh("docker", ["run", "--rm", "node:20-slim", "npx", "-y", `rpi-deploy@${version}`, "--version"]);
-  results.push({ label: "npx smoke", ...checkSmokeOutput(stdout, version, Date.now() - started) });
+  const npmBlocker = smokeBlocker({ releasePublished, npmLatest, version, tag });
 
+  if (npmBlocker !== null) {
+    results.push({
+      label: "npx smoke",
+      ok: false,
+      reason: `not run — rpi-deploy@${version} cannot be on npm yet (${npmBlocker}); re-run once the release workflow has finished`,
+    });
+  } else {
+    const started = Date.now();
+    try {
+      const stdout = sh("docker", ["run", "--rm", "node:20-slim", "npx", "-y", `rpi-deploy@${version}`, "--version"]);
+      results.push({ label: "npx smoke", ...checkSmokeOutput(stdout, version, Date.now() - started) });
+    } catch (err) {
+      // A container that ran and could not resolve the version is a check
+      // that has not passed (the registry can lag its own dist-tag by
+      // seconds). No docker, a dead daemon or a failed image pull is the
+      // script unable to run, and is rethrown to exit 2.
+      if (classifyNpmFailure(commandFailureText(err)) !== "not-published") throw err;
+      results.push({
+        label: "npx smoke",
+        ok: false,
+        reason: `npx could not resolve rpi-deploy@${version} inside the container — the registry does not serve that version yet; re-run in a minute`,
+      });
+    }
+  }
+}
+
+function printResults(results) {
   for (const r of results) console.log(`${r.ok ? "ok" : "FAIL"}  ${r.label}: ${r.reason}`);
-  const slow = results.find((r) => r.slow);
-  if (slow) console.log("warn  install was slow — check that postinstall found the prebuilt binary");
+  if (results.some((r) => r.slow)) {
+    console.log("warn  install was slow — check that postinstall found the prebuilt binary");
+  }
+}
+
+function main() {
+  const version = process.argv[2];
+  if (!version || !/^\d+\.\d+\.\d+$/.test(version)) {
+    console.error("usage: node scripts/release-verify.mjs <X.Y.Z>");
+    process.exit(2);
+  }
+  const tag = `v${version}`;
+  const root = path.resolve(fileURLToPath(import.meta.url), "..", "..");
+  const results = [];
+
+  try {
+    runChecks(results, { version, tag, root });
+  } catch (err) {
+    // Print what did get answered before handing the failure to the exit-2
+    // path: an operator debugging a broken `gh` or Docker still learns
+    // whether the release itself is fine.
+    printResults(results);
+    throw err;
+  }
+
+  printResults(results);
 
   const failed = results.filter((r) => !r.ok);
   if (failed.length > 0) {
