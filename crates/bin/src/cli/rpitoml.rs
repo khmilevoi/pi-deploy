@@ -406,10 +406,9 @@ impl RpiToml {
             // The deploy path fills this from the resolved `EnvSelection`
             // (later task); rpi.toml alone never carries an environment.
             environment: None,
-            // Deploy-time layering of [secrets].groups into the deploy
-            // request is a later task (secret-groups spec); this task only
-            // persists the field once it is set.
-            secret_groups: Vec::new(),
+            // Declared order is layer order (secret-groups spec: Attachment
+            // and layering) — carried through verbatim, never re-sorted.
+            secret_groups: self.secrets.groups.clone(),
         }
     }
 }
@@ -798,6 +797,19 @@ files = ["certs/server.pem"]
             vec!["common".to_string(), "preview".to_string()]
         );
         assert!(RpiToml::parse(SAMPLE).unwrap().secrets.groups.is_empty());
+    }
+
+    #[test]
+    fn to_project_config_carries_secret_groups_in_declared_order() {
+        let toml = SAMPLE.replace("[secrets]", "[secrets]\ngroups = [\"common\", \"preview\"]");
+        let config = RpiToml::parse(&toml).unwrap().to_project_config();
+        assert_eq!(
+            config.secret_groups,
+            vec!["common".to_string(), "preview".to_string()]
+        );
+
+        let config = RpiToml::parse(SAMPLE).unwrap().to_project_config();
+        assert!(config.secret_groups.is_empty());
     }
 
     #[test]

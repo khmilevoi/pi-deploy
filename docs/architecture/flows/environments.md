@@ -112,8 +112,10 @@ sequenceDiagram
    error.
 3. The overlay merges onto the base configuration field by field: scalars
    replace, nested tables merge field-wise (only the fields actually present
-   in the overlay change), `[commands]` and array fields (`secrets.files`)
-   replace wholesale rather than merge, and an explicit empty string (`""`)
+   in the overlay change), `[commands]` and array fields (`secrets.files`,
+   `secrets.groups`) replace wholesale rather than merge — an overlay that
+   declares `secrets.groups = []` explicitly detaches every group rather
+   than inheriting the base file's — and an explicit empty string (`""`)
    resets an optional field to unset instead of being treated as a normal
    value.
 4. The merged, revalidated configuration's `project.name` is overwritten
@@ -148,7 +150,20 @@ sequenceDiagram
    CLI checks the agent advertises the `environments` feature (agent
    `>= 0.24.0`) and refuses locally with an upgrade message if it's talking
    to an older agent.
-7. The agent validates shape before ever touching the registry. A request
+7. **Secret groups follow the resolved config, not the environment.**
+   `ProjectConfig.secret_groups` — the `[secrets].groups` list, itself
+   subject to the overlay's wholesale-replace merge (item 3) — travels
+   inside the same resolved `ProjectConfig` as everything else, so an
+   overlay can declare its own group list independent of the base file's.
+   At deploy time (`flows/secrets.md`) the agent resolves those groups
+   against the *base* project's namespace (`environment.base`, not the
+   derived key), which is the whole point of a group meant to be shared by
+   more than one deploy. A fresh environment's first deploy therefore
+   inherits every group its overlay declares immediately, with no separate
+   `rpi secrets send` needed for those groups; only its own implicit key
+   bundle starts empty, and the base project's own key bundle is never
+   copied to it.
+8. The agent validates shape before ever touching the registry. A request
    with **no** `environment` block whose `project.name` contains `--` is
    rejected 400 immediately — `--` is reserved for derived keys — which is
    why a plain, non-overlay deploy can never even reach the
@@ -157,11 +172,11 @@ sequenceDiagram
    charset, no `--`, no leading/trailing `-`) and that
    `base--env[--slug]` matches `project.name` exactly; either failure is also
    400, still before the registry is consulted.
-8. Only once shape validation passes does the agent look the key up in the
+9. Only once shape validation passes does the agent look the key up in the
    registry. If it already exists under the opposite kind — a plain deploy
    aimed at a key that's registered with environment metadata, or an
    environment deploy aimed at a key registered as a base project — the
-   agent answers 409. Because step 7 already rejects every `--`-bearing name
+   agent answers 409. Because step 8 already rejects every `--`-bearing name
    on a plain deploy, this 409 in practice only fires for a key that passes
    plain-deploy name validation (no `--`) yet is *already* registered as an
    environment — for example a registry row seeded by a version that
@@ -171,7 +186,7 @@ sequenceDiagram
    `environment.base`, not the derived key) and answers 409 if its hostname
    matches — the same production-key protection as step 4's resolve-time
    check, but covering a stale or hand-crafted CLI that skips it.
-9. From here the deploy pipeline (`flows/deploy.md`) runs unchanged through
+10. From here the deploy pipeline (`flows/deploy.md`) runs unchanged through
    fetch, build, start, health, and the optional route stage. Right after
    that point — whether or not a hostname triggered an actual route — an
    environment deploy whose overlay set `on_create` and whose registry row
@@ -186,22 +201,22 @@ sequenceDiagram
    - *Success*: `on_create_done` flips to `true` and the command never runs
      again for that key, across any number of future redeploys — only
      `rpi env reset-data` clears the flag back to `false`.
-10. `gc` runs last, exactly as in a plain deploy.
-11. The registry (`repo.rs`) persists `env_name`/`env_base`/`env_slug`/
+11. `gc` runs last, exactly as in a plain deploy.
+12. The registry (`repo.rs`) persists `env_name`/`env_base`/`env_slug`/
     `env_ttl_secs`/`env_on_create`/`env_on_create_done` alongside the
     existing project row; `env_name IS NOT NULL` is what makes a row "an
     environment" for every guard and query in this document, and a
     redeploy's `UPDATE` never touches `env_on_create_done` — only
     `set_on_create_done` does. `mark_deploy_success` stamps
     `last_success_at` on every successful deploy, environment or not; the
-    reaper (step 14) reads that same timestamp.
-12. `rpi env ls [--all]` calls `GET /v1/environments[?base=<project>]`.
+    reaper (step 15) reads that same timestamp.
+13. `rpi env ls [--all]` calls `GET /v1/environments[?base=<project>]`.
     Without `--all`, the CLI first resolves the current directory's own
     `rpi.toml` (no overlay) to get its `base` name and passes that as the
     filter; `--all`, or running outside any project directory, lists every
     environment on the agent instead. Only rows with `env_name` set are ever
     returned.
-13. `rpi env destroy <env> [--vars ...]` and `rpi env reset-data <env>
+14. `rpi env destroy <env> [--vars ...]` and `rpi env reset-data <env>
     [--vars ...]` both first run the exact same local overlay resolution
     `rpi deploy` uses to compute the target key — so a typo'd `--vars`
     fails the same way it would on deploy — then prompt for the key to be
@@ -225,7 +240,7 @@ sequenceDiagram
       database. A missing key is a genuine 404 here (there's nothing to
       reset); a base-project key, or a key with an active deployment, is
       409.
-14. A background sweep (`agent/run.rs`, on a timer whose period comes from
+15. A background sweep (`agent/run.rs`, on a timer whose period comes from
     `agent.toml`'s `[environments].reap_interval`, default one hour) calls
     `ReapEnvironments::execute` once per tick. It lists every environment
     and, for each one with a `ttl` set, computes an expiry anchor from that
@@ -294,6 +309,11 @@ sequenceDiagram
   runs once after health (and the optional route stage) when `on_create` is
   set and not yet done, fails the deploy on a nonzero exit or an undeclared
   command name, and flips `on_create_done` only on success.
+- `crates/application/src/lib.rs` (`effective_secrets`) — resolves
+  `ProjectConfig.secret_groups` against `environment.base` (not the derived
+  key) for an environment deploy, so a base project's declared groups are
+  shared by every environment built from it; full mechanics in
+  `flows/secrets.md`.
 - `crates/infrastructure/src/repo.rs` — the registry's `env_name`/
   `env_base`/`env_slug`/`env_ttl_secs`/`env_on_create`/`env_on_create_done`
   columns; `list_environments` (filters on `env_name IS NOT NULL`,
