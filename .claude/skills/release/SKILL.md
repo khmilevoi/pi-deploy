@@ -76,10 +76,22 @@ survive a `feat:` commit, which is why preflight refuses one.
    a rebase and a successful push the release commit genuinely *is* on
    `origin/master`), and the workflow's `check` job only compares
    `package.json` against the tag name. The rejected push is the signal;
-   act on it there. Going back means dropping the release commit first —
-   `rtk git fetch origin master && rtk git reset --hard origin/master` —
-   otherwise preflight refuses on `HEAD != origin/master`; nothing is lost,
-   the commit holds only the three files step 2 regenerates.
+   act on it there. Going back means undoing the release commit first, or
+   preflight refuses on `HEAD != origin/master`:
+   ```
+   rtk git reset --soft HEAD~1
+   rtk git checkout HEAD -- Cargo.toml package.json Cargo.lock
+   rtk git stash                 # only if a README or docs edit is left staged
+   ```
+   `--soft` keeps everything the commit held; the `checkout` discards only
+   the three files step 2 regenerates, and takes them from `HEAD` so the
+   index loses the bump too. Anything hand-written survives — a
+   `## Highlights` edit is allowed in this mode (see "A README edit" below),
+   and it exists nowhere else, so **never `reset --hard` here**. Then step 1:
+   `rtk git pull` fast-forwards onto the new `master`, preflight and step 2
+   both want a clean tree, and `rtk git stash pop` after step 2 brings the
+   edit back onto the new base — re-read it there, since the commits you
+   just pulled may have changed what it should say.
 5. **Confirm the commit you are about to tag is on `origin/master`**:
    ```
    rtk git fetch origin master
@@ -196,12 +208,23 @@ What quick mode does **not** do, and why it is safe:
    and nothing downstream re-reads them. Re-run preflight, re-check the
    bump, and redo steps 2-4 on the new base. Step 7's ancestry check does
    not cover this — after a rebase and a successful push the release commit
-   really is on `origin/master`. Drop the release commit before going back
-   (preflight and `bump-version.mjs` both refuse otherwise): `rtk git reset
-   --hard origin/master` when it holds only the three generated files, or
-   `rtk git reset --soft HEAD~1 && rtk git stash` first when it also carries
-   README or docs edits you want to keep — step 2 needs a clean tree, so
-   restore them after it.
+   really is on `origin/master`. Undo the release commit before going back,
+   or preflight refuses on `HEAD != origin/master` (`bump-version.mjs` will
+   not stop you — it only checks for a dirty tree, and a committed release
+   leaves the tree clean):
+   ```
+   rtk git reset --soft HEAD~1
+   rtk git checkout HEAD -- Cargo.toml package.json Cargo.lock
+   rtk git stash                 # only if a README or docs edit is left staged
+   ```
+   `--soft` keeps everything the commit held; the `checkout` discards only
+   the three files step 2 regenerates, and takes them from `HEAD` so the
+   index loses the bump too. The README and `docs/` edits from step 3 exist
+   nowhere else, so **never `reset --hard` here**. Then step 1: `rtk git
+   pull` fast-forwards onto the new `master`, preflight and step 2 both want
+   a clean tree, and `rtk git stash pop` after step 2 brings the edits back
+   onto the new base — re-read them there, since the commits you just pulled
+   may have changed what they should say.
 6. **Optional dry run** (recommended after toolchain/dependency changes): `gh workflow run release.yml --ref master` builds all 3 targets (Windows MSVC, x86_64/aarch64 musl) but skips release + publish.
 7. **Tag and push**: first confirm the commit you are about to tag is on `origin/master`:
    ```
