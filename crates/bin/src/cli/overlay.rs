@@ -148,6 +148,7 @@ pub struct OverlaySecrets {
     pub env: Option<String>,
     pub files: Option<Vec<String>>,
     pub file_mode: Option<String>,
+    pub groups: Option<Vec<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -275,6 +276,9 @@ pub fn interpolate(
         for f in s.files.iter().flatten() {
             forbid("secrets.files", Some(f))?;
         }
+        for g in s.groups.iter().flatten() {
+            forbid("secrets.groups", Some(g))?;
+        }
     }
     for (name, value) in overlay.commands.iter().flatten() {
         for s in command_strings(value) {
@@ -391,6 +395,9 @@ pub fn apply_overlay(base: &mut RpiToml, overlay: RpiTomlOverlay) {
         }
         if let Some(mode) = s.file_mode {
             base.secrets.file_mode = reset_or(mode);
+        }
+        if let Some(groups) = s.groups {
+            base.secrets.groups = groups;
         }
     }
     if let Some(commands) = overlay.commands {
@@ -1113,5 +1120,32 @@ seed = "node seed.js"
         let parsed = toml::from_str::<toml::Value>(&text).unwrap();
         // Verify the control character was preserved in round-trip
         assert_eq!(parsed["base"].as_str().unwrap(), "my\u{0007}app");
+    }
+
+    #[test]
+    fn overlay_groups_replace_wholesale_and_empty_list_detaches() {
+        let mut base = crate::cli::rpitoml::RpiToml::parse(
+            &BASE.replace("[secrets]", "[secrets]\ngroups = [\"common\"]"),
+        )
+        .unwrap();
+        apply_overlay(&mut base, overlay("[secrets]\ngroups = [\"preview\"]\n"));
+        assert_eq!(
+            base.secrets.groups,
+            vec!["preview".to_string()],
+            "arrays replace, never concatenate"
+        );
+
+        apply_overlay(&mut base, overlay("[secrets]\ngroups = []\n"));
+        assert!(
+            base.secrets.groups.is_empty(),
+            "an explicit empty list detaches every group"
+        );
+    }
+
+    #[test]
+    fn interpolation_in_groups_is_rejected() {
+        let mut o = overlay("[secrets]\ngroups = [\"${BRANCH_NAME}\"]\n");
+        let err = interpolate(&mut o, &branch_vars()).unwrap_err().to_string();
+        assert!(err.contains("secrets.groups"), "got: {err}");
     }
 }

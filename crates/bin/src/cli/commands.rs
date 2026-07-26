@@ -906,6 +906,7 @@ mod tests {
             env: env.map(str::to_string),
             files: files.iter().map(|s| s.to_string()).collect(),
             file_mode: None,
+            groups: vec![],
         }
     }
 

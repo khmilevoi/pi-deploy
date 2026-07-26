@@ -122,6 +122,11 @@ pub struct SecretsSection {
     /// `[secrets].files` and 0600 for the injected `.env`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub file_mode: Option<String>,
+    /// Declared secret groups, applied in this order at deploy time before the
+    /// deploy key's own bundle (secret-groups spec: Attachment and layering).
+    /// An explicit empty list detaches every group.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub groups: Vec<String>,
 }
 
 /// [commands] value: a shell-word string, an explicit argv array, or a table
@@ -311,6 +316,14 @@ impl RpiToml {
         if let Some(mode) = &self.secrets.file_mode {
             pi_domain::secretmode::parse(mode)
                 .map_err(|e| anyhow::anyhow!("rpi.toml [secrets].file_mode: {e}"))?;
+        }
+        let mut seen_groups = std::collections::BTreeSet::new();
+        for name in &self.secrets.groups {
+            pi_domain::secretgroup::validate_group_name(name)
+                .map_err(|e| anyhow::anyhow!("rpi.toml [secrets].groups: {e}"))?;
+            if !seen_groups.insert(name) {
+                anyhow::bail!("rpi.toml [secrets].groups: duplicate group '{name}'");
+            }
         }
         if let Some(commands) = &self.commands {
             if commands.is_empty() {
@@ -768,5 +781,40 @@ files = ["certs/server.pem"]
             "[timeouts]\ncommand = \"soon\"\n\n[healthcheck]",
         );
         assert!(RpiToml::parse(&bad).is_err());
+    }
+
+    #[test]
+    fn secrets_groups_are_parsed_and_default_to_empty() {
+        let parsed = RpiToml::parse(
+            &SAMPLE.replace("[secrets]", "[secrets]\ngroups = [\"common\", \"preview\"]"),
+        )
+        .unwrap();
+        assert_eq!(
+            parsed.secrets.groups,
+            vec!["common".to_string(), "preview".to_string()]
+        );
+        assert!(RpiToml::parse(SAMPLE).unwrap().secrets.groups.is_empty());
+    }
+
+    #[test]
+    fn invalid_group_names_are_rejected_at_parse_time() {
+        for bad in ["Preview", "a/b", "1st", "under_score", ""] {
+            let err = RpiToml::parse(
+                &SAMPLE.replace("[secrets]", &format!("[secrets]\ngroups = [\"{bad}\"]")),
+            )
+            .unwrap_err()
+            .to_string();
+            assert!(err.contains("[secrets].groups"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
+    fn duplicate_groups_are_rejected() {
+        let err = RpiToml::parse(
+            &SAMPLE.replace("[secrets]", "[secrets]\ngroups = [\"common\", \"common\"]"),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("duplicate"), "got: {err}");
     }
 }
