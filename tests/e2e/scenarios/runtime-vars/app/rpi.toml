@@ -1,0 +1,47 @@
+schema = 1
+
+[project]
+name = "e2e-fixture"
+
+[source]
+repo = "git://git-fixture/fixture.git"
+branch = "main"
+
+[build]
+compose = "compose.yaml"
+
+[ingress]
+service = "web"
+port = 8080
+
+[healthcheck]
+path = "/health"
+expect = "200"
+timeout = "30s"
+
+# The commands are the only way a scenario can look *inside* a running
+# container, so each one dumps rather than asserts: the scenario owns what a
+# value must be, and a failed assertion leaves the whole observed set in the
+# artifact instead of a bare exit code.
+#
+# Unpinned, so it execs into the ingress service (`web`). SEEN is matched too
+# because it only ever comes from the project's own compose file.
+[commands.web-vars]
+run = ["sh", "-c", "printenv | grep -E '^(RPI_|SEEN=)' | sort"]
+
+# Pinned to a service that is neither public nor the ingress service: the
+# `-e` flags of `docker compose exec` would carry RPI_* here regardless, so
+# what this really proves is that `up` gave the container those values -- i.e.
+# that the generated override emits an `environment:` block per service.
+[commands.worker-vars]
+run = ["sh", "-c", "printenv | grep -E '^(RPI_|SEEN=)' | sort"]
+service = "worker"
+
+# `printenv NAME` prints nothing and exits 1 when NAME is unset, which is
+# exactly the "omitted, not empty" distinction a plain deploy has to show for
+# RPI_ENV -- an empty-string value would exit 0 and defeat ${RPI_ENV:-prod}.
+[commands.env-name]
+run = ["printenv", "RPI_ENV"]
+
+[commands.project-name]
+run = ["printenv", "RPI_PROJECT"]

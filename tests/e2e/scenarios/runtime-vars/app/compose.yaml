@@ -1,0 +1,20 @@
+services:
+  web:
+    build: .
+    expose:
+      - "8080"
+    environment:
+      # Interpolated by the `docker compose` process, from the environment rpi
+      # puts on every invocation that reads this file. Nothing else can supply
+      # it: the generated override only ever writes RPI_* keys, so a container
+      # reporting SEEN=branch=<x> proves the process-environment delivery path
+      # on its own.
+      SEEN: "branch=${RPI_BRANCH_NAME}"
+
+  # Non-public, not the ingress service, and deliberately without a SEEN of
+  # its own: whatever RPI_* this container reports can only have arrived
+  # through the per-service `environment:` blocks of the generated override.
+  # BusyBox `sleep` takes a number, not `infinity`, hence the loop.
+  worker:
+    build: .
+    command: ["sh", "-c", "while :; do sleep 3600; done"]

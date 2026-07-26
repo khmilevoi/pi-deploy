@@ -1,0 +1,19 @@
+[source]
+# The whole point of the environment: the deployed branch is a --vars input,
+# so RPI_BRANCH_NAME differs from the base project's. The fixture repo carries
+# this ref with the same tree as main but its own sha (see ../branches), so the
+# fetch resolves and RPI_COMMIT_SHA is still telling.
+branch = "${BRANCH_NAME}"
+
+[ingress]
+# The only reference to ${env.slug} in the pair, and therefore what makes the
+# key gain its `--feature-login` suffix -- a slug is derived only when
+# something asks for one. Doubles as the cross-check that the config-time slug
+# and the runtime RPI_ENV_SLUG are the same string. The agent has no
+# [cloudflared], so the route stage is skipped with a warning and nothing is
+# actually published; `.invalid` keeps it that way by construction.
+hostname = "${env.slug}.runtime-vars.e2e.invalid"
+
+# No [commands] here on purpose: an overlay's [commands] table replaces the
+# base one wholesale, which would take web-vars/worker-vars/env-name away from
+# exactly the deploy that needs them most.
