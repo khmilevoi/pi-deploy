@@ -264,6 +264,15 @@ fn collect_secrets(
         },
     };
 
+    // The RPI_ namespace is injected by the agent at deploy time. Accepting a
+    // secret with that prefix would make it ambiguous which side wins inside
+    // the container, so it is refused here rather than silently overridden.
+    if let Some(key) = vars.keys().find(|k| k.starts_with("RPI_")) {
+        anyhow::bail!(
+            "secret key '{key}' uses the reserved RPI_ prefix (rpi injects those at deploy time) - rename it"
+        );
+    }
+
     let mut files = BTreeMap::new();
     let mut missing: Vec<&str> = Vec::new();
     let mut total: usize = 0;
@@ -893,7 +902,38 @@ fn deploy_warning(line: &str) -> Option<&str> {
 pub async fn config_show(env: Option<String>, vars: Vec<String>) -> anyhow::Result<()> {
     let resolved = crate::cli::overlay::resolve(env.as_deref(), &vars)?;
     print!("{}", crate::cli::overlay::render_resolved(&resolved)?);
+    print!("{}", render_runtime_preview(&resolved));
     Ok(())
+}
+
+/// The `RPI_*` variables a deploy of this configuration would export, as far
+/// as they are knowable locally. `RPI_HOST_PORT` and `RPI_COMMIT_SHA` are
+/// assigned by the agent (port allocation and fetch respectively), so they
+/// are shown as placeholders rather than omitted — an operator debugging a
+/// missing variable needs to see that they exist.
+pub fn render_runtime_preview(r: &crate::cli::overlay::Resolved) -> String {
+    let mut out = String::from("\n[runtime]\n");
+    let mut put = |key: &str, value: &str| {
+        out.push_str(&format!("{key} = \"{value}\"\n"));
+    };
+    put("RPI_PROJECT", &r.rpitoml.project.name);
+    match &r.env {
+        Some(env) => {
+            put("RPI_PROJECT_BASE", &env.base);
+            put("RPI_ENV", &env.env);
+            if let Some(slug) = &env.slug {
+                put("RPI_ENV_SLUG", slug);
+            }
+        }
+        None => put("RPI_PROJECT_BASE", &r.rpitoml.project.name),
+    }
+    put("RPI_BRANCH_NAME", &r.rpitoml.source.branch);
+    if let Some(hostname) = &r.rpitoml.ingress.hostname {
+        put("RPI_HOSTNAME", hostname);
+    }
+    put("RPI_HOST_PORT", "<assigned by agent>");
+    put("RPI_COMMIT_SHA", "<assigned by agent>");
+    out
 }
 
 #[cfg(test)]
@@ -908,6 +948,22 @@ mod tests {
             file_mode: None,
         }
     }
+
+    const OVERLAY_BASE: &str = r#"
+schema = 1
+
+[project]
+name = "myapp"
+
+[source]
+repo = "git@github.com:acme/myapp.git"
+branch = "main"
+
+[ingress]
+hostname = "app.example.com"
+service = "web"
+port = 3000
+"#;
 
     #[test]
     fn deploy_warning_extracts_only_prefixed_lines() {
@@ -1044,6 +1100,72 @@ mod tests {
             result.is_err(),
             "must not follow a symlink out of the project root"
         );
+    }
+
+    #[test]
+    fn secrets_reject_the_reserved_rpi_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join(".env"), "A=1\nRPI_BRANCH_NAME=nope\n").unwrap();
+        let err = collect_secrets(dir.path(), &section(None, &[]))
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("RPI_BRANCH_NAME"), "got: {err}");
+        assert!(err.contains("reserved"), "got: {err}");
+    }
+
+    #[test]
+    fn runtime_preview_lists_local_values_and_marks_agent_side_ones() {
+        let resolved = crate::cli::overlay::resolve_from(
+            OVERLAY_BASE,
+            Some((
+                "branch",
+                "[source]\nbranch = \"${BRANCH_NAME}\"\n\n[ingress]\nhostname = \"${env.slug}.preview.example.com\"\n",
+            )),
+            &["BRANCH_NAME=feature/login".into()],
+        )
+        .unwrap();
+        let text = render_runtime_preview(&resolved);
+        assert!(text.contains("[runtime]"), "got:\n{text}");
+        assert!(
+            text.contains("RPI_PROJECT = \"myapp--branch--feature-login\""),
+            "got:\n{text}"
+        );
+        assert!(
+            text.contains("RPI_PROJECT_BASE = \"myapp\""),
+            "got:\n{text}"
+        );
+        assert!(text.contains("RPI_ENV = \"branch\""), "got:\n{text}");
+        assert!(
+            text.contains("RPI_ENV_SLUG = \"feature-login\""),
+            "got:\n{text}"
+        );
+        assert!(
+            text.contains("RPI_BRANCH_NAME = \"feature/login\""),
+            "got:\n{text}"
+        );
+        assert!(
+            text.contains("RPI_HOSTNAME = \"feature-login.preview.example.com\""),
+            "got:\n{text}"
+        );
+        assert!(
+            text.contains("RPI_HOST_PORT = \"<assigned by agent>\""),
+            "got:\n{text}"
+        );
+        assert!(
+            text.contains("RPI_COMMIT_SHA = \"<assigned by agent>\""),
+            "got:\n{text}"
+        );
+    }
+
+    #[test]
+    fn runtime_preview_omits_variables_that_do_not_exist() {
+        let base = OVERLAY_BASE.replace("hostname = \"app.example.com\"\n", "");
+        let resolved = crate::cli::overlay::resolve_from(&base, None, &[]).unwrap();
+        let text = render_runtime_preview(&resolved);
+        assert!(text.contains("RPI_PROJECT = \"myapp\""), "got:\n{text}");
+        assert!(!text.contains("RPI_ENV "), "no env selected: {text}");
+        assert!(!text.contains("RPI_ENV_SLUG"), "no slug: {text}");
+        assert!(!text.contains("RPI_HOSTNAME"), "no hostname: {text}");
     }
 
     #[test]
