@@ -10,7 +10,7 @@
 [![ci](https://github.com/khmilevoi/rpi-deploy/actions/workflows/ci.yml/badge.svg)](https://github.com/khmilevoi/rpi-deploy/actions/workflows/ci.yml)
 [![license](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
-[rpi.iiskelo.com](https://rpi.iiskelo.com) · [Releases](https://github.com/khmilevoi/rpi-deploy/releases) · [Quick Start](#quick-start) · [Commands](#commands) · [`rpi.toml`](#project-configuration-rpitoml)
+[rpi.iiskelo.com](https://rpi.iiskelo.com) · [Releases](https://github.com/khmilevoi/rpi-deploy/releases) · [Claude Code plugin](#claude-code-plugin) · [Quick Start](#quick-start) · [Commands](#commands) · [`rpi.toml`](#project-configuration-rpitoml)
 
 </div>
 
@@ -34,6 +34,24 @@
 
 ▸ deployed ✓ myboard  →  https://myboard.example.com · 2 services (58.4s)
 ```
+
+## Claude Code Plugin
+
+This repository doubles as a [Claude Code](https://claude.com/claude-code) plugin marketplace, so the agent you already deploy with can learn `rpi` instead of guessing at its flags and config keys:
+
+```bash
+claude plugin marketplace add khmilevoi/rpi-deploy
+claude plugin install rpi@rpi
+```
+
+The `rpi` plugin ships two skills:
+
+| Skill | Covers |
+| --- | --- |
+| `rpi-cli` | deploys, secrets and secret groups, environment overlays, logs and stats, agent setup, `rpi upgrade`, CLI-to-agent troubleshooting |
+| `rpi-toml` | schema 1 fields, `[project]`/`[source]`/`[build]`/`[ingress]`/`[healthcheck]`/`[secrets]`, Compose service and port mapping, `rpi.<env>.toml` overlays, configuration variables and the `RPI_*` runtime set |
+
+Pull later versions with `claude plugin update rpi@rpi`. The plugin source lives in [`plugins/rpi/`](plugins/rpi) — for OpenAI Codex, install the same two skills from a checkout with `sh plugins/rpi/scripts/install-skills.sh codex` (`plugins\rpi\scripts\install-skills.ps1 -Target codex` on Windows).
 
 ## Highlights
 
@@ -737,6 +755,7 @@ The CLI warns when its version differs from the agent's. Update both sides to th
 
 ## Documentation
 
+- [Claude Code plugin and Codex skills](plugins/rpi) — `rpi-cli` and `rpi-toml`, installed from this repo as a plugin marketplace
 - [CI deploys with GitHub Actions](docs/ci-github-actions.md)
 - [Migration: `pi` → `rpi` (v0.5 → v0.6)](docs/migration-v0.5-to-v0.6.md)
 - [Migration: `[env]` → `[secrets]`](docs/migration-env-to-secrets.md)
