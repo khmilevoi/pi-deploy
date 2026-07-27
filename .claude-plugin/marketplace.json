@@ -1,0 +1,14 @@
+{
+  "name": "rpi",
+  "owner": {
+    "name": "rpi maintainers"
+  },
+  "plugins": [
+    {
+      "name": "rpi",
+      "source": "./plugins/rpi",
+      "description": "Portable skills for operating the rpi deploy CLI and authoring rpi.toml project configs.",
+      "version": "0.1.0"
+    }
+  ]
+}

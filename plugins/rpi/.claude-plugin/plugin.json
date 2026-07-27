@@ -1,0 +1,8 @@
+{
+  "name": "rpi",
+  "version": "0.1.0",
+  "description": "Portable skills for operating the rpi deploy CLI and authoring rpi.toml project configs.",
+  "author": {
+    "name": "rpi maintainers"
+  }
+}
